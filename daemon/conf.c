@@ -553,6 +553,12 @@ int config_load_locked(struct snapraid_state* state)
 					++error_count;
 					log_msg(LVL_ERROR, "invalid config option %s=%s", key, val);
 				}
+			} else if (strcmp(key, "net_storage_admin") == 0) {
+				if (parse_int(val, 0, 1, &config->net_storage_admin) == 0) {
+				} else {
+					++error_count;
+					log_msg(LVL_ERROR, "invalid config option %s=%s", key, val);
+				}
 			} else if (strcmp(key, "net_web_root") == 0) {
 				if (parse_string(config->net_web_root, sizeof(config->net_web_root), val) == 0) {
 				} else {
@@ -1258,6 +1264,7 @@ void config_default_locked(struct snapraid_state* state)
 	config->net_security_headers = 1;
 	sncpy(config->net_allowed_origin, sizeof(config->net_allowed_origin), "self");
 	config->net_config_full_access = 0;
+	config->net_storage_admin = 0;
 	config->net_web_root[0] = 0;
 	config->net_auth_credential[0] = 0;
 
@@ -1316,6 +1323,7 @@ void config_dup_locked(struct snapraid_state* state, struct snapraid_config* tra
 	transient->net_security_headers = config->net_security_headers;
 	sncpy(transient->net_allowed_origin, sizeof(transient->net_allowed_origin), config->net_allowed_origin);
 	transient->net_config_full_access = config->net_config_full_access;
+	transient->net_storage_admin = config->net_storage_admin;
 	sncpy(transient->net_web_root, sizeof(transient->net_web_root), config->net_web_root);
 	sncpy(transient->net_auth_credential, sizeof(transient->net_auth_credential), config->net_auth_credential);
 
@@ -1381,6 +1389,7 @@ void config_apply_locked(struct snapraid_state* state, struct snapraid_config* t
 	config->net_security_headers = transient->net_security_headers;
 	sncpy(config->net_allowed_origin, sizeof(config->net_allowed_origin), transient->net_allowed_origin);
 	config->net_config_full_access = transient->net_config_full_access;
+	config->net_storage_admin = transient->net_storage_admin;
 	sncpy(config->net_web_root, sizeof(config->net_web_root), transient->net_web_root);
 	sncpy(config->net_auth_credential, sizeof(config->net_auth_credential), transient->net_auth_credential);
 

@@ -98,6 +98,7 @@ snapraidd_SOURCES = \
 	daemon/elem.c \
 	daemon/report.c \
 	daemon/notify.c \
+	daemon/storage.c \
 	daemon/smart.c \
 	daemon/selftest.c \
 	daemon/unixapp.c \
@@ -149,6 +150,7 @@ noinst_HEADERS = \
 	daemon/elem.h \
 	daemon/report.h \
 	daemon/notify.h \
+	daemon/storage.h \
 	daemon/smart.h \
 	daemon/selftest.h \
 	daemon/version.h
@@ -379,6 +381,7 @@ DAEMON_INCLUDES = \
 	$(srcdir)/daemon/log.h \
 	$(srcdir)/daemon/memory.h \
 	$(srcdir)/daemon/notify.h \
+	$(srcdir)/daemon/storage.h \
 	$(srcdir)/daemon/parser.h \
 	$(srcdir)/daemon/report.h \
 	$(srcdir)/daemon/rest.h \
@@ -404,6 +407,7 @@ $(DAEMON_PREFIX)elem.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)log.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)mingw.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)notify.$(OBJEXT): $(DAEMON_INCLUDES)
+$(DAEMON_PREFIX)storage.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)parser.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)report.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)rest.$(OBJEXT): $(DAEMON_INCLUDES)

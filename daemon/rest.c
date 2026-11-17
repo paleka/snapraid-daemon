@@ -13,6 +13,7 @@
 #include "scheduler.h"
 #include "smart.h"
 #include "web.h"
+#include "storage.h"
 #include "rest.h"
 
 /****************************************************************************/
@@ -2599,6 +2600,388 @@ static int handler_array(struct mg_connection* conn, void* cbdata)
 	return 200;
 }
 
+/****************************************************************************/
+/* storage */
+
+#define FIELD_STRING 0
+#define FIELD_BOOL 1
+
+struct json_field {
+	const char* name;
+	int type;
+	char* str;
+	size_t str_size;
+	int* flag;
+	int seen;
+};
+
+/**
+ * Parse a flat JSON object made only of strings and booleans.
+ */
+static int json_fields(char* js, ssize_t jl, struct json_field* fields, char* msg, size_t msg_size)
+{
+	jsmntok_t jv[JSMN_TOKEN_MAX];
+	int jc;
+	int j = 0;
+
+	if (json_parse(js, jl, jv, &jc, 0, msg, msg_size) != 0)
+		return -1;
+
+	if (jv[j].type != JSMN_OBJECT) {
+		snprintf(msg, msg_size, "Missing root JSON object");
+		return -1;
+	}
+
+	int c0 = jv[j++].size;
+	while (c0-- > 0) {
+		struct json_field* f;
+		for (f = fields; f->name; ++f) {
+			if (json_entry(js, &jv[j], f->name, strlen(f->name)) == 0)
+				break;
+		}
+		if (!f->name) {
+			json_error_entry(msg, msg_size, js, &jv[j]);
+			return -1;
+		}
+		if (f->seen) {
+			json_error_duplicate(msg, msg_size, js, &jv[j]);
+			return -1;
+		}
+		f->seen = 1;
+		++j;
+		int ret;
+		if (f->type == FIELD_BOOL)
+			ret = json_boolean(js, &jv[j], f->flag);
+		else
+			ret = json_string(js, &jv[j], f->str, f->str_size);
+		if (ret != 0) {
+			json_error_arg(msg, msg_size, js, &jv[j - 1], &jv[j]);
+			return -1;
+		}
+		++j;
+	}
+
+	return 0;
+}
+
+/**
+ * Storage administration is root on the machine. Beside the explicit option,
+ * the daemon must not be open to everybody: either it listens only on the
+ * loopback, or it asks for credentials, or it has an access list.
+ *
+ * \return 0 if allowed, otherwise the reason is in msg.
+ */
+static int storage_admin_check(struct snapraid_state* state, char* msg, size_t msg_size)
+{
+	int ret = 0;
+
+	state_lock();
+	struct snapraid_config* config = &state->config;
+
+	if (!config->net_storage_admin) {
+		snprintf(msg, msg_size, "Storage administration is disabled. Set net_storage_admin = 1 in snapraidd.conf and reload the daemon.");
+		ret = -1;
+	} else if (config->net_auth_credential[0] == 0 && config->net_acl[0] == 0) {
+		/* the default is the loopback */
+		int local = 1;
+		char buf[CONFIG_MAX];
+		sncpy(buf, sizeof(buf), config->net_port);
+		char* save = 0;
+		for (char* tok = strtok_r(buf, ", ", &save); tok; tok = strtok_r(0, ", ", &save)) {
+			if (strncmp(tok, "127.", 4) != 0 && strncmp(tok, "[::1]", 5) != 0)
+				local = 0;
+		}
+		if (!local) {
+			snprintf(msg, msg_size, "Storage administration is refused because the daemon is reachable from the network without protection. Set net_auth_credential or net_acl in snapraidd.conf.");
+			ret = -1;
+		}
+	}
+
+	state_unlock();
+	return ret;
+}
+
+/**
+ * GET /snapraid/v1/storage
+ * GET /snapraid/v1/storage/job
+ * GET /snapraid/v1/storage/browse?pool=DIR&path=DIR
+ */
+static int handler_storage(struct mg_connection* conn, void* cbdata)
+{
+	if (!rest_uri_is_lowercase(conn))
+		return send_lowercase(conn);
+
+	struct snapraid_state* state = cbdata;
+	const struct mg_request_info* ri = mg_get_request_info(conn);
+	int level = 0;
+	ss_t s;
+
+	if (strcmp(ri->request_method, "OPTIONS") == 0)
+		return send_no_content(conn);
+
+	if (strcmp(ri->request_method, "GET") != 0)
+		return send_json_error(conn, 405, "Only GET is allowed for this endpoint");
+
+	char reason[MSG_MAX] = "";
+	int admin = storage_admin_check(state, reason, sizeof(reason)) == 0;
+
+	ss_init(&s, JSON_INITIAL_SIZE);
+
+	ss_json_open(&s, &level);
+
+	/* the light version, polled while a background operation runs */
+	if (strcmp(strrchr(ri->local_uri, '/') + 1, "job") == 0) {
+		storage_job_json(&s, level);
+		ss_json_close(&s, &level);
+		send_json_answer(conn, 200, &s);
+		ss_done(&s);
+		return 200;
+	}
+
+	/* where the files of a pool are */
+	if (strcmp(strrchr(ri->local_uri, '/') + 1, "browse") == 0) {
+		char pool[PATH_MAX];
+		char path[PATH_MAX];
+		char msg[MSG_MAX];
+		int status = 400;
+		sncpy(msg, sizeof(msg), "Missing pool or path");
+		if (ri->query_string != 0
+			&& mg_get_var(ri->query_string, strlen(ri->query_string), "pool", pool, sizeof(pool)) > 0
+			&& mg_get_var(ri->query_string, strlen(ri->query_string), "path", path, sizeof(path)) > 0)
+			status = storage_browse_json(pool, path, &s, level, msg, sizeof(msg));
+		if (status != 0) {
+			ss_done(&s);
+			return send_json_error(conn, status, msg);
+		}
+		ss_json_close(&s, &level);
+		send_json_answer(conn, 200, &s);
+		ss_done(&s);
+		return 200;
+	}
+
+	ss_json_bool(&s, level, "admin", admin);
+	if (!admin)
+		ss_json_str(&s, level, "admin_reason", reason);
+	storage_inventory_json(state, &s, level);
+	ss_json_close(&s, &level);
+
+	send_json_answer(conn, 200, &s);
+
+	ss_done(&s);
+
+	return 200;
+}
+
+/**
+ * PUT  /snapraid/v1/storage/engine_conf
+ * POST /snapraid/v1/storage/format
+ * POST /snapraid/v1/storage/mount
+ * POST /snapraid/v1/storage/unmount
+ * POST /snapraid/v1/storage/pool
+ * POST /snapraid/v1/storage/mkdir
+ * POST /snapraid/v1/storage/recover
+ * POST /snapraid/v1/storage/balance
+ * POST /snapraid/v1/storage/duplicates
+ * POST /snapraid/v1/storage/job_stop
+ */
+static int handler_storage_action(struct mg_connection* conn, void* cbdata)
+{
+	if (!rest_uri_is_lowercase(conn))
+		return send_lowercase(conn);
+
+	char msg[MSG_MAX];
+	struct snapraid_state* state = cbdata;
+	const struct mg_request_info* ri = mg_get_request_info(conn);
+	const char* action = strrchr(ri->local_uri, '/') + 1;
+	int is_conf = strcmp(action, "engine_conf") == 0;
+	int status;
+	ssize_t jl;
+	char* js;
+	int level = 0;
+	ss_t s;
+
+	if (strcmp(ri->request_method, "OPTIONS") == 0)
+		return send_no_content(conn);
+
+	if (strcmp(ri->request_method, is_conf ? "PUT" : "POST") != 0)
+		return send_json_error(conn, 405, is_conf ? "Only PUT is allowed for this endpoint" : "Only POST is allowed for this endpoint");
+
+	if (storage_admin_check(state, msg, sizeof(msg)) != 0)
+		return send_json_error(conn, 403, msg);
+
+	status = json_read(conn, &js, &jl, msg, sizeof(msg));
+	if (status != 200)
+		return send_json_error(conn, status, msg);
+
+	/* decoded strings are never longer than the request */
+	size_t size = jl + 1;
+	char* a = malloc_nofail(size * 4);
+	char* b = a + size;
+	char* c = b + size;
+	char* d = c + size;
+	int flag = 0;
+	char part[PATH_MAX] = "";
+	char uuid[128] = "";
+	a[0] = b[0] = c[0] = d[0] = 0;
+
+	msg[0] = 0;
+	if (is_conf) {
+		struct json_field fields[] = {
+			{ "text", FIELD_STRING, a, size, 0, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_engine_conf_write(state, a, msg, sizeof(msg));
+	} else if (strcmp(action, "format") == 0) {
+		struct json_field fields[] = {
+			{ "device", FIELD_STRING, a, size, 0, 0 },
+			{ "fstype", FIELD_STRING, b, size, 0, 0 },
+			{ "label", FIELD_STRING, c, size, 0, 0 },
+			{ "purpose", FIELD_STRING, d, size, 0, 0 },
+			{ "wipe", FIELD_BOOL, 0, 0, &flag, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_format_start(a, b, c, d, flag, msg, sizeof(msg));
+	} else if (strcmp(action, "mount") == 0) {
+		struct json_field fields[] = {
+			{ "source", FIELD_STRING, a, size, 0, 0 },
+			{ "target", FIELD_STRING, b, size, 0, 0 },
+			{ "fstype", FIELD_STRING, c, size, 0, 0 },
+			{ "options", FIELD_STRING, d, size, 0, 0 },
+			{ "persist", FIELD_BOOL, 0, 0, &flag, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_mount(a, b, c, d, flag, msg, sizeof(msg));
+	} else if (strcmp(action, "recover") == 0) {
+		int accept = 0;
+		int force_uuid = 0;
+		struct json_field fields[] = {
+			{ "disks", FIELD_STRING, a, size, 0, 0 },
+			{ "check", FIELD_BOOL, 0, 0, &flag, 0 },
+			{ "accept", FIELD_BOOL, 0, 0, &accept, 0 },
+			{ "force_uuid", FIELD_BOOL, 0, 0, &force_uuid, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0) {
+			/* a comma separated list of disk names, never options */
+			sl_t disks;
+			sl_init(&disks);
+			int valid = 1;
+			char* save = 0;
+			for (char* tok = strtok_r(a, ",", &save); tok; tok = strtok_r(0, ",", &save)) {
+				size_t len = strlen(tok);
+				if (len == 0 || len >= 64 || tok[0] == '-')
+					valid = 0;
+				for (size_t k = 0; k < len; ++k) {
+					if (!isalnum((unsigned char)tok[k]) && tok[k] != '-' && tok[k] != '_')
+						valid = 0;
+				}
+				sl_insert_str(&disks, tok);
+			}
+			if (!valid || (!accept && tommy_list_empty(&disks))) {
+				snprintf(msg, sizeof(msg), "Invalid or missing disk names");
+				status = 400;
+			} else {
+				schedule_recover(state, &disks, flag, accept, force_uuid, msg, sizeof(msg), &status);
+				if (status >= 200 && status <= 299)
+					status = 0;
+			}
+			sl_free(&disks);
+		}
+	} else if (strcmp(action, "balance") == 0) {
+		struct json_field fields[] = {
+			{ "mountpoint", FIELD_STRING, a, size, 0, 0 },
+			{ "max_bytes", FIELD_STRING, b, size, 0, 0 },
+			{ "spread", FIELD_STRING, c, size, 0, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0) {
+			/* moving files under a running sync would make it fail */
+			state_lock();
+			int working = state->runner.latest != 0 && state->runner.latest->running;
+			state_unlock();
+			if (working) {
+				snprintf(msg, sizeof(msg), "A SnapRAID task is running. Balance the pool when it has finished.");
+				status = 409;
+			} else {
+				status = storage_balance_start(a, strtoull(b, 0, 10), (unsigned)strtoul(c, 0, 10), msg, sizeof(msg));
+			}
+		}
+	} else if (strcmp(action, "duplicates") == 0) {
+		struct json_field fields[] = {
+			{ "mountpoint", FIELD_STRING, a, size, 0, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_duplicates_start(a, msg, sizeof(msg));
+	} else if (strcmp(action, "job_stop") == 0) {
+		struct json_field fields[] = {
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_job_stop(msg, sizeof(msg));
+	} else if (strcmp(action, "mkdir") == 0) {
+		struct json_field fields[] = {
+			{ "path", FIELD_STRING, a, size, 0, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_mkdir(a, msg, sizeof(msg));
+	} else if (strcmp(action, "unmount") == 0) {
+		struct json_field fields[] = {
+			{ "target", FIELD_STRING, a, size, 0, 0 },
+			{ "forget", FIELD_BOOL, 0, 0, &flag, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_unmount(a, flag, msg, sizeof(msg));
+	} else {
+		struct json_field fields[] = {
+			{ "mountpoint", FIELD_STRING, a, size, 0, 0 },
+			{ "branches", FIELD_STRING, b, size, 0, 0 },
+			{ "options", FIELD_STRING, c, size, 0, 0 },
+			{ "persist", FIELD_BOOL, 0, 0, &flag, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_pool(a, b, c, flag, msg, sizeof(msg));
+	}
+
+	free(a);
+	free(js);
+
+	if (status != 0)
+		return send_json_error(conn, status, msg[0] ? msg : "Unrecognized json");
+
+	ss_init(&s, JSON_INITIAL_SIZE);
+
+	ss_json_open(&s, &level);
+	ss_json_bool(&s, level, "success", 1);
+	if (part[0])
+		ss_json_str(&s, level, "partition", part);
+	if (uuid[0])
+		ss_json_str(&s, level, "uuid", uuid);
+	ss_json_close(&s, &level);
+
+	send_json_answer(conn, 200, &s);
+
+	ss_done(&s);
+
+	return 200;
+}
+
 /**
  * Hook for internal CivetWeb messages.
  * \param conn    The connection associated with the message (can be NULL for array errors).
@@ -3479,6 +3862,19 @@ int rest_init(struct snapraid_state* state, int net_enabled, const char* net_por
 		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/state$", handler_state, state) != 0
 		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/system$", handler_system, state) != 0
 		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/hold_off$", handler_hold_off, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage$", handler_storage, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/engine_conf$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/format$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/mount$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/unmount$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/pool$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/mkdir$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/recover$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/balance$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/duplicates$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/job_stop$", handler_storage_action, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/job$", handler_storage, state) != 0
+		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/browse$", handler_storage, state) != 0
 		|| mg_set_request_handler(state->rest_context, "/metrics$", handler_metrics, state) != 0
 
 	        /*

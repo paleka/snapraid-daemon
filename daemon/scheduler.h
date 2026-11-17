@@ -45,6 +45,32 @@ void scheduler_pulse(struct snapraid_state* state);
 void schedule_maintenance(struct snapraid_state* state, int spindown, int threshold, char* msg, size_t msg_size, int* status);
 
 /**
+ * Schedule the recovery of an array with replaced or changed disks.
+ *
+ * It follows the recovering procedure of the SnapRAID manual: `fix -d NAME`
+ * for every disk to rebuild, optionally `check -d NAME -a` to verify the
+ * result ignoring the parity, and then `sync` to record the new disks.
+ *
+ * With `accept` nothing is rebuilt: the disks are taken as they are and
+ * only the `sync` runs. It's for disks whose content was copied by other
+ * means, where only the filesystem UUID is new.
+ *
+ * It's the only sequence allowed to run fix, check and sync while the
+ * array is DEGRADED, PREFAIL or FAILING, because those are the states
+ * a recovery starts from.
+ *
+ * @param state Current snapraid state
+ * @param disks Names of the data disks and parity levels to rebuild
+ * @param check 1 to verify the rebuilt disks before the sync
+ * @param accept 1 to skip the rebuild
+ * @param force_uuid 1 to add -U, --force-uuid, needed when more disks changed UUID than the parity levels
+ * @param msg Buffer for error message
+ * @param msg_size Size of message buffer
+ * @param status Pointer to store HTTP status code
+ */
+void schedule_recover(struct snapraid_state* state, sl_t* disks, int check, int accept, int force_uuid, char* msg, size_t msg_size, int* status);
+
+/**
  * Schedule a heal operation (fix errors).
  * @param state Current snapraid state
  * @param spindown 1 to spindown disks after completion, 0 to don't spindown, -1 use configured management

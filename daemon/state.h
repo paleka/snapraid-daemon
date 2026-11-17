@@ -310,8 +310,9 @@ struct snapraid_disk {
 #define CMD_SUSPEND_IDLE 204 /**< High level command. Never enter the queue. */
 #define CMD_REFRESH 205  /**< High level command. Never enter the queue. */
 #define CMD_STARTUP 206  /**< High level command. Never enter the queue. */
+#define CMD_RECOVER 207  /**< High level command. Never enter the queue. */
 
-#define CMD_HIGH_BIT(cmd) (cmd >= CMD_MAINTENANCE && cmd <= CMD_STARTUP ? (1U << (cmd - CMD_MAINTENANCE)) : 0) /**< Bit mask for high commands */
+#define CMD_HIGH_BIT(cmd) (cmd >= CMD_MAINTENANCE && cmd <= CMD_RECOVER ? (1U << (cmd - CMD_MAINTENANCE)) : 0) /**< Bit mask for high commands */
 
 #define PROCESS_STATE_QUEUE 0 /**< The process is queued */
 #define PROCESS_STATE_START 1 /**< The process is starting */
@@ -605,6 +606,7 @@ struct snapraid_config {
 	int net_security_headers; /**< 1 to enable security headers, 0 otherwise */
 	char net_allowed_origin[CONFIG_MAX]; /**< Allowed origin for CORS */
 	int net_config_full_access; /**< 1 if full configuration access is allowed from network, 0 otherwise */
+	int net_storage_admin; /**< 1 if disks, mounts, pools and the engine configuration can be changed from network, 0 otherwise */
 	char net_web_root[PATH_MAX]; /**< Web pages directory */
 	char net_auth_credential[CONFIG_MAX]; /**< Argon2id hashed credentials for Basic Auth */
 	int check_updates; /**< 1 to enable periodic update check, 0 otherwise */

@@ -42,6 +42,7 @@ struct {
 	{ CMD_SUSPEND_IDLE, "suspend_idle" },
 	{ CMD_REFRESH, "refresh" },
 	{ CMD_STARTUP, "startup" },
+	{ CMD_RECOVER, "recover" },
 	{ 0 }
 };
 
@@ -929,7 +930,7 @@ int health_array_locked(struct snapraid_state* state, char* reason, size_t reaso
 #ifdef _WIN32
 			snprintf(reason, reason_size, "The array is not configured. Copy snapraid.conf.example to snapraid.conf in the installation directory (where snapraid.exe and snapraidd.exe reside) and define your disks to begin.");
 #else
-			snprintf(reason, reason_size, "The array is not configured. The /etc/snapraid.conf is missing or empty. Copy the snapraid.conf.example to /etc/snapraid.conf and define your disks to begin.");
+			snprintf(reason, reason_size, "The array is not configured. The /etc/snapraid.conf is missing or empty. Use the guided setup in the Storage page, or copy the snapraid.conf.example to /etc/snapraid.conf and define your disks to begin.");
 #endif
 		}
 	}

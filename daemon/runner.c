@@ -1699,6 +1699,14 @@ static int runner_precondition_locked(struct snapraid_state* state)
 		/* these taks are allowed regardless the health */
 		break;
 	default :
+		/*
+		 * A recovery is what brings back an array that is DEGRADED, or that
+		 * has a PREFAIL or FAILING disk just replaced. It's requested
+		 * explicitly, naming the disks to rebuild.
+		 */
+		if (task->high_cmd == CMD_RECOVER)
+			break;
+
 		/* other commands are run only if the array is sane */
 		if (state->array.health == HEALTH_DEGRADED) {
 			const char* msg = "Array is DEGRADED! Task aborted!";

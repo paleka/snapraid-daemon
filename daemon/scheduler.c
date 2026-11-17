@@ -142,6 +142,72 @@ void schedule_maintenance(struct snapraid_state* state, int spindown, int thresh
 	state_unlock();
 }
 
+void schedule_recover(struct snapraid_state* state, sl_t* disks, int check, int accept, int force_uuid, char* msg, size_t msg_size, int* status)
+{
+	time_t now = time(0);
+
+	state_lock();
+
+	if (runner_has_high_cmd_locked(state, CMD_RECOVER)) {
+		sncpy(msg, msg_size, "Recover already running or scheduled");
+		*status = 409;
+		state_unlock();
+		return;
+	}
+
+	int group = ++state->runner.group_allocator;
+
+	state->runner.task_pending |= CMD_HIGH_BIT(CMD_RECOVER);
+
+	sl_t fix_arg_list;
+	sl_t check_arg_list;
+	sl_t sync_arg_list;
+	sl_init(&fix_arg_list);
+	sl_init(&check_arg_list);
+	sl_init(&sync_arg_list);
+	int has_data = 0;
+	for (tommy_node* i = tommy_list_head(disks); i != 0; i = i->next) {
+		sn_t* sn = i->data;
+		sl_insert_str(&fix_arg_list, "-d");
+		sl_insert_str(&fix_arg_list, sn->str);
+		/* the check without parity makes sense only for data */
+		if (strstr(sn->str, "parity") == 0) {
+			sl_insert_str(&check_arg_list, "-d");
+			sl_insert_str(&check_arg_list, sn->str);
+			has_data = 1;
+		}
+	}
+	sl_insert_str(&check_arg_list, "-a");
+	if (force_uuid) {
+		sl_insert_str(&fix_arg_list, "-U");
+		sl_insert_str(&check_arg_list, "-U");
+		sl_insert_str(&sync_arg_list, "-U");
+	}
+
+	const char* snapraid = runner_begin_locked(state, msg, msg_size, status);
+	if (snapraid) {
+		if (state->config.notify_start[0] != 0)
+			runner_step_locked(state, snapraid, CMD_RECOVER, CMD_START, now, group, 0);
+		runner_step_locked(state, snapraid, CMD_RECOVER, CMD_PROBE, now, group, 0);
+		if (!accept) {
+			runner_step_locked(state, snapraid, CMD_RECOVER, CMD_FIX, now, group, &fix_arg_list);
+			if (check && has_data)
+				runner_step_locked(state, snapraid, CMD_RECOVER, CMD_CHECK, now, group, &check_arg_list);
+		}
+		runner_step_locked(state, snapraid, CMD_RECOVER, CMD_SYNC, now, group, force_uuid ? &sync_arg_list : 0);
+		runner_step_locked(state, snapraid, CMD_RECOVER, CMD_REPORT, now, group, 0);
+		*status = 202;
+	}
+
+	sl_free(&fix_arg_list);
+	sl_free(&check_arg_list);
+	sl_free(&sync_arg_list);
+
+	state->runner.task_pending &= ~CMD_HIGH_BIT(CMD_RECOVER);
+
+	state_unlock();
+}
+
 void schedule_heal(struct snapraid_state* state, int spindown, char* msg, size_t msg_size, int* status)
 {
 	time_t now = time(0);

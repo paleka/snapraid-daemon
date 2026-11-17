@@ -8,6 +8,7 @@
 #include "scheduler.h"
 #include "selftest.h"
 #include "version.h"
+#include "storage.h"
 
 struct filter_escape_test_case {
 	const char* input;
@@ -326,6 +327,9 @@ int selftest(void)
 		return -1;
 
 	if (test_version_cmp() != 0)
+		return -1;
+
+	if (storage_selftest() != 0)
 		return -1;
 
 	return 0;
