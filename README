@@ -12,6 +12,10 @@ branch adds a Storage page to the web UI, to set up and maintain a SnapRAID
 array, with or without a mergerfs pool, from the browser. The additions are
 listed in the CHANGES-FORK file.
 
+Screenshots of the Storage page, and a lab to try it with emulated disks:
+
+    https://github.com/paleka/snapraid-lab#screenshots
+
 The additions are not part of SnapRAID Daemon, and they are not reviewed or
 endorsed by its author. Please report problems of the Storage page here:
 
