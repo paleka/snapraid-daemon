@@ -1,3 +1,31 @@
+NOTE: THIS IS AN UNOFFICIAL FORK
+================================
+
+This repository is a fork of SnapRAID Daemon, written and maintained by
+Andrea Mazzoleni:
+
+    https://github.com/amadvance/snapraid-daemon
+    https://www.snapraid.it/
+
+The 'master' branch is kept identical to the original project. The 'storage'
+branch adds a Storage page to the web UI, to set up and maintain a SnapRAID
+array, with or without a mergerfs pool, from the browser. The additions are
+listed in the CHANGES-FORK file.
+
+The additions are not part of SnapRAID Daemon, and they are not reviewed or
+endorsed by its author. Please report problems of the Storage page here:
+
+    https://github.com/paleka/snapraid-daemon/issues
+
+and not to the SnapRAID project. For SnapRAID itself, see its manual and its
+support page:
+
+    https://www.snapraid.it/manual
+    https://www.snapraid.it/support
+
+Everything that follows is the README of the original project.
+
+
 SnapRAID-Daemon
 ===============
 

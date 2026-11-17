@@ -1,0 +1,82 @@
+Changes of this fork
+====================
+
+This file lists what the 'storage' branch of this fork adds to SnapRAID Daemon
+by Andrea Mazzoleni (https://github.com/amadvance/snapraid-daemon).
+
+The original project is licensed under GPL-3.0-or-later, and so are the
+additions. Files that already existed keep the copyright of their author.
+The new files (daemon/storage.c, daemon/storage.h, js/storage.js of both UIs,
+test/ui/) are copyright of Robert Paleka.
+
+The additions were written with the help of an AI coding assistant (Claude).
+The AGENTS.md file of the original project asks agents to never commit to
+git. That rule is followed for the original repository: nothing was committed
+or proposed there. On this fork the commits were made on request of the fork
+owner.
+
+
+What is added
+-------------
+
+Everything is disabled by default. It is enabled by the new 'net_storage_admin'
+option, and only if the API is bound to the loopback address, or it is
+protected by 'net_auth_credential' or 'net_acl'. Linux only.
+
+* Storage page in the Commander and Brutale UIs, with a diagram of the array
+  and of the pool, an advisor, and a guided setup.
+
+* Inventory of the disks, partitions, filesystems and mount points.
+
+* Editor of the SnapRAID configuration file, with validation.
+
+* Format (ext4, xfs) and mount of disks, with /etc/fstab kept up to date.
+  A backup of the previous fstab is kept as /etc/fstab.snapraidd.bak.
+
+* mergerfs pools: create, change and remove, with branches and policies.
+
+* Balance of the files among the data disks, search of duplicate files in
+  the branches of a pool, and a file browser.
+
+* Recovery of failed disks, also with the array in a degraded state: fix of
+  the selected disks, check, and sync, in one command.
+
+* Arrays up to the limits of SnapRAID: six parity levels, split parity.
+
+* Tests: 'make check' also runs a selftest of the storage code and, if
+  Node.js is installed, the tests of the logic of the Storage page.
+
+
+Changes to existing files
+-------------------------
+
+    Makefile.am                new sources and UI files, tests in check-local
+    daemon/conf.c, state.h     'net_storage_admin' option, recover command
+    daemon/elem.c              name of the recover command
+    daemon/rest.c              /snapraid/v1/storage endpoints
+    daemon/runner.c            recover command allowed on a degraded array
+    daemon/scheduler.c/.h      schedule_recover()
+    daemon/selftest.c          call of storage_selftest()
+    commander/, brutale/       index.html, css/style.css, js/app.js, js/utils.js
+    doc/snapraidd.d/.1/.txt    documentation of the new option and endpoints
+    snapraidd.yaml             OpenAPI description of the new endpoints
+    snapraidd.conf.example     example of the new option
+    README                     note about the fork
+
+
+How it is tested
+----------------
+
+A Docker lab with emulated disks, and the tests of the API against real
+filesystems, are in a separate repository:
+
+    https://github.com/paleka/snapraid-lab
+
+
+Keeping up with the original project
+------------------------------------
+
+    git remote add upstream https://github.com/amadvance/snapraid-daemon.git
+    git fetch upstream
+    git checkout master && git merge --ff-only upstream/master
+    git checkout storage && git rebase master
