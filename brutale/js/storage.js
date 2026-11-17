@@ -876,10 +876,12 @@ const advise = (m) => {
 
     m.pools.forEach(pool => {
         const policy = pool.options['category.create'] || '';
+        // with more pools, say which one
+        const which = m.pools.length > 1 ? ` ${pool.mountpoint}` : '';
         if (policy.startsWith('ep'))
-            add('tip', `The pool can report “no space left” with space free`, `With the “${policy}” policy a file can only go to a disk that already has its folder. When those disks are full the write fails even if others are empty. Use pfrd or mfs unless you want folders kept together.`, { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
+            add('tip', `The pool${which} can report “no space left” with space free`, `With the “${policy}” policy a file can only go to a disk that already has its folder. When those disks are full the write fails even if others are empty. Use pfrd or mfs unless you want folders kept together.`, { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
         if (pool.options.moveonenospc === 'false')
-            add('tip', 'A file growing on a full disk will fail', 'The pool option “moveonenospc” is off: when a disk fills up while a file is being written, the write fails instead of moving the file to another disk.');
+            add('tip', `A file growing on a full disk${which ? ` of${which}` : ''} will fail`, 'The pool option “moveonenospc” is off: when a disk fills up while a file is being written, the write fails instead of moving the file to another disk.');
     });
     if (m.configured && !m.conf.some(e => e.type === 'filter'))
         add('tip', 'Nothing is excluded', 'Temporary files, downloads in progress and application data change during a sync and make it fail. Exclude them in the configuration.', { label: 'Edit configuration', st: 'tab', data: { tab: 'config' } });
