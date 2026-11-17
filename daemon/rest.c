@@ -15,6 +15,7 @@
 #include "web.h"
 #include "storage.h"
 #include "rest.h"
+#include "arrays.h"
 
 /****************************************************************************/
 /* jsmn */
@@ -699,6 +700,95 @@ static int handler_not_found(struct mg_connection* conn, void* cbdata)
 	return send_json_error(conn, 404, "Resource not found");
 }
 
+#define REST_ARRAYS "/snapraid/v1/arrays/"
+
+/**
+ * Get the name of the array from an URI like /snapraid/v1/arrays/NAME/...
+ * @return 0 on success, -1 if the URI doesn't name an array
+ */
+static int rest_array_name(const char* uri, char* name, size_t name_size)
+{
+	size_t prefix = strlen(REST_ARRAYS);
+
+	if (strncmp(uri, REST_ARRAYS, prefix) != 0)
+		return -1;
+
+	const char* begin = uri + prefix;
+	size_t len = strcspn(begin, "/");
+	if (len == 0 || len >= name_size)
+		return -1;
+
+	memcpy(name, begin, len);
+	name[len] = 0;
+
+	return 0;
+}
+
+/**
+ * Get the array a request is for.
+ *
+ * The endpoints of an array are available as /snapraid/v1/arrays/NAME/..., and
+ * for the default array also directly as /snapraid/v1/..., as they always were.
+ *
+ * The returned pointer stays valid also if the array is removed meanwhile:
+ * the state of a removed array is freed only when the daemon stops.
+ *
+ * @return The state of the array, or 0 if there is no array with that name
+ */
+static struct snapraid_state* rest_state(struct mg_connection* conn, void* cbdata)
+{
+	const struct mg_request_info* ri = mg_get_request_info(conn);
+	char name[ARRAY_NAME_MAX];
+
+	if (strncmp(ri->local_uri, REST_ARRAYS, strlen(REST_ARRAYS)) != 0)
+		return cbdata;
+
+	if (rest_array_name(ri->local_uri, name, sizeof(name)) != 0)
+		return 0;
+
+	state_lock();
+	struct snapraid_state* state = state_find_locked(name);
+	state_unlock();
+
+	return state;
+}
+
+/**
+ * Tell if the next task of the array is waiting for another array.
+ */
+static void json_waiting_for(ss_t* s, int level, struct snapraid_state* state)
+{
+	if (state->runner.latest && state->runner.latest->running)
+		return;
+	if (tommy_list_empty(&state->runner.waiting_list))
+		return;
+
+	struct snapraid_task* next = tommy_list_head(&state->runner.waiting_list)->data;
+	if (arbiter_is_heavy(next->cmd)) {
+		struct snapraid_state* other = arbiter_waiting_for_locked(state);
+		if (storage_job_claims_array(state->name))
+			ss_json_str(s, level, "waiting_for", "storage");
+		else if (other != 0)
+			ss_json_str(s, level, "waiting_for", other->name);
+	} else if (next->cmd == CMD_SHUTDOWN && arrays_others_busy_locked(state)) {
+		ss_json_str(s, level, "waiting_for", "*");
+	}
+}
+
+/**
+ * Check if the request is for the second version of an endpoint.
+ * Under arrays/NAME there is only the latest version of every endpoint.
+ */
+static int rest_is_v2(const struct mg_request_info* ri)
+{
+	return strstr(ri->local_uri, "/v2/") != 0 || strncmp(ri->local_uri, REST_ARRAYS, strlen(REST_ARRAYS)) == 0;
+}
+
+static int send_no_array(struct mg_connection* conn)
+{
+	return send_json_error(conn, 404, "There is no array with this name. See /snapraid/v1/arrays");
+}
+
 static void json_pulse(ss_t* s, int level, struct snapraid_pulse* pulse)
 {
 	ss_json_object_open(s, &level, "pulse");
@@ -719,7 +809,9 @@ static int handler_state(struct mg_connection* conn, void* cbdata)
 	if (!rest_uri_is_lowercase(conn))
 		return send_lowercase(conn);
 
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int level = 0;
 	ss_t s;
@@ -755,11 +847,14 @@ static int handler_state(struct mg_connection* conn, void* cbdata)
 	}
 
 	ss_json_str(&s, level, "health", health_name(state->array.health));
-	if (state->instance[0] != 0) {
-		ss_json_str(&s, level, "instance", state->instance);
+	if (state->host->instance[0] != 0) {
+		ss_json_str(&s, level, "instance", state->host->instance);
 	}
 	if (state->array.health != HEALTH_PASSED && state->array.health_reason[0] != 0)
 		ss_json_str(&s, level, "health_reason", state->array.health_reason);
+	ss_json_str(&s, level, "array", state->name);
+	ss_json_int(&s, level, "arrays_count", tommy_list_count(&state->host->state_list));
+	json_waiting_for(&s, level, state);
 	ss_json_close(&s, &level);
 
 	state_unlock();
@@ -781,7 +876,7 @@ static int handler_system(struct mg_connection* conn, void* cbdata)
 
 	struct snapraid_state* state = cbdata;
 	const struct mg_request_info* ri = mg_get_request_info(conn);
-	struct snapraid_system* system = &state->system;
+	struct snapraid_system* system = &state->host->system;
 	int level = 0;
 	ss_t s;
 
@@ -795,7 +890,7 @@ static int handler_system(struct mg_connection* conn, void* cbdata)
 
 	state_lock();
 
-	app_system_refresh(&state->system);
+	app_system_refresh(&state->host->system);
 
 	ss_json_open(&s, &level);
 	ss_json_str(&s, level, "hostname", system->hostname);
@@ -827,7 +922,7 @@ static int handler_config_patch(struct mg_connection* conn, void* cbdata)
 	char msg[MSG_MAX];
 	struct snapraid_state* state = cbdata;
 	const struct mg_request_info* ri = mg_get_request_info(conn);
-	int is_v2 = strstr(ri->local_uri, "/v2/") != 0;
+	int is_v2 = rest_is_v2(ri);
 	int status;
 	jsmntok_t jv[JSMN_TOKEN_MAX];
 	ssize_t jl;
@@ -860,7 +955,15 @@ static int handler_config_patch(struct mg_connection* conn, void* cbdata)
 				goto bad;
 
 			char keyword[KEYWORD_MAX];
-			if (json_entry(js, &jv[j], json_const("check_updates")) == 0) {
+			if (json_entry(js, &jv[j], json_const("array_parallel")) == 0) {
+				++j;
+				if (json_boolean(js, &jv[j], &transient.array_parallel) == 0) {
+				} else {
+					json_error_arg(msg, sizeof(msg), js, &jv[j - 1], &jv[j]);
+					goto bad;
+				}
+				++j;
+			} else if (json_entry(js, &jv[j], json_const("check_updates")) == 0) {
 				++j;
 				if (json_boolean(js, &jv[j], &transient.check_updates) == 0) {
 				} else {
@@ -1095,6 +1198,16 @@ static int handler_config_patch(struct mg_connection* conn, void* cbdata)
 		}
 	}
 
+	/* the options of the machine are changed only in the default array */
+	if (!config_is_default(state)
+		&& (transient.check_updates != state->config.check_updates
+		|| transient.array_parallel != state->config.array_parallel
+		|| transient.notify_syslog != state->config.notify_syslog
+		|| transient.notify_syslog_level != state->config.notify_syslog_level)) {
+		snprintf(msg, sizeof(msg), "check_updates, array_parallel and notify_syslog_* are options of the machine: change them in the configuration of the array '%s'", ARRAY_DEFAULT);
+		goto bad;
+	}
+
 	config_dup_locked(state, &rollback);
 	config_apply_locked(state, &transient);
 
@@ -1110,6 +1223,10 @@ static int handler_config_patch(struct mg_connection* conn, void* cbdata)
 	}
 
 	config_free(&rollback);
+
+	/* the other arrays follow the options of the machine */
+	if (config_is_default(state))
+		arrays_inherit_locked();
 
 	/* configuration changes may also affect data exposed by /array and /disks. */
 	pulse(state, PULSE_CONFIG | PULSE_DISKS | PULSE_ARRAY);
@@ -1147,7 +1264,7 @@ static int handler_config_get(struct mg_connection* conn, void* cbdata)
 	ss_t s;
 	char schedule_buf[CONFIG_MAX];
 	const struct mg_request_info* ri = mg_get_request_info(conn);
-	int is_v2 = strstr(ri->local_uri, "/v2/") != 0;
+	int is_v2 = rest_is_v2(ri);
 
 	ss_init(&s, JSON_INITIAL_SIZE);
 
@@ -1159,6 +1276,8 @@ static int handler_config_get(struct mg_connection* conn, void* cbdata)
 	json_pulse(&s, level, &state->pulse);
 	ss_json_bool(&s, level, "config_full_access", config->net_config_full_access);
 	ss_json_bool(&s, level, "check_updates", config->check_updates);
+	ss_json_str(&s, level, "array", state->name);
+	ss_json_bool(&s, level, "array_parallel", config->array_parallel);
 	ss_json_str(&s, level, "maintenance_schedule", schedule_buf);
 	ss_json_int(&s, level, "sync_threshold_deletes", config->sync_threshold_deletes);
 	ss_json_int(&s, level, "sync_threshold_updates", config->sync_threshold_updates);
@@ -1186,8 +1305,8 @@ static int handler_config_get(struct mg_connection* conn, void* cbdata)
 	ss_json_str(&s, level, "hook_docker_pause", config->hook_docker_pause);
 
 	log_lock();
-	ss_json_bool(&s, level, "notify_syslog_enabled", state->log.syslog);
-	ss_json_str(&s, level, "notify_syslog_level", config_level_str(state->log.syslog_level));
+	ss_json_bool(&s, level, "notify_syslog_enabled", state->host->log.syslog);
+	ss_json_str(&s, level, "notify_syslog_level", config_level_str(state->host->log.syslog_level));
 	log_unlock();
 
 	ss_json_str(&s, level, "notify_run_as_user", config->notify_run_as_user);
@@ -1218,11 +1337,15 @@ static int handler_config(struct mg_connection* conn, void* cbdata)
 	if (strcmp(ri->request_method, "OPTIONS") == 0)
 		return send_no_content(conn);
 
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
+
 	if (strcmp(ri->request_method, "GET") == 0)
-		return handler_config_get(conn, cbdata);
+		return handler_config_get(conn, state);
 
 	if (strcmp(ri->request_method, "PATCH") == 0)
-		return handler_config_patch(conn, cbdata);
+		return handler_config_patch(conn, state);
 
 	return send_json_error(conn, 405, "Only GET/PATCH is allowed for this endpoint");
 }
@@ -1236,7 +1359,9 @@ static int handler_action(struct mg_connection* conn, void* cbdata)
 		return send_lowercase(conn);
 
 	char msg[MSG_MAX];
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	const char* path = ri->local_uri;
 	int status;
@@ -1263,8 +1388,9 @@ static int handler_action(struct mg_connection* conn, void* cbdata)
 	int has_disk_filters = 0;
 	int has_spindown = 0;
 	int has_threshold = 0;
+	/* the command is the last part, also under arrays/NAME */
 	if (strncmp(path, "/snapraid/v1/", 13) == 0)
-		cmd = command_parse(path + 13);
+		cmd = command_parse(strrchr(path, '/') + 1);
 	switch (cmd) {
 	case 0 :
 	case CMD_START :
@@ -1421,7 +1547,9 @@ static int handler_schedule(struct mg_connection* conn, void* cbdata)
 		return send_lowercase(conn);
 
 	char msg[MSG_MAX];
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int status;
 	jsmntok_t jv[JSMN_TOKEN_MAX];
@@ -1555,7 +1683,9 @@ static int handler_stop(struct mg_connection* conn, void* cbdata)
 		return send_lowercase(conn);
 
 	char msg[MSG_MAX];
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int status;
 	uint64_t display_pid = 0;
@@ -1601,7 +1731,9 @@ static int handler_clear(struct mg_connection* conn, void* cbdata)
 		return send_lowercase(conn);
 
 	char msg[MSG_MAX];
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int status;
 	int count = 0;
@@ -1645,7 +1777,9 @@ static int handler_hold_off(struct mg_connection* conn, void* cbdata)
 		return send_lowercase(conn);
 
 	char msg[MSG_MAX];
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int status;
 	jsmntok_t jv[JSMN_TOKEN_MAX];
@@ -1735,7 +1869,9 @@ static int handler_report(struct mg_connection* conn, void* cbdata)
 		return send_lowercase(conn);
 
 	char msg[MSG_MAX];
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int status;
 
@@ -2116,9 +2252,11 @@ static int handler_disks(struct mg_connection* conn, void* cbdata)
 	if (!rest_uri_is_lowercase(conn))
 		return send_lowercase(conn);
 
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
-	int is_v2 = strstr(ri->local_uri, "/v2/") != 0;
+	int is_v2 = rest_is_v2(ri);
 	int level = 0;
 	ss_t s;
 
@@ -2325,7 +2463,9 @@ static int handler_activity(struct mg_connection* conn, void* cbdata)
 	if (!rest_uri_is_lowercase(conn))
 		return send_lowercase(conn);
 
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int level = 0;
 	ss_t s;
@@ -2370,7 +2510,9 @@ static int handler_tasks(struct mg_connection* conn, void* cbdata)
 	if (!rest_uri_is_lowercase(conn))
 		return send_lowercase(conn);
 
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int level = 0;
 	ss_t s;
@@ -2443,7 +2585,9 @@ static int handler_array(struct mg_connection* conn, void* cbdata)
 	if (!rest_uri_is_lowercase(conn))
 		return send_lowercase(conn);
 
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	struct snapraid_array* array = &state->array;
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int level = 0;
@@ -2496,16 +2640,16 @@ static int handler_array(struct mg_connection* conn, void* cbdata)
 	json_pulse(&s, level, &state->pulse);
 	ss_json_str(&s, level, "daemon_version", PACKAGE_VERSION);
 	if (state->config.check_updates) {
-		if (state->latest_daemon_version[0] != 0) {
-			ss_json_str(&s, level, "latest_daemon_version", state->latest_daemon_version);
+		if (state->host->latest_daemon_version[0] != 0) {
+			ss_json_str(&s, level, "latest_daemon_version", state->host->latest_daemon_version);
 		}
-		if (state->latest_engine_version[0] != 0) {
-			ss_json_str(&s, level, "latest_engine_version", state->latest_engine_version);
+		if (state->host->latest_engine_version[0] != 0) {
+			ss_json_str(&s, level, "latest_engine_version", state->host->latest_engine_version);
 		}
 	}
 	ss_json_str(&s, level, "daemon_conf", state->config.conf);
-	if (state->instance[0] != 0) {
-		ss_json_str(&s, level, "instance", state->instance);
+	if (state->host->instance[0] != 0) {
+		ss_json_str(&s, level, "instance", state->host->instance);
 	}
 	ss_json_str(&s, level, "health", health_name(state->array.health));
 	if (*state->engine_version)
@@ -2711,7 +2855,9 @@ static int handler_storage(struct mg_connection* conn, void* cbdata)
 	if (!rest_uri_is_lowercase(conn))
 		return send_lowercase(conn);
 
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	int level = 0;
 	ss_t s;
@@ -2790,7 +2936,9 @@ static int handler_storage_action(struct mg_connection* conn, void* cbdata)
 		return send_lowercase(conn);
 
 	char msg[MSG_MAX];
-	struct snapraid_state* state = cbdata;
+	struct snapraid_state* state = rest_state(conn, cbdata);
+	if (state == 0)
+		return send_no_array(conn);
 	const struct mg_request_info* ri = mg_get_request_info(conn);
 	const char* action = strrchr(ri->local_uri, '/') + 1;
 	int is_conf = strcmp(action, "engine_conf") == 0;
@@ -2903,16 +3051,8 @@ static int handler_storage_action(struct mg_connection* conn, void* cbdata)
 		};
 		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
 		if (status == 0) {
-			/* moving files under a running sync would make it fail */
-			state_lock();
-			int working = state->runner.latest != 0 && state->runner.latest->running;
-			state_unlock();
-			if (working) {
-				snprintf(msg, sizeof(msg), "A SnapRAID task is running. Balance the pool when it has finished.");
-				status = 409;
-			} else {
-				status = storage_balance_start(a, strtoull(b, 0, 10), (unsigned)strtoul(c, 0, 10), msg, sizeof(msg));
-			}
+			/* it's refused while an array of the pool works on its disks, see storage_balance_start() */
+			status = storage_balance_start(a, strtoull(b, 0, 10), (unsigned)strtoul(c, 0, 10), msg, sizeof(msg));
 		}
 	} else if (strcmp(action, "duplicates") == 0) {
 		struct json_field fields[] = {
@@ -2980,6 +3120,244 @@ static int handler_storage_action(struct mg_connection* conn, void* cbdata)
 	ss_done(&s);
 
 	return 200;
+}
+
+/****************************************************************************/
+/* arrays */
+
+/**
+ * Emit the summary of an array as an object. The state lock must be held.
+ */
+static void json_array_summary(ss_t* s, int level, struct snapraid_state* state)
+{
+	char engine_conf[PATH_MAX];
+	uint64_t total_space_bytes = 0;
+	uint64_t free_space_bytes = 0;
+	int data_count = 0;
+
+	for (tommy_node* i = tommy_list_head(&state->array.disk_list); i; i = i->next) {
+		struct snapraid_disk* disk = i->data;
+
+		if (disk->kind != DISK_DATA)
+			continue;
+
+		++data_count;
+		if (disk->total_space_bytes == SMART_UNASSIGNED || total_space_bytes == SMART_UNASSIGNED)
+			total_space_bytes = SMART_UNASSIGNED;
+		else
+			total_space_bytes += disk->total_space_bytes;
+		if (disk->free_space_bytes == SMART_UNASSIGNED || free_space_bytes == SMART_UNASSIGNED)
+			free_space_bytes = SMART_UNASSIGNED;
+		else
+			free_space_bytes += disk->free_space_bytes;
+	}
+
+	array_engine_conf_locked(state, engine_conf, sizeof(engine_conf));
+
+	ss_json_open(s, &level);
+	ss_json_str(s, level, "name", state->name);
+	ss_json_bool(s, level, "default", config_is_default(state));
+	ss_json_str(s, level, "daemon_conf", state->config.conf);
+	if (engine_conf[0] != 0)
+		ss_json_str(s, level, "engine_conf", engine_conf);
+
+	/* an array without disks is a place still to set up */
+	ss_json_bool(s, level, "configured", !tommy_list_empty(&state->array.disk_list));
+	ss_json_str(s, level, "health", health_name(state->array.health));
+	if (state->array.health != HEALTH_PASSED && state->array.health_reason[0] != 0)
+		ss_json_str(s, level, "health_reason", state->array.health_reason);
+	ss_json_int(s, level, "data_disks_count", disk_count(&state->array.disk_list, DISK_DATA));
+	ss_json_int(s, level, "parity_disks_count", disk_count(&state->array.disk_list, DISK_PARITY));
+	if (data_count != 0 && total_space_bytes != SMART_UNASSIGNED)
+		ss_json_u64(s, level, "total_space_bytes", total_space_bytes);
+	if (data_count != 0 && free_space_bytes != SMART_UNASSIGNED)
+		ss_json_u64(s, level, "free_space_bytes", free_space_bytes);
+	if (state->array.sync_time)
+		ss_json_pair_iso8601(s, level, "last_sync_at", state->array.sync_time);
+	if (state->array.scrub_time)
+		ss_json_pair_iso8601(s, level, "last_scrub_at", state->array.scrub_time);
+	ss_json_u64(s, level, "block_unsynced", state->array.block_unsynced);
+	ss_json_u64(s, level, "block_bad", state->array.block_bad);
+	ss_json_u64(s, level, "diff_pending", state->array.diff_current.diff_added + state->array.diff_current.diff_removed
+		+ state->array.diff_current.diff_updated + state->array.diff_current.diff_moved
+		+ state->array.diff_current.diff_copied + state->array.diff_current.diff_relocated
+		+ state->array.diff_current.diff_restored);
+
+	if (state->runner.latest && state->runner.latest->running) {
+		struct snapraid_task* task = state->runner.latest;
+		ss_json_str(s, level, "active_command", command_name(task->cmd));
+		if (task->state == PROCESS_STATE_RUN
+			&& (task->cmd == CMD_SYNC || task->cmd == CMD_SCRUB || task->cmd == CMD_FIX || task->cmd == CMD_CHECK)) {
+			ss_json_int(s, level, "progress", task->progress);
+			ss_json_uint(s, level, "eta_seconds", task->eta_seconds);
+		}
+	}
+	ss_json_int(s, level, "pending_count", tommy_list_count(&state->runner.waiting_list));
+	json_waiting_for(s, level, state);
+	json_pulse(s, level, &state->pulse);
+	ss_json_close(s, &level);
+}
+
+/**
+ * GET  /snapraid/v1/arrays
+ * POST /snapraid/v1/arrays
+ */
+static int handler_arrays(struct mg_connection* conn, void* cbdata)
+{
+	if (!rest_uri_is_lowercase(conn))
+		return send_lowercase(conn);
+
+	struct snapraid_state* state = cbdata;
+	const struct mg_request_info* ri = mg_get_request_info(conn);
+	char msg[MSG_MAX];
+	int level = 0;
+	ss_t s;
+
+	if (strcmp(ri->request_method, "OPTIONS") == 0)
+		return send_no_content(conn);
+
+	if (strcmp(ri->request_method, "GET") == 0) {
+		char dir[PATH_MAX];
+
+		ss_init(&s, JSON_INITIAL_SIZE);
+
+		state_lock();
+
+		arrays_dir(dir, sizeof(dir));
+
+		ss_json_open(&s, &level);
+		ss_json_bool(&s, level, "array_parallel", state->config.array_parallel);
+		ss_json_str(&s, level, "arrays_dir", dir);
+		ss_json_array_open(&s, &level, "arrays");
+		for (tommy_node* i = tommy_list_head(&state->host->state_list); i; i = i->next)
+			json_array_summary(&s, level, i->data);
+		ss_json_array_close(&s, &level);
+		ss_json_close(&s, &level);
+
+		state_unlock();
+
+		send_json_answer(conn, 200, &s);
+		ss_done(&s);
+		return 200;
+	}
+
+	if (strcmp(ri->request_method, "POST") != 0)
+		return send_json_error(conn, 405, "Only GET/POST is allowed for this endpoint");
+
+	/* a new array is a new configuration file and a new set of disks to manage */
+	if (storage_admin_check(state, msg, sizeof(msg)) != 0)
+		return send_json_error(conn, 403, msg);
+
+	ssize_t jl;
+	char* js;
+	int status = json_read(conn, &js, &jl, msg, sizeof(msg));
+	if (status != 200)
+		return send_json_error(conn, status, msg);
+
+	size_t size = jl + 1;
+	char* name = malloc_nofail(size * 2);
+	char* engine_conf = name + size;
+	name[0] = engine_conf[0] = 0;
+
+	struct json_field fields[] = {
+		{ "name", FIELD_STRING, name, size, 0, 0 },
+		{ "engine_conf", FIELD_STRING, engine_conf, size, 0, 0 },
+		{ 0, 0, 0, 0, 0, 0 }
+	};
+
+	msg[0] = 0;
+	if (json_fields(js, jl, fields, msg, sizeof(msg)) != 0) {
+		status = 400;
+	} else if (!fields[0].seen) {
+		snprintf(msg, sizeof(msg), "Missing the name of the array");
+		status = 400;
+	} else {
+		array_create(name, engine_conf, msg, sizeof(msg), &status);
+	}
+
+	if (status != 201) {
+		free(name);
+		free(js);
+		return send_json_error(conn, status, msg[0] ? msg : "Unrecognized json");
+	}
+
+	ss_init(&s, JSON_INITIAL_SIZE);
+
+	state_lock();
+	struct snapraid_state* created = state_find_locked(name);
+	if (created != 0)
+		json_array_summary(&s, level, created);
+	state_unlock();
+
+	free(name);
+	free(js);
+
+	if (created == 0) {
+		ss_done(&s);
+		return send_json_success(conn, 201);
+	}
+
+	send_json_answer(conn, 201, &s);
+	ss_done(&s);
+	return 201;
+}
+
+/**
+ * GET    /snapraid/v1/arrays/NAME
+ * DELETE /snapraid/v1/arrays/NAME
+ */
+static int handler_arrays_one(struct mg_connection* conn, void* cbdata)
+{
+	if (!rest_uri_is_lowercase(conn))
+		return send_lowercase(conn);
+
+	const struct mg_request_info* ri = mg_get_request_info(conn);
+	char name[ARRAY_NAME_MAX];
+	char msg[MSG_MAX];
+	int level = 0;
+	int status;
+	ss_t s;
+
+	if (strcmp(ri->request_method, "OPTIONS") == 0)
+		return send_no_content(conn);
+
+	if (rest_array_name(ri->local_uri, name, sizeof(name)) != 0)
+		return send_no_array(conn);
+
+	if (strcmp(ri->request_method, "GET") == 0) {
+		ss_init(&s, JSON_INITIAL_SIZE);
+
+		state_lock();
+		struct snapraid_state* state = state_find_locked(name);
+		if (state != 0)
+			json_array_summary(&s, level, state);
+		state_unlock();
+
+		if (state == 0) {
+			ss_done(&s);
+			return send_no_array(conn);
+		}
+
+		send_json_answer(conn, 200, &s);
+		ss_done(&s);
+		return 200;
+	}
+
+	if (strcmp(ri->request_method, "DELETE") != 0)
+		return send_json_error(conn, 405, "Only GET/DELETE is allowed for this endpoint");
+
+	if (storage_admin_check(cbdata, msg, sizeof(msg)) != 0)
+		return send_json_error(conn, 403, msg);
+
+	/* nothing is expected in the body, but the content type keeps other sites away */
+	status = json_request_check(conn, msg, sizeof(msg));
+	if (status != 200)
+		return send_json_error(conn, status, msg);
+
+	if (array_remove(name, msg, sizeof(msg), &status) != 0)
+		return send_json_error(conn, status, msg);
+
+	return send_json_success(conn, 200);
 }
 
 /**
@@ -3129,10 +3507,37 @@ static int handler_metrics(struct mg_connection* conn, void* cbdata)
 	if (strcmp(ri->request_method, "GET") != 0)
 		return send_json_error(conn, 405, "Only GET is allowed for this endpoint");
 
+	/*
+	 * The metrics are of one array: the default one, or the one asked with
+	 * /metrics?array=NAME. A metric family cannot be declared twice in the
+	 * same answer, so every array is scraped on its own. Only the health of
+	 * all the arrays is always given, with the array as label.
+	 */
+	char array_name[ARRAY_NAME_MAX];
+	int has_array = ri->query_string != 0
+		&& mg_get_var(ri->query_string, strlen(ri->query_string), "array", array_name, sizeof(array_name)) > 0;
+
 	ss_t s;
 	ss_init(&s, METRICS_INITIAL_SIZE);
 
 	state_lock();
+
+	if (has_array) {
+		state = state_find_locked(array_name);
+		if (state == 0) {
+			state_unlock();
+			ss_done(&s);
+			return send_no_array(conn);
+		}
+	}
+
+	ss_prints(&s, "# HELP snapraid_arrays_health Health state of every array handled by the daemon (pending=0, passed=1, corrupt=2, degraded=3, prefail=4, failing=5)\n");
+	ss_prints(&s, "# TYPE snapraid_arrays_health gauge\n");
+	for (tommy_node* i = tommy_list_head(&state->host->state_list); i; i = i->next) {
+		struct snapraid_state* other = i->data;
+		ss_printf(&s, "snapraid_arrays_health{array=\"%s\"} %d\n", other->name, metrics_health_numeric(other->array.health));
+	}
+	ss_prints(&s, "\n");
 
 	struct snapraid_array* array = &state->array;
 	struct snapraid_config* config = &state->config;
@@ -3504,7 +3909,7 @@ static int handler_metrics(struct mg_connection* conn, void* cbdata)
 	/* daemon uptime */
 	ss_prints(&s, "# HELP snapraid_daemon_uptime_seconds Seconds the daemon has been running\n");
 	ss_prints(&s, "# TYPE snapraid_daemon_uptime_seconds gauge\n");
-	ss_printf(&s, "snapraid_daemon_uptime_seconds %" PRIi64 "\n", (int64_t)(time(0) - state->daemon_start_time));
+	ss_printf(&s, "snapraid_daemon_uptime_seconds %" PRIi64 "\n", (int64_t)(time(0) - state->host->daemon_start_time));
 	ss_prints(&s, "\n");
 
 	/* exporter up */
@@ -3562,7 +3967,7 @@ static int auth_handler_callback(struct mg_connection* conn, void* cbdata)
 	}
 
 	/* check if the token is already in the cache */
-	if (b64_payload != 0 && state->rest_auth_cache[0] != 0 && strcmp(state->rest_auth_cache, b64_payload) == 0) {
+	if (b64_payload != 0 && state->host->rest_auth_cache[0] != 0 && strcmp(state->host->rest_auth_cache, b64_payload) == 0) {
 		state_unlock();
 		return 1;
 	}
@@ -3596,10 +4001,10 @@ static int auth_handler_callback(struct mg_connection* conn, void* cbdata)
 	 * this limiter through rest_auth_cache.
 	 */
 	state_lock();
-	if (state->rest_latest_auth != 0 && now - state->rest_latest_auth < AUTH_DELAY_SECONDS) {
+	if (state->host->rest_latest_auth != 0 && now - state->host->rest_latest_auth < AUTH_DELAY_SECONDS) {
 		too_fast = 1;
 	} else {
-		state->rest_latest_auth = now;
+		state->host->rest_latest_auth = now;
 	}
 	state_unlock();
 
@@ -3747,7 +4152,7 @@ static int auth_handler_callback(struct mg_connection* conn, void* cbdata)
 	state_lock();
 	credential_changed = strcmp(state->config.net_auth_credential, net_auth_credential) != 0;
 	if (!credential_changed && cacheable) {
-		sncpy(state->rest_auth_cache, sizeof(state->rest_auth_cache), b64_payload);
+		sncpy(state->host->rest_auth_cache, sizeof(state->host->rest_auth_cache), b64_payload);
 	}
 	state_unlock();
 
@@ -3818,75 +4223,100 @@ int rest_init(struct snapraid_state* state, int net_enabled, const char* net_por
 		return -1;
 	}
 
-	memset(&state->rest_callbacks, 0, sizeof(state->rest_callbacks));
+	memset(&state->host->rest_callbacks, 0, sizeof(state->host->rest_callbacks));
 
-	state->rest_callbacks.log_message = log_internal_callback;
+	state->host->rest_callbacks.log_message = log_internal_callback;
 
-	state->rest_context = mg_start(&state->rest_callbacks, state, options);
-	if (!state->rest_context && listening_port_default) {
+	state->host->rest_context = mg_start(&state->host->rest_callbacks, state, options);
+	if (!state->host->rest_context && listening_port_default) {
 		/* retry with only IPv4 */
 		log_msg(LVL_WARNING, "failed to start web server binding to both IPv4 and IPv6, going to retry with IPv4 only, errno=%s(%d)", strerror(errno), errno);
 		sncpy(listening_port, sizeof(listening_port), "127.0.0.1:7627");
-		state->rest_context = mg_start(&state->rest_callbacks, state, options);
+		state->host->rest_context = mg_start(&state->host->rest_callbacks, state, options);
 	}
-	if (!state->rest_context) {
+	if (!state->host->rest_context) {
 		log_msg(LVL_ERROR, "failed to start web server, errno=%s(%d)", strerror(errno), errno);
 		mg_exit_library();
 		return -1;
 	}
 
-	if (mg_set_auth_handler(state->rest_context, "**", auth_handler_callback, state) != 0) {
+	if (mg_set_auth_handler(state->host->rest_context, "**", auth_handler_callback, state) != 0) {
 		log_msg(LVL_ERROR, "failed to install REST authentication handler");
-		mg_stop(state->rest_context);
-		state->rest_context = 0;
+		mg_stop(state->host->rest_context);
+		state->host->rest_context = 0;
 		mg_exit_library();
 		return -1;
 	}
 
-	if (mg_set_request_handler(state->rest_context, "/snapraid/v1/maintenance$", handler_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/heal$", handler_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/undelete$", handler_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/suspend_idle$", handler_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/refresh$", handler_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/schedule$", handler_schedule, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/stop$", handler_stop, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/clear$", handler_clear, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/report$", handler_report, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/disks$", handler_disks, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v2/disks$", handler_disks, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/activity$", handler_activity, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/tasks$", handler_tasks, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/config$", handler_config, state) != 0 /* deprecated but kept for compatibility */
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v2/config$", handler_config, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/array$", handler_array, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/state$", handler_state, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/system$", handler_system, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/hold_off$", handler_hold_off, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage$", handler_storage, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/engine_conf$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/format$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/mount$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/unmount$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/pool$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/mkdir$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/recover$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/balance$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/duplicates$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/job_stop$", handler_storage_action, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/job$", handler_storage, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/v1/storage/browse$", handler_storage, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/metrics$", handler_metrics, state) != 0
+	/* the endpoints of an array: for the default one as they always were, and for every array under arrays/NAME */
+	static const struct {
+		const char* path;
+		int (*handler)(struct mg_connection*, void*);
+	} ARRAY_ROUTES[] = {
+		{ "v1/maintenance", handler_action },
+		{ "v1/heal", handler_action },
+		{ "v1/undelete", handler_action },
+		{ "v1/suspend_idle", handler_action },
+		{ "v1/refresh", handler_action },
+		{ "v1/schedule", handler_schedule },
+		{ "v1/stop", handler_stop },
+		{ "v1/clear", handler_clear },
+		{ "v1/report", handler_report },
+		{ "v1/disks", handler_disks },
+		{ "v2/disks", handler_disks },
+		{ "v1/activity", handler_activity },
+		{ "v1/tasks", handler_tasks },
+		{ "v1/config", handler_config }, /* deprecated but kept for compatibility */
+		{ "v2/config", handler_config },
+		{ "v1/array", handler_array },
+		{ "v1/state", handler_state },
+		{ "v1/hold_off", handler_hold_off },
+		{ "v1/storage", handler_storage },
+		{ "v1/storage/engine_conf", handler_storage_action },
+		{ "v1/storage/format", handler_storage_action },
+		{ "v1/storage/mount", handler_storage_action },
+		{ "v1/storage/unmount", handler_storage_action },
+		{ "v1/storage/pool", handler_storage_action },
+		{ "v1/storage/mkdir", handler_storage_action },
+		{ "v1/storage/recover", handler_storage_action },
+		{ "v1/storage/balance", handler_storage_action },
+		{ "v1/storage/duplicates", handler_storage_action },
+		{ "v1/storage/job_stop", handler_storage_action },
+		{ "v1/storage/job", handler_storage },
+		{ "v1/storage/browse", handler_storage },
+		{ 0, 0 }
+	};
+
+	int failed = 0;
+	for (unsigned r = 0; ARRAY_ROUTES[r].path; ++r) {
+		char uri[128];
+
+		snprintf(uri, sizeof(uri), "/snapraid/%s$", ARRAY_ROUTES[r].path);
+		if (mg_set_request_handler(state->host->rest_context, uri, ARRAY_ROUTES[r].handler, state) != 0)
+			failed = 1;
+
+		/* under arrays/NAME there is only the latest version: the v2 handler replaces the v1 one */
+		snprintf(uri, sizeof(uri), REST_ARRAYS "*/%s$", ARRAY_ROUTES[r].path + 3);
+		if (mg_set_request_handler(state->host->rest_context, uri, ARRAY_ROUTES[r].handler, state) != 0)
+			failed = 1;
+	}
+
+	if (failed
+		|| mg_set_request_handler(state->host->rest_context, "/snapraid/v1/system$", handler_system, state) != 0
+		|| mg_set_request_handler(state->host->rest_context, "/snapraid/v1/arrays$", handler_arrays, state) != 0
+		|| mg_set_request_handler(state->host->rest_context, REST_ARRAYS "*$", handler_arrays_one, state) != 0
+		|| mg_set_request_handler(state->host->rest_context, "/metrics$", handler_metrics, state) != 0
 
 	        /*
 	         * Keep REST unknown paths inside the REST namespace, but make the
 	         * fallback itself a pattern so it does not win CivetWeb's prefix-match
 	         * phase before the exact endpoint patterns above are considered.
 	         */
-		|| mg_set_request_handler(state->rest_context, "/snapraid$", handler_not_found, state) != 0
-		|| mg_set_request_handler(state->rest_context, "/snapraid/**", handler_not_found, state) != 0) {
+		|| mg_set_request_handler(state->host->rest_context, "/snapraid$", handler_not_found, state) != 0
+		|| mg_set_request_handler(state->host->rest_context, "/snapraid/**", handler_not_found, state) != 0) {
 		log_msg(LVL_ERROR, "failed to install REST request handlers");
-		mg_stop(state->rest_context);
-		state->rest_context = 0;
+		mg_stop(state->host->rest_context);
+		state->host->rest_context = 0;
 		mg_exit_library();
 		return -1;
 	}
@@ -3898,12 +4328,12 @@ int rest_init(struct snapraid_state* state, int net_enabled, const char* net_por
 
 void rest_done(struct snapraid_state* state, int net_enabled)
 {
-	if (!net_enabled && !state->rest_context)
+	if (!net_enabled && !state->host->rest_context)
 		return;
 
-	if (state->rest_context) {
-		mg_stop(state->rest_context);
-		state->rest_context = 0;
+	if (state->host->rest_context) {
+		mg_stop(state->host->rest_context);
+		state->host->rest_context = 0;
 	}
 
 	mg_exit_library();

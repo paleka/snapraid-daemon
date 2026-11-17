@@ -72,6 +72,18 @@ void config_init(struct snapraid_state* state);
 void config_done(struct snapraid_state* state);
 
 /**
+ * Check if the state is the one of the default array, defined by the main
+ * configuration file, where the options of the machine are set.
+ */
+int config_is_default(const struct snapraid_state* state);
+
+/**
+ * Copy the options of the machine from the default array to another array.
+ * It does nothing for the default array.
+ */
+void config_inherit_locked(struct snapraid_state* state);
+
+/**
  * Set a configuration to default values
  */
 void config_default_locked(struct snapraid_state* state);

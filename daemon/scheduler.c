@@ -585,6 +585,8 @@ void* scheduler_thread(void* arg)
 	int64_t last_version_check_ts;
 	int64_t version_check_interval_secs;
 
+	log_bind(state);
+
 	last = state->scheduler.start_time;
 	localtime_r(&last, &last_tm);
 	last_probe_and_spindown_ts = os_tick_sec();
@@ -749,7 +751,7 @@ void* scheduler_thread(void* arg)
 		if (!daemon_is_running(state))
 			break;
 
-		thread_cond_wait(&state->scheduler.cond, &state->state_lock);
+		thread_cond_wait(&state->scheduler.cond, &state->host->state_lock);
 	}
 
 	state_unlock();

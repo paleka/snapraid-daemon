@@ -76,6 +76,46 @@ static void log_out(int level, int syslog, int termlog, const char* fmt, va_list
 
 #define LOG_MAX 1024
 
+static void log_array(int level, int syslog, int termlog, const char* fmt, ...) __attribute__((format(attribute_printf, 4, 5)));
+
+static void log_array(int level, int syslog, int termlog, const char* fmt, ...)
+{
+	va_list ap;
+
+	va_start(ap, fmt);
+	log_out(level, syslog, termlog, fmt, ap);
+	va_end(ap);
+}
+
+/**
+ * Array the current thread works for, or 0 for the threads of the daemon
+ * that are not specific of an array.
+ *
+ * Every array has its own runner and scheduler threads, working at the same
+ * time: what they log is told apart with the name of the array, and the
+ * messages for the task log are kept separated.
+ */
+static __thread struct snapraid_state* log_bound;
+
+void log_bind(struct snapraid_state* state)
+{
+	log_bound = state;
+}
+
+/**
+ * Like log_out(), with the name of the array in front, if not the default one.
+ */
+static void log_emit(int level, int syslog, int termlog, const char* fmt, va_list ap)
+{
+	if (log_bound == 0 || strcmp(log_bound->name, ARRAY_DEFAULT) == 0) {
+		log_out(level, syslog, termlog, fmt, ap);
+	} else {
+		char buf[LOG_MAX];
+		vsnprintf(buf, sizeof(buf), fmt, ap);
+		log_array(level, syslog, termlog, "[%s] %s", log_bound->name, buf);
+	}
+}
+
 void vlog_msg(int level, const char* fmt, va_list ap)
 {
 	int syslog;
@@ -83,21 +123,21 @@ void vlog_msg(int level, const char* fmt, va_list ap)
 	int verboselog;
 
 	/*
-	 * Access fields of state->log requiring only log_lock (state_lock is not required).
-	 * state_ptr() merely returns the global struct pointer without acquiring state_lock.
+	 * Access fields of state->host->log requiring only log_lock (state_lock is not required).
+	 * host_ptr() merely returns the global struct pointer without acquiring state_lock.
 	 */
 	log_lock();
-	struct snapraid_state* state = state_ptr();
-	syslog = state->log.syslog && level <= state->log.syslog_level;
-	termlog = state->log.foreground;
-	verboselog = state->log.verbose;
+	struct snapraid_host* host = host_ptr();
+	syslog = host->log.syslog && level <= host->log.syslog_level;
+	termlog = host->log.foreground;
+	verboselog = host->log.verbose;
 
 	log_unlock();
 
 	if (level == LVL_DEBUG && !verboselog)
 		return;
 
-	log_out(level, syslog, termlog, fmt, ap);
+	log_emit(level, syslog, termlog, fmt, ap);
 }
 
 void log_msg(int level, const char* fmt, ...)
@@ -116,14 +156,14 @@ void vlog_task(int level, const char* fmt, va_list ap)
 	int verboselog;
 
 	/*
-	 * Access fields of state->log requiring only log_lock (state_lock is not required).
-	 * state_ptr() merely returns the global struct pointer without acquiring state_lock.
+	 * Access fields of state->host->log requiring only log_lock (state_lock is not required).
+	 * host_ptr() merely returns the global struct pointer without acquiring state_lock.
 	 */
 	log_lock();
-	struct snapraid_state* state = state_ptr();
-	syslog = state->log.syslog && level <= state->log.syslog_level;
-	termlog = state->log.foreground;
-	verboselog = state->log.verbose;
+	struct snapraid_host* host = host_ptr();
+	syslog = host->log.syslog && level <= host->log.syslog_level;
+	termlog = host->log.foreground;
+	verboselog = host->log.verbose;
 
 	/* output also in the task log */
 	if (level < LVL_INFO) {
@@ -137,7 +177,9 @@ void vlog_task(int level, const char* fmt, va_list ap)
 		vsnprintf(buf + len, sizeof(buf) - len, fmt, ap2);
 		va_end(ap2);
 
-		message_insert(&state->log.task_list, level, MESSAGE_TYPE_SOFTWARE, buf);
+		/* what is logged by a thread not working for an array goes to the default one */
+		struct snapraid_state* state = log_bound != 0 ? log_bound : state_ptr();
+		message_insert(&state->log_task_list, level, MESSAGE_TYPE_SOFTWARE, buf);
 	}
 
 	log_unlock();
@@ -145,7 +187,7 @@ void vlog_task(int level, const char* fmt, va_list ap)
 	if (level == LVL_DEBUG && !verboselog)
 		return;
 
-	log_out(level, syslog, termlog, fmt, ap);
+	log_emit(level, syslog, termlog, fmt, ap);
 }
 
 void log_task(int level, const char* fmt, ...)
@@ -176,9 +218,9 @@ void log_task_reset(void)
 {
 	log_lock();
 
-	struct snapraid_state* state = state_ptr();
-	tommy_list_foreach(&state->log.task_list, message_free);
-	tommy_list_init(&state->log.task_list);
+	struct snapraid_state* state = log_bound != 0 ? log_bound : state_ptr();
+	tommy_list_foreach(&state->log_task_list, message_free);
+	tommy_list_init(&state->log_task_list);
 
 	log_unlock();
 }
@@ -187,9 +229,9 @@ void log_task_push(tommy_list* message_list)
 {
 	log_lock();
 
-	struct snapraid_state* state = state_ptr();
+	struct snapraid_state* state = log_bound != 0 ? log_bound : state_ptr();
 
-	tommy_node* i = tommy_list_head(&state->log.task_list);
+	tommy_node* i = tommy_list_head(&state->log_task_list);
 	while (i != 0) {
 		tommy_node* i_next = i->next;
 		struct snapraid_message* message = i->data;
@@ -199,7 +241,7 @@ void log_task_push(tommy_list* message_list)
 		i = i_next;
 	}
 
-	tommy_list_init(&state->log.task_list);
+	tommy_list_init(&state->log_task_list);
 
 	log_unlock();
 }

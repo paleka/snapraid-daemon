@@ -229,10 +229,10 @@ int version_check_locked_yield(struct snapraid_state* state)
 	state_lock();
 
 	if (daemon_version[0] != 0)
-		sncpy(state->latest_daemon_version, sizeof(state->latest_daemon_version), daemon_version);
+		sncpy(state->host->latest_daemon_version, sizeof(state->host->latest_daemon_version), daemon_version);
 
 	if (engine_version[0] != 0)
-		sncpy(state->latest_engine_version, sizeof(state->latest_engine_version), engine_version);
+		sncpy(state->host->latest_engine_version, sizeof(state->host->latest_engine_version), engine_version);
 
 	if (daemon_version[0] != 0 || engine_version[0] != 0)
 		pulse(state, PULSE_ARRAY);
@@ -329,13 +329,13 @@ int version_update_available_locked(const struct snapraid_state* state)
 	if (!state->config.check_updates)
 		return 0;
 
-	if (state->latest_daemon_version[0] != 0) {
-		if (version_cmp(PACKAGE_VERSION, state->latest_daemon_version) < 0)
+	if (state->host->latest_daemon_version[0] != 0) {
+		if (version_cmp(PACKAGE_VERSION, state->host->latest_daemon_version) < 0)
 			return 1;
 	}
 
-	if (state->latest_engine_version[0] != 0 && state->engine_version[0] != 0) {
-		if (version_cmp(state->engine_version, state->latest_engine_version) < 0)
+	if (state->host->latest_engine_version[0] != 0 && state->engine_version[0] != 0) {
+		if (version_cmp(state->engine_version, state->host->latest_engine_version) < 0)
 			return 1;
 	}
 

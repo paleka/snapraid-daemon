@@ -29,8 +29,8 @@ static void app_signal_handler_term(int sig)
 {
 	struct snapraid_state* state = state_ptr();
 
-	state->daemon_sig = sig;
-	state->daemon_terminating = 1;
+	state->host->daemon_sig = sig;
+	state->host->daemon_terminating = 1;
 }
 
 /****************************************************************************/
@@ -740,9 +740,9 @@ static int do_service_install(const struct snapraid_state* state)
 	sncat(bin_path, sizeof(bin_path), path);
 	sncat(bin_path, sizeof(bin_path), "\"");
 
-	if (state->instance[0]) {
+	if (state->host->instance[0]) {
 		sncat(bin_path, sizeof(bin_path), " -i ");
-		sncat(bin_path, sizeof(bin_path), state->instance);
+		sncat(bin_path, sizeof(bin_path), state->host->instance);
 	}
 	if (state->config.conf[0]) {
 		sncat(bin_path, sizeof(bin_path), " -c \"");
@@ -1126,7 +1126,7 @@ VOID WINAPI ServiceMain(DWORD argc, LPWSTR* argv)
 	 * is already terminating. Evaluate the final daemon status only after all worker threads
 	 * have stopped.
 	 */
-	if (state->daemon_failing || state->daemon_aborting)
+	if (state->host->daemon_failing || state->host->daemon_aborting)
 		ret = -1;
 
 	state_done(state);
@@ -1159,7 +1159,7 @@ int main(int argc, char* argv[])
 
 	daemon_options(state, argc, argv);
 
-	if (state->service_install) {
+	if (state->host->service_install) {
 		int ret = do_service_install(state);
 		state_done(state);
 		app_done();
@@ -1167,7 +1167,7 @@ int main(int argc, char* argv[])
 		return ret != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 	}
 
-	if (state->service_remove) {
+	if (state->host->service_remove) {
 		int ret = do_service_remove();
 		state_done(state);
 		app_done();
@@ -1175,7 +1175,7 @@ int main(int argc, char* argv[])
 		return ret != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 	}
 
-	if (state->service_start_all) {
+	if (state->host->service_start_all) {
 		int ret = do_service_start_all();
 		state_done(state);
 		app_done();
@@ -1183,7 +1183,7 @@ int main(int argc, char* argv[])
 		return ret != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 	}
 
-	if (state->service_stop_all) {
+	if (state->host->service_stop_all) {
 		int ret = do_service_stop_all();
 		state_done(state);
 		app_done();
@@ -1191,7 +1191,7 @@ int main(int argc, char* argv[])
 		return ret != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 	}
 
-	if (state->service_remove_all) {
+	if (state->host->service_remove_all) {
 		int ret = do_service_remove_all();
 		state_done(state);
 		app_done();
@@ -1199,7 +1199,7 @@ int main(int argc, char* argv[])
 		return ret != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 	}
 
-	if (state->service_list) {
+	if (state->host->service_list) {
 		int ret = do_service_list();
 		state_done(state);
 		app_done();
@@ -1207,7 +1207,7 @@ int main(int argc, char* argv[])
 		return ret != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 	}
 
-	if (state->log.foreground) {
+	if (state->host->log.foreground) {
 		if (!SetConsoleCtrlHandler(console_handler, TRUE)) {
 			exit(EXIT_FAILURE);
 		}
@@ -1224,7 +1224,7 @@ int main(int argc, char* argv[])
 		 * is already terminating. Evaluate the final daemon status only after all worker threads
 		 * have stopped.
 		 */
-		if (state->daemon_failing || state->daemon_aborting)
+		if (state->host->daemon_failing || state->host->daemon_aborting)
 			ret = -1;
 
 		state_done(state);

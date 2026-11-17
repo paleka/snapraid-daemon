@@ -65,6 +65,12 @@ int storage_pool(const char* mountpoint, const char* branches, const char* optio
 /** Emit the state of the last background job as fields of the open JSON object. */
 void storage_job_json(ss_t* s, int level);
 
+/**
+ * Check if the running background job is changing the data disks of an array.
+ * The commands of the array that work on the whole disks wait for it.
+ */
+int storage_job_claims_array(const char* name);
+
 /** Ask the running background job to stop at the first safe point. */
 int storage_job_stop(char* msg, size_t msg_size);
 

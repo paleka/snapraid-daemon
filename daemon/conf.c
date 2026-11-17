@@ -348,14 +348,83 @@ int config_parse_level(const char* input, int* out)
 	return -1;
 }
 
+/**
+ * Options of the machine. They are set only in the main configuration file,
+ * and are refused in the configuration of the other arrays.
+ */
+static int config_key_is_machine(const char* key)
+{
+	static const char* MACHINE[] = {
+		"sys_engine", "sys_log_directory", "sys_log_retention_days", "sys_log_compression", "sys_shutdown_on",
+		"net_enabled", "net_port", "net_acl", "net_security_headers", "net_allowed_origin",
+		"net_config_full_access", "net_storage_admin", "net_web_root", "net_auth_credential",
+		"check_updates", "array_parallel", "notify_syslog_enabled", "notify_syslog_level", 0
+	};
+
+	for (unsigned i = 0; MACHINE[i]; ++i) {
+		if (strcmp(key, MACHINE[i]) == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+int config_is_default(const struct snapraid_state* state)
+{
+	return state == state_ptr();
+}
+
+void config_inherit_locked(struct snapraid_state* state)
+{
+	struct snapraid_config* config = &state->config;
+	struct snapraid_config* main_config = &state_ptr()->config;
+
+	if (config_is_default(state))
+		return;
+
+	sncpy(config->sys_engine, sizeof(config->sys_engine), main_config->sys_engine);
+
+	/* every array logs in its own directory, to keep its history separated */
+	sncpy(config->sys_log_directory, sizeof(config->sys_log_directory), main_config->sys_log_directory);
+	if (config->sys_log_directory[0] != 0) {
+		size_t len = strlen(config->sys_log_directory);
+		if (config->sys_log_directory[len - 1] != '/' && config->sys_log_directory[len - 1] != '\\')
+			sncat(config->sys_log_directory, sizeof(config->sys_log_directory), "/");
+		sncat(config->sys_log_directory, sizeof(config->sys_log_directory), state->name);
+	}
+
+	config->sys_log_retention_days = main_config->sys_log_retention_days;
+	config->sys_log_compression = main_config->sys_log_compression;
+	sncpy(config->sys_shutdown_on, sizeof(config->sys_shutdown_on), main_config->sys_shutdown_on);
+	config->net_enabled = main_config->net_enabled;
+	sncpy(config->net_port, sizeof(config->net_port), main_config->net_port);
+	sncpy(config->net_acl, sizeof(config->net_acl), main_config->net_acl);
+	config->net_security_headers = main_config->net_security_headers;
+	sncpy(config->net_allowed_origin, sizeof(config->net_allowed_origin), main_config->net_allowed_origin);
+	config->net_config_full_access = main_config->net_config_full_access;
+	config->net_storage_admin = main_config->net_storage_admin;
+	sncpy(config->net_web_root, sizeof(config->net_web_root), main_config->net_web_root);
+	sncpy(config->net_auth_credential, sizeof(config->net_auth_credential), main_config->net_auth_credential);
+	config->array_parallel = main_config->array_parallel;
+	config->notify_syslog = main_config->notify_syslog;
+	config->notify_syslog_level = main_config->notify_syslog_level;
+
+	/* the check for updates is done once, by the default array */
+	config->check_updates = 0;
+}
+
 static void config_refresh_locked(struct snapraid_state* state)
 {
 	struct snapraid_config* config = &state->config;
 
+	/* the syslog options are of the machine */
+	if (!config_is_default(state))
+		return;
+
 	/* apply to the runtime */
 	log_lock();
-	state->log.syslog = config->notify_syslog;
-	state->log.syslog_level = config->notify_syslog_level;
+	state->host->log.syslog = config->notify_syslog;
+	state->host->log.syslog_level = config->notify_syslog_level;
 	log_unlock();
 }
 
@@ -420,6 +489,7 @@ int config_load_locked(struct snapraid_state* state)
 	 * reloads preserve the previous valid configuration.
 	 */
 	config_default_locked(state);
+	config_inherit_locked(state);
 
 	char* next = buffer;
 	while (*next) {
@@ -478,7 +548,23 @@ int config_load_locked(struct snapraid_state* state)
 			/* trim key, val is already trimmed */
 			*key_end = 0;
 
-			if (strcmp(key, "sys_engine") == 0) {
+			if (!config_is_default(state) && config_key_is_machine(key)) {
+				++error_count;
+				log_msg(LVL_ERROR, "config option %s is of the machine and cannot be set for the array %s, set it in the main configuration file", key, state->name);
+			} else if (strcmp(key, "engine_conf") == 0) {
+				/* the default array gets it from the command line, or from the engine */
+				if (!config_is_default(state) && val[0] != 0 && parse_string(config->engine_conf, sizeof(config->engine_conf), val) == 0) {
+				} else {
+					++error_count;
+					log_msg(LVL_ERROR, "invalid config option %s=%s", key, val);
+				}
+			} else if (strcmp(key, "array_parallel") == 0) {
+				if (parse_int(val, 0, 1, &config->array_parallel) == 0) {
+				} else {
+					++error_count;
+					log_msg(LVL_ERROR, "invalid config option %s=%s", key, val);
+				}
+			} else if (strcmp(key, "sys_engine") == 0) {
 				if (parse_string(config->sys_engine, sizeof(config->sys_engine), val) == 0) {
 				} else {
 					++error_count;
@@ -568,7 +654,7 @@ int config_load_locked(struct snapraid_state* state)
 			} else if (strcmp(key, "net_auth_credential") == 0) {
 				if (parse_string(config->net_auth_credential, sizeof(config->net_auth_credential), val) == 0) {
 					/* clear the credential cache */
-					state->rest_auth_cache[0] = 0;
+					state->host->rest_auth_cache[0] = 0;
 				} else {
 					++error_count;
 					log_msg(LVL_ERROR, "invalid config option %s", key);
@@ -721,6 +807,11 @@ int config_load_locked(struct snapraid_state* state)
 		}
 	}
 
+	if (!config_is_default(state) && error_count == 0 && config->engine_conf[0] == 0) {
+		++error_count;
+		log_msg(LVL_ERROR, "missing config option engine_conf, the SnapRAID configuration file of the array %s", state->name);
+	}
+
 	config_refresh_locked(state);
 
 	free(buffer);
@@ -819,6 +910,8 @@ static const char* config_diff_sys(struct snapraid_config* a, struct snapraid_co
 		return "sys_shutdown_on";
 	if (!smartignore_list_equal(&a->smartignore_list, &b->smartignore_list))
 		return "sys_smartignore";
+	if (strcmp(a->engine_conf, b->engine_conf) != 0)
+		return "engine_conf";
 
 	return 0;
 }
@@ -1251,9 +1344,9 @@ void config_default_locked(struct snapraid_state* state)
 	/* set default */
 	config->sys_engine[0] = 0;
 	app_default_log(config->sys_log_directory, sizeof(config->sys_log_directory));
-	if (state->instance[0] != 0) {
+	if (state->host->instance[0] != 0) {
 		sncat(config->sys_log_directory, sizeof(config->sys_log_directory), "-");
-		sncat(config->sys_log_directory, sizeof(config->sys_log_directory), state->instance);
+		sncat(config->sys_log_directory, sizeof(config->sys_log_directory), state->host->instance);
 	}
 	config->sys_log_retention_days = 0;
 	config->sys_log_compression = 0;
@@ -1267,9 +1360,11 @@ void config_default_locked(struct snapraid_state* state)
 	config->net_storage_admin = 0;
 	config->net_web_root[0] = 0;
 	config->net_auth_credential[0] = 0;
+	config->array_parallel = 0;
+	config->engine_conf[0] = 0;
 
 	/* clear the credential cache */
-	state->rest_auth_cache[0] = 0;
+	state->host->rest_auth_cache[0] = 0;
 
 	config->check_updates = 0;
 	tommy_list_foreach(&config->maintenance_list, run_free);
@@ -1326,6 +1421,8 @@ void config_dup_locked(struct snapraid_state* state, struct snapraid_config* tra
 	transient->net_storage_admin = config->net_storage_admin;
 	sncpy(transient->net_web_root, sizeof(transient->net_web_root), config->net_web_root);
 	sncpy(transient->net_auth_credential, sizeof(transient->net_auth_credential), config->net_auth_credential);
+	transient->array_parallel = config->array_parallel;
+	sncpy(transient->engine_conf, sizeof(transient->engine_conf), config->engine_conf);
 
 	transient->check_updates = config->check_updates;
 	tommy_list_init(&transient->maintenance_list);
@@ -1392,9 +1489,11 @@ void config_apply_locked(struct snapraid_state* state, struct snapraid_config* t
 	config->net_storage_admin = transient->net_storage_admin;
 	sncpy(config->net_web_root, sizeof(config->net_web_root), transient->net_web_root);
 	sncpy(config->net_auth_credential, sizeof(config->net_auth_credential), transient->net_auth_credential);
+	config->array_parallel = transient->array_parallel;
+	sncpy(config->engine_conf, sizeof(config->engine_conf), transient->engine_conf);
 
 	/* clear the credential cache */
-	state->rest_auth_cache[0] = 0;
+	state->host->rest_auth_cache[0] = 0;
 
 	config->check_updates = transient->check_updates;
 	tommy_list_foreach(&config->maintenance_list, run_free);
@@ -1427,7 +1526,10 @@ void config_apply_locked(struct snapraid_state* state, struct snapraid_config* t
 	config->notify_result_level = transient->notify_result_level;
 	config->notify_differences = transient->notify_differences;
 
-	config_set_int(config, "check_updates", config->check_updates);
+	if (config_is_default(state)) {
+		config_set_int(config, "check_updates", config->check_updates);
+		config_set_int(config, "array_parallel", config->array_parallel);
+	}
 
 	/* apply to the text copy */
 	char maintenance_schedule[CONFIG_MAX];
@@ -1452,8 +1554,10 @@ void config_apply_locked(struct snapraid_state* state, struct snapraid_config* t
 	config_set_string(config, "hook_run_as_user", config->hook_run_as_user);
 	config_set_string(config, "hook_script", config->hook_script);
 	config_set_string(config, "hook_docker_pause", config->hook_docker_pause);
-	config_set_int(config, "notify_syslog_enabled", config->notify_syslog);
-	config_set(config, "notify_syslog_level", config_level(config->notify_syslog_level));
+	if (config_is_default(state)) {
+		config_set_int(config, "notify_syslog_enabled", config->notify_syslog);
+		config_set(config, "notify_syslog_level", config_level(config->notify_syslog_level));
+	}
 	config_set_string(config, "notify_run_as_user", config->notify_run_as_user);
 	config_set_string(config, "notify_heartbeat", config->notify_heartbeat);
 	config_set_string(config, "notify_start", config->notify_start);

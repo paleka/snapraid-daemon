@@ -5,6 +5,7 @@
 
 #include "app.h"
 #include "report.h"
+#include "conf.h"
 #include "state.h"
 #include "support.h"
 #include "log.h"
@@ -1071,11 +1072,15 @@ static void report_wide_locked(struct snapraid_state* state, ss_t* ss,
 	print_separator(ss);
 	ss_prints(ss, "\n");
 
-	if (state->instance[0] != 0)
-		ss_printf(ss, "INSTANCE: %s\n", state->instance);
+	if (state->host->instance[0] != 0)
+		ss_printf(ss, "INSTANCE: %s\n", state->host->instance);
 
-	if (state->system.hostname[0] != 0)
-		ss_printf(ss, "HOSTNAME: %s\n", state->system.hostname);
+	/* with more arrays the report tells which one it's about */
+	if (!config_is_default(state))
+		ss_printf(ss, "ARRAY: %s\n", state->name);
+
+	if (state->host->system.hostname[0] != 0)
+		ss_printf(ss, "HOSTNAME: %s\n", state->host->system.hostname);
 
 	/* array health */
 	array_health = state->array.health;
@@ -1199,11 +1204,15 @@ void report_narrow_locked(struct snapraid_state* state, ss_t* ss,
 	struct snapraid_diff_stat* diff_stat,
 	struct snapraid_fix_stat* fix_stat)
 {
-	if (state->instance[0] != 0)
-		ss_printf(ss, "INSTANCE: %s\n", state->instance);
+	if (state->host->instance[0] != 0)
+		ss_printf(ss, "INSTANCE: %s\n", state->host->instance);
 
-	if (state->system.hostname[0] != 0)
-		ss_printf(ss, "HOSTNAME: %s\n", state->system.hostname);
+	/* with more arrays the report tells which one it's about */
+	if (!config_is_default(state))
+		ss_printf(ss, "ARRAY: %s\n", state->name);
+
+	if (state->host->system.hostname[0] != 0)
+		ss_printf(ss, "HOSTNAME: %s\n", state->host->system.hostname);
 
 	int array_health = state->array.health;
 	ss_printf(ss, "HEALTH: %s\n", health_report_wide(array_health));

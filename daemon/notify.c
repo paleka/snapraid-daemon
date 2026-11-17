@@ -132,7 +132,11 @@ static int result_locked_yield(struct snapraid_state* state, int high_cmd, int r
 	sncpy(template, sizeof(template), state->config.notify_result);
 	sncpy(level, sizeof(level), config_level_str(report_level));
 	strupr(level);
-	snprintf(subject, sizeof(subject), "[%s] SnapRAID %s", level, command);
+	/* with more arrays the subject tells which one it's about */
+	if (config_is_default(state))
+		snprintf(subject, sizeof(subject), "[%s] SnapRAID %s", level, command);
+	else
+		snprintf(subject, sizeof(subject), "[%s] SnapRAID %s of %s", level, command, state->name);
 
 	switch (report_level) {
 	case LVL_CRITICAL : /* hardware problem */
@@ -285,7 +289,10 @@ static int start_locked_yield(struct snapraid_state* state, int high_cmd)
 	command[0] = toupper((unsigned char)command[0]);
 	sncpy(run_as_user, sizeof(run_as_user), state->config.notify_run_as_user);
 	sncpy(template, sizeof(template), state->config.notify_start);
-	snprintf(subject, sizeof(subject), "[START] SnapRAID %s", command);
+	if (config_is_default(state))
+		snprintf(subject, sizeof(subject), "[START] SnapRAID %s", command);
+	else
+		snprintf(subject, sizeof(subject), "[START] SnapRAID %s of %s", command, state->name);
 
 #define START_PLACEHOLDERS 8
 	const char* placeholders[START_PLACEHOLDERS] = {

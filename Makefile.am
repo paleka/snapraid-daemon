@@ -38,6 +38,7 @@ COMMANDER_DIST = \
 	css/style.css \
 	js/api.js \
 	js/storage.js \
+	js/arrays.js \
 	js/app.js \
 	js/init.js \
 	js/ui.js \
@@ -100,6 +101,7 @@ snapraidd_SOURCES = \
 	daemon/report.c \
 	daemon/notify.c \
 	daemon/storage.c \
+	daemon/arrays.c \
 	daemon/smart.c \
 	daemon/selftest.c \
 	daemon/unixapp.c \
@@ -152,6 +154,7 @@ noinst_HEADERS = \
 	daemon/report.h \
 	daemon/notify.h \
 	daemon/storage.h \
+	daemon/arrays.h \
 	daemon/smart.h \
 	daemon/selftest.h \
 	daemon/version.h
@@ -171,6 +174,9 @@ LIST_TXT = doc/snapraidd.txt $(patsubst %, doc/snapraidd-%.txt, $(LANG_CODES))
 LIST_XML = doc/snapraidd.xml $(patsubst %, doc/snapraidd-%.xml, $(LANG_CODES))
 
 EXTRA_DIST = \
+	test/ui/README \
+	test/ui/storage.test.mjs \
+	test/ui/arrays.test.mjs \
 	autogen.sh autover.sh \
 	README HISTORY INSTALL AUTHORS BLUEBOX \
 	CHANGES-FORK ROADMAP-FORK installer.sh \
@@ -227,6 +233,7 @@ EXTRA_DIST = \
 	commander/js/ui.js \
 	commander/js/api.js \
 	commander/js/storage.js \
+	commander/js/arrays.js \
 	commander/js/app.js \
 	commander/js/utils.js \
 	brutale/index.html \
@@ -242,6 +249,7 @@ EXTRA_DIST = \
 	brutale/js/ui.js \
 	brutale/js/api.js \
 	brutale/js/storage.js \
+	brutale/js/arrays.js \
 	brutale/js/app.js \
 	brutale/js/utils.js \
 	brutale/css/fonts/BebasNeue-Regular.woff2 \
@@ -386,6 +394,7 @@ DAEMON_INCLUDES = \
 	$(srcdir)/daemon/memory.h \
 	$(srcdir)/daemon/notify.h \
 	$(srcdir)/daemon/storage.h \
+	$(srcdir)/daemon/arrays.h \
 	$(srcdir)/daemon/parser.h \
 	$(srcdir)/daemon/report.h \
 	$(srcdir)/daemon/rest.h \
@@ -412,6 +421,10 @@ $(DAEMON_PREFIX)log.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)mingw.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)notify.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)storage.$(OBJEXT): $(DAEMON_INCLUDES)
+$(DAEMON_PREFIX)arrays.$(OBJEXT): $(DAEMON_INCLUDES)
+$(DAEMON_PREFIX)unixapp.$(OBJEXT): $(DAEMON_INCLUDES)
+$(DAEMON_PREFIX)mingwapp.$(OBJEXT): $(DAEMON_INCLUDES)
+$(DAEMON_PREFIX)selftest.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)parser.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)report.$(OBJEXT): $(DAEMON_INCLUDES)
 $(DAEMON_PREFIX)rest.$(OBJEXT): $(DAEMON_INCLUDES)
@@ -466,7 +479,7 @@ endif
 check-local: snapraidd$(EXEEXT)
 	./snapraidd$(EXEEXT) test
 	@if command -v node >/dev/null 2>&1; then \
-		node --test $(srcdir)/test/ui/storage.test.mjs; \
+		node --test $(srcdir)/test/ui/storage.test.mjs $(srcdir)/test/ui/arrays.test.mjs; \
 	else \
 		echo "node not found: skipping the tests of the Storage page"; \
 	fi

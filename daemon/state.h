@@ -91,6 +91,16 @@
 #define SMART_COUNT 256
 
 /**
+ * Max length of the name of an array, including the terminating null.
+ */
+#define ARRAY_NAME_MAX 32
+
+/**
+ * Name of the array defined by the main configuration file of the daemon.
+ */
+#define ARRAY_DEFAULT "default"
+
+/**
  * Max instance name storage size, including the terminating null.
  */
 #define INSTANCE_MAX 64
@@ -416,6 +426,7 @@ struct snapraid_hook_config {
 	char conf[PATH_MAX];
 	char engine_conf[PATH_MAX];
 	char instance[INSTANCE_MAX];
+	char array[ARRAY_NAME_MAX]; /**< Name of the array the hook runs for */
 };
 
 struct snapraid_hook_state {
@@ -609,6 +620,8 @@ struct snapraid_config {
 	int net_storage_admin; /**< 1 if disks, mounts, pools and the engine configuration can be changed from network, 0 otherwise */
 	char net_web_root[PATH_MAX]; /**< Web pages directory */
 	char net_auth_credential[CONFIG_MAX]; /**< Argon2id hashed credentials for Basic Auth */
+	int array_parallel; /**< 1 if arrays that share no physical disk can run at the same time, 0 to run one array at a time */
+	char engine_conf[PATH_MAX]; /**< SnapRAID configuration file of the array. Empty for the default array. */
 	int check_updates; /**< 1 to enable periodic update check, 0 otherwise */
 	tommy_list maintenance_list; /**< List of snapraid_run */
 	tommy_list smartignore_list; /**< List of snapraid_smartignore */
@@ -658,7 +671,6 @@ struct snapraid_log {
 	int verbose; /**< Verbose output */
 	int syslog; /**< 1 if syslog is enabled, 0 otherwise */
 	int syslog_level; /**< Minimum level for syslog messages */
-	tommy_list task_list; /**< List of snapraid_message */
 };
 
 struct snapraid_web {
@@ -692,7 +704,14 @@ struct snapraid_duplicate_id {
 	tommy_hashtable_node node; /**< Node in parser_duplicate_hash. */
 };
 
-struct snapraid_state {
+struct snapraid_state;
+
+/**
+ * What belongs to the machine and to the daemon process, and not to one array.
+ *
+ * There is a single host. Every array has its own snapraid_state pointing to it.
+ */
+struct snapraid_host {
 	/*
 	 * Daemon lifecycle flags.
 	 *
@@ -731,41 +750,39 @@ struct snapraid_state {
 	volatile sig_atomic_t daemon_terminating; /**< Graceful daemon termination requested. */
 	volatile sig_atomic_t daemon_failing; /**< Fatal daemon failure requires termination. */
 	volatile sig_atomic_t daemon_aborting; /**< Emergency shutdown is in progress. */
+	struct snapraid_state* abort_state; /**< Array that entered the abort state, and whose runner shuts down the system. Set with daemon_aborting. */
 
-	volatile sig_atomic_t daemon_loading; /**< Initialization is in progress. */
 	volatile sig_atomic_t daemon_reloading; /**< A configuration reload is requested. */
 	volatile sig_atomic_t daemon_sig; /**< Signal received by the daemon that made it stopping */
 	time_t daemon_start_time; /**< Time the daemon started */
 
-	/* data private for the parser. The parser run only one at a time, so no lock is required */
-	int parser_version_major; /**< Major version number */
-	int parser_version_minor; /**< Minor version number */
-	char parser_boot_id[37]; /**< Current Linux boot UUID, or empty if unavailable. */
-	size_t parser_boot_id_len; /**< Cached length of the current Linux boot UUID. */
-	tommy_list parser_association; /**< Associations of device<->id */
-	tommy_hashtable parser_association_hash; /**< First association for each ID in the current mapping */
-	tommy_hashtable parser_duplicate_hash; /**< IDs permanently known to be ambiguous */
-	int parser_previous_was_association; /**< If the previous entry was an association */
-	int parser_has_end; /**< If the daemon:end record was read */
-
 	/**< Data protected by the state lock */
-	thread_mutex_t state_lock; /**< Protection for the following data */
-	tommy_list device_catalog; /**< Catalog of all physical devices */
-	char engine_version[64]; /**< SnapRAID engine full version. */
+	thread_mutex_t state_lock; /**< Protection of the host and of the state of every array */
 	char latest_daemon_version[64]; /**< Latest daemon version fetched from GitHub. */
 	char latest_engine_version[64]; /**< Latest engine version fetched from GitHub. */
-	struct snapraid_pulse pulse; /**< Pulse counters. */
 	struct mg_context* rest_context; /**< The context of the rest support */
 	struct mg_callbacks rest_callbacks; /**< CivetWeb callbacks */
 	char rest_auth_cache[CONFIG_MAX]; /**< Cached Authorization header payload */
 	uint64_t rest_latest_auth; /**< Monotonic time in seconds of the latest authentication */
-	struct snapraid_runner runner; /**< Task runner system */
-	struct snapraid_scheduler scheduler; /**< Maintenance scheduler */
-	struct snapraid_array array; /**< Global array metadata */
-	struct snapraid_config config; /**< Runtime configuration */
 	struct snapraid_system system; /**< Host system information */
 	char instance[INSTANCE_MAX]; /**< Instance name specified via -i, --instance */
 	char log_ident[128]; /**< Formatted logging identifier for syslog */
+
+	/**
+	 * Arrays handled by the daemon, as list of snapraid_state.
+	 *
+	 * The first one is always the default array, defined by the main
+	 * configuration file. The others come from the arrays directory.
+	 */
+	tommy_list state_list;
+
+	/**
+	 * Arrays removed at runtime.
+	 *
+	 * Their state is kept allocated until the daemon stops, because a request
+	 * that yielded the state lock may still hold a pointer to it.
+	 */
+	tommy_list removed_list;
 
 #ifdef __MINGW32__
 	int service_install; /**< Install Windows service and exit */
@@ -783,47 +800,116 @@ struct snapraid_state {
 	/**< Data protected by the log lock */
 	thread_mutex_t log_lock; /**< Protection for the following data */
 	struct snapraid_log log; /**< Logging configuration */
+};
 
-	/**< Data immutable after command-line parsing */
-	char engine_conf_arg[PATH_MAX]; /**< SnapRAID configuration file specified via -C, --engine-conf */
+/**
+ * State of one array.
+ *
+ * The machine options of the configuration (sys_*, net_*, check_updates,
+ * array_parallel) are meaningful only in the default array. The other arrays
+ * get a copy of them when their configuration is loaded.
+ */
+struct snapraid_state {
+	struct snapraid_host* host; /**< The machine. Never 0. */
+	char name[ARRAY_NAME_MAX]; /**< Name of the array. ARRAY_DEFAULT for the default one. */
+	tommy_node node; /**< Node in state_list or removed_list of the host */
+	int removed; /**< The array was removed at runtime, and its threads are stopped */
+	int running; /**< The array holds the engine for its heavy commands. See the arbiter in arrays.h. */
+
+	volatile sig_atomic_t daemon_loading; /**< Initialization of this array is in progress. */
+
+	/* data private for the parser. The parser of an array runs only one at a time, so no lock is required */
+	int parser_version_major; /**< Major version number */
+	int parser_version_minor; /**< Minor version number */
+	char parser_boot_id[37]; /**< Current Linux boot UUID, or empty if unavailable. */
+	size_t parser_boot_id_len; /**< Cached length of the current Linux boot UUID. */
+	tommy_list parser_association; /**< Associations of device<->id */
+	tommy_hashtable parser_association_hash; /**< First association for each ID in the current mapping */
+	tommy_hashtable parser_duplicate_hash; /**< IDs permanently known to be ambiguous */
+	int parser_previous_was_association; /**< If the previous entry was an association */
+	int parser_has_end; /**< If the daemon:end record was read */
+
+	/**< Data protected by the state lock of the host */
+	tommy_list device_catalog; /**< Catalog of all physical devices seen by this array */
+	char engine_version[64]; /**< SnapRAID engine full version. */
+	struct snapraid_pulse pulse; /**< Pulse counters. */
+	struct snapraid_runner runner; /**< Task runner system */
+	struct snapraid_scheduler scheduler; /**< Maintenance scheduler */
+	struct snapraid_array array; /**< Global array metadata */
+	struct snapraid_config config; /**< Runtime configuration */
+
+	/**< Data protected by the log lock of the host */
+	tommy_list log_task_list; /**< List of snapraid_message logged while a task of this array runs */
+
+	/**< Data immutable after the array is created */
+	char engine_conf_arg[PATH_MAX]; /**< SnapRAID configuration file specified via -C, --engine-conf, or by engine_conf in the configuration of the array */
 };
 
 static inline int daemon_is_running(const struct snapraid_state* state)
 {
-	return !state->daemon_terminating && !state->daemon_failing;
+	/* an array removed at runtime is like a daemon that is terminating, but only for that array */
+	return !state->host->daemon_terminating && !state->host->daemon_failing && !state->removed;
 }
 
 static inline int daemon_is_aborting(const struct snapraid_state* state)
 {
-	return state->daemon_aborting != 0;
+	return state->host->daemon_aborting != 0;
 }
 
 /****************************************************************************/
 /* state */
 
 /**
- * Initialize the global state system.
+ * Initialize the host and the state of the default array.
  *
  * This function is called during daemon startup in a single-threaded (mono thread)
  * context.
  *
- * @return Pointer to global state structure
+ * @return Pointer to the state of the default array
  */
 struct snapraid_state* state_init(void);
 
 /**
- * Cleanup the global state system.
+ * Cleanup the host and the state of every array.
  *
  * This function is called during daemon shutdown in a single-threaded (mono thread)
  * context after all worker threads have terminated and with no locks held.
  *
- * @param state State structure to cleanup
+ * @param state State of the default array
  */
 void state_done(struct snapraid_state* state);
 
 /**
- * Get pointer to the global snapraid state.
- * @return Pointer to global state structure
+ * Allocate the state of another array, not yet in the list of the host.
+ */
+struct snapraid_state* state_alloc(const char* name);
+
+/**
+ * Free the state of an array allocated with state_alloc().
+ * The threads of the array must be already terminated.
+ */
+void state_free(struct snapraid_state* state);
+
+/**
+ * Check if the name can be used for an array: lowercase letters, digits,
+ * '_' and '-', starting with a letter or a digit.
+ */
+int state_name_valid(const char* name);
+
+/**
+ * Find an array by name. The state lock must be held.
+ * @return The state of the array, or 0 if there is no array with this name
+ */
+struct snapraid_state* state_find_locked(const char* name);
+
+/**
+ * Get the pointer to the host.
+ */
+struct snapraid_host* host_ptr(void);
+
+/**
+ * Get the pointer to the state of the default array.
+ * @return Pointer to the state of the default array
  */
 struct snapraid_state* state_ptr(void);
 

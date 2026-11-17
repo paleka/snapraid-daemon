@@ -636,9 +636,9 @@ static int handler_virtual_file(struct mg_connection* conn, void* cbdata)
 
 	web_rdlock();
 
-	time_t page_time = state->web.page_time;
+	time_t page_time = state->host->web.page_time;
 
-	tommy_node* i = tommy_list_head(&state->web.page_list);
+	tommy_node* i = tommy_list_head(&state->host->web.page_list);
 	while (i) {
 		struct snapraid_page* page = i->data;
 
@@ -828,7 +828,7 @@ static int handler_real_file(struct mg_connection* conn, void* cbdata)
 int web_init(struct snapraid_state* state)
 {
 	/* web assets are optional until the network interface is enabled */
-	if (state->config.net_enabled && !state->web.page_nocache) {
+	if (state->config.net_enabled && !state->host->web.page_nocache) {
 		if (web_reload(state, state->config.net_web_root) != 0)
 			return -1;
 	}
@@ -838,15 +838,15 @@ int web_init(struct snapraid_state* state)
 
 int web_start(struct snapraid_state* state)
 {
-	if (!state->rest_context)
+	if (!state->host->rest_context)
 		return 0;
 
-	if (!state->web.page_nocache) {
-		if (mg_set_request_handler(state->rest_context, "**", handler_virtual_file, state) != 0)
+	if (!state->host->web.page_nocache) {
+		if (mg_set_request_handler(state->host->rest_context, "**", handler_virtual_file, state) != 0)
 			return -1;
 	} else {
 		log_msg(LVL_INFO, "serving web root %s", state->config.net_web_root);
-		if (mg_set_request_handler(state->rest_context, "**", handler_real_file, state) != 0)
+		if (mg_set_request_handler(state->host->rest_context, "**", handler_real_file, state) != 0)
 			return -1;
 	}
 
@@ -943,10 +943,10 @@ int web_reload(struct snapraid_state* state, const char* root)
 
 	/* publish the new cache atomically only after a successful crawl. */
 	web_wrlock();
-	tommy_list old_page_list = state->web.page_list;
-	state->web.page_list = new_page_list;
+	tommy_list old_page_list = state->host->web.page_list;
+	state->host->web.page_list = new_page_list;
 	if (root[0] != 0)
-		state->web.page_time = new_page_time;
+		state->host->web.page_time = new_page_time;
 	web_unlock();
 
 	/* no reader can reference the old list after the completed write-locked swap. */

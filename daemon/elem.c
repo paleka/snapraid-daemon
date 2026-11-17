@@ -9,6 +9,7 @@
 #include "log.h"
 #include "parser.h"
 #include "runner.h"
+#include "conf.h"
 #include "smart.h"
 #include "elem.h"
 
@@ -930,7 +931,10 @@ int health_array_locked(struct snapraid_state* state, char* reason, size_t reaso
 #ifdef _WIN32
 			snprintf(reason, reason_size, "The array is not configured. Copy snapraid.conf.example to snapraid.conf in the installation directory (where snapraid.exe and snapraidd.exe reside) and define your disks to begin.");
 #else
-			snprintf(reason, reason_size, "The array is not configured. The /etc/snapraid.conf is missing or empty. Use the guided setup in the Storage page, or copy the snapraid.conf.example to /etc/snapraid.conf and define your disks to begin.");
+			if (state->engine_conf_arg[0] != 0 && !config_is_default(state))
+				snprintf(reason, reason_size, "The array '%s' is not configured. Its %s is missing or empty. Use the guided setup in the Storage page to define its disks.", state->name, state->engine_conf_arg);
+			else
+				snprintf(reason, reason_size, "The array is not configured. The /etc/snapraid.conf is missing or empty. Use the guided setup in the Storage page, or copy the snapraid.conf.example to /etc/snapraid.conf and define your disks to begin.");
 #endif
 		}
 	}

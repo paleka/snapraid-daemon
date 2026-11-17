@@ -14,6 +14,7 @@
 #include "notify.h"
 #include "conf.h"
 #include "runner.h"
+#include "arrays.h"
 
 /****************************************************************************/
 /* runner */
@@ -98,7 +99,10 @@ static int runner_health_check_locked(struct snapraid_state* state)
 				trigger_shutdown = 1;
 
 			if (trigger_shutdown) {
-				state->daemon_aborting = 1;
+				/* only the runner of the first array asking for it shuts down the system */
+				if (!state->host->daemon_aborting)
+					state->host->abort_state = state;
+				state->host->daemon_aborting = 1;
 				log_task(LVL_CRITICAL, "entering abort state for emergency shutdown on %s health status", health_name(new_health));
 				task_list_cancel_all(state, "Canceled before shutdown");
 
@@ -621,7 +625,7 @@ static int runner_report_locked(struct snapraid_state* state)
 	 * runner_thread() will then leave the queue and perform the emergency system shutdown.
 	 */
 	if (daemon_is_aborting(state))
-		state->daemon_failing = 1;
+		state->host->daemon_failing = 1;
 
 	return 0;
 }
@@ -775,7 +779,8 @@ static void hook_config_acquire_locked(struct snapraid_state* state, struct snap
 		sncpy(config->engine_conf, sizeof(config->engine_conf), state->engine_conf_arg);
 	else
 		sncpy(config->engine_conf, sizeof(config->engine_conf), state->array.engine_conf);
-	sncpy(config->instance, sizeof(config->instance), state->instance);
+	sncpy(config->instance, sizeof(config->instance), state->host->instance);
+	sncpy(config->array, sizeof(config->array), state->name);
 }
 
 /**
@@ -931,6 +936,7 @@ static int runner_hook_begin(struct snapraid_hook* hook, ZFILE* log_f, char* exi
 		if (hook->config.instance[0] != 0) {
 			add_env(envv, &envv_count, "SNAPRAID_INSTANCE", "%s", hook->config.instance);
 		}
+		add_env(envv, &envv_count, "SNAPRAID_ARRAY", "%s", hook->config.array);
 		envv[envv_count] = NULL;
 
 		os_privileges_acquire();
@@ -1079,6 +1085,7 @@ static int runner_hook_end(const struct snapraid_hook* hook, ZFILE* log_f, char*
 		if (hook->config.instance[0] != 0) {
 			add_env(envv, &envv_count, "SNAPRAID_INSTANCE", "%s", hook->config.instance);
 		}
+		add_env(envv, &envv_count, "SNAPRAID_ARRAY", "%s", hook->config.array);
 		envv[envv_count] = NULL;
 
 		os_privileges_acquire();
@@ -1201,9 +1208,9 @@ static int runner_shutdown_locked(struct snapraid_state* state)
 	 * the daemon regardless of the command result.
 	 */
 	if (ret == 0)
-		state->daemon_terminating = 1;
+		state->host->daemon_terminating = 1;
 	else
-		state->daemon_failing = 1;
+		state->host->daemon_failing = 1;
 
 	struct snapraid_task* shutdown_task = state->runner.latest;
 
@@ -1827,6 +1834,8 @@ static void* runner_thread(void* arg)
 	struct snapraid_state* state = arg;
 	int stop_pending = 0;
 
+	log_bind(state);
+
 	state_lock();
 
 	while (1) {
@@ -1840,6 +1849,16 @@ static void* runner_thread(void* arg)
 				runner_hook_postponed_locked_yield(state, 0);
 				continue;
 			}
+
+			/*
+			 * With more arrays, a command working on the whole disks waits for
+			 * the engine to be free, and a shutdown of the machine waits for
+			 * the other arrays to complete what they are doing. The runner is
+			 * woken up when another array ends a task.
+			 */
+			if ((arbiter_is_heavy(next->cmd) && !arbiter_acquire_locked(state))
+				|| (next->cmd == CMD_SHUTDOWN && arrays_others_busy_locked(state)))
+				break;
 
 			time_t now = time(0);
 
@@ -1890,6 +1909,9 @@ static void* runner_thread(void* arg)
 				/* if this canceled task was supposed to handle the hook, we must close the hook now */
 				runner_hook_postponed_locked_yield(state, task);
 			}
+
+			/* let the other arrays go on */
+			arbiter_release_locked(state);
 		}
 
 		if (!daemon_is_running(state))
@@ -1901,12 +1923,16 @@ static void* runner_thread(void* arg)
 			continue;
 		}
 
-		thread_cond_wait(&state->runner.cond, &state->state_lock);
+		thread_cond_wait(&state->runner.cond, &state->host->state_lock);
 	}
 
 	/* with an emergency health shutdown perform the system shutdown directly */
 	if (daemon_is_aborting(state)) {
 		state_unlock();
+
+		/* the runners of the other arrays only stop */
+		if (state->host->abort_state != state)
+			return 0;
 
 		log_msg(LVL_CRITICAL, "calling system shutdown after emergency abort");
 		int ret = os_shutdown();

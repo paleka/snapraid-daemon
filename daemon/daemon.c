@@ -14,6 +14,7 @@
 #include "parser.h"
 #include "web.h"
 #include "selftest.h"
+#include "arrays.h"
 
 /****************************************************************************/
 /* helpers */
@@ -179,7 +180,7 @@ void daemon_options(struct snapraid_state* state, int argc, char* argv[])
 		!= EOF) {
 		switch (c) {
 		case 'f' :
-			state->log.foreground = 1;
+			state->host->log.foreground = 1;
 			break;
 		case 'c' :
 			if (absolutepath(optarg, state->config.conf) == 0) {
@@ -203,22 +204,22 @@ void daemon_options(struct snapraid_state* state, int argc, char* argv[])
 				fprintf(stderr, "Error: Invalid character '%c' in instance name. Only [a-zA-Z0-9_-] are allowed.\n", optarg[len]);
 				exit(EXIT_FAILURE);
 			}
-			if (len >= sizeof(state->instance)) {
+			if (len >= sizeof(state->host->instance)) {
 				fprintf(stderr, "Error: Instance name is too long. Maximum length is %d characters.\n", INSTANCE_MAX - 1);
 				exit(EXIT_FAILURE);
 			}
-			sncpy(state->instance, sizeof(state->instance), optarg);
+			sncpy(state->host->instance, sizeof(state->host->instance), optarg);
 #ifdef __MINGW32__
-			for (char* p = state->instance; *p != 0; ++p) {
+			for (char* p = state->host->instance; *p != 0; ++p) {
 				if (*p >= 'A' && *p <= 'Z')
 					*p += 'a' - 'A';
 			}
 #endif
-			app_instance(state->instance);
+			app_instance(state->host->instance);
 			break;
 		}
 		case 'N' :
-			state->web.page_nocache = 1;
+			state->host->web.page_nocache = 1;
 			break;
 		case 'p' :
 #ifndef __MINGW32__
@@ -230,7 +231,7 @@ void daemon_options(struct snapraid_state* state, int argc, char* argv[])
 			state->config.pidfile_arg = optarg;
 			break;
 		case 'v' :
-			state->log.verbose = 1;
+			state->host->log.verbose = 1;
 			break;
 		case 'g' :
 			gen_auth(optarg);
@@ -243,22 +244,22 @@ void daemon_options(struct snapraid_state* state, int argc, char* argv[])
 			exit(EXIT_SUCCESS);
 #ifdef __MINGW32__
 		case OPT_SERVICE_INSTALL :
-			state->service_install = 1;
+			state->host->service_install = 1;
 			break;
 		case OPT_SERVICE_REMOVE :
-			state->service_remove = 1;
+			state->host->service_remove = 1;
 			break;
 		case OPT_SERVICE_START_ALL :
-			state->service_start_all = 1;
+			state->host->service_start_all = 1;
 			break;
 		case OPT_SERVICE_STOP_ALL :
-			state->service_stop_all = 1;
+			state->host->service_stop_all = 1;
 			break;
 		case OPT_SERVICE_REMOVE_ALL :
-			state->service_remove_all = 1;
+			state->host->service_remove_all = 1;
 			break;
 		case OPT_SERVICE_LIST :
-			state->service_list = 1;
+			state->host->service_list = 1;
 			break;
 #endif
 		default :
@@ -268,9 +269,9 @@ void daemon_options(struct snapraid_state* state, int argc, char* argv[])
 	}
 
 #ifdef __MINGW32__
-	if (state->service_install + state->service_remove
-		+ state->service_start_all + state->service_stop_all
-		+ state->service_remove_all + state->service_list > 1) {
+	if (state->host->service_install + state->host->service_remove
+		+ state->host->service_start_all + state->host->service_stop_all
+		+ state->host->service_remove_all + state->host->service_list > 1) {
 		fprintf(stderr, "Error: Service options are mutually exclusive.\n");
 		exit(EXIT_FAILURE);
 	}
@@ -282,9 +283,9 @@ int daemon_init(struct snapraid_state* state)
 	char msg[MSG_MAX];
 	int status;
 
-	if (state->instance[0]) {
-		snprintf(state->log_ident, sizeof(state->log_ident), "%s-%s", DAEMON_NAME, state->instance);
-		log_init(state->log_ident);
+	if (state->host->instance[0]) {
+		snprintf(state->host->log_ident, sizeof(state->host->log_ident), "%s-%s", DAEMON_NAME, state->host->instance);
+		log_init(state->host->log_ident);
 	} else {
 		log_init(DAEMON_NAME);
 	}
@@ -302,7 +303,7 @@ int daemon_init(struct snapraid_state* state)
 	/*
 	 * Load system information
 	 */
-	app_system_info(&state->system);
+	app_system_info(&state->host->system);
 
 	/*
 	 * Initialize runner while signals are still BLOCKED
@@ -320,6 +321,11 @@ int daemon_init(struct snapraid_state* state)
 	 * Log loaded
 	 */
 	state->daemon_loading = 0;
+
+	/*
+	 * Load the other arrays, with their past logs, while still privileged
+	 */
+	arrays_init();
 
 	/*
 	 * Drop privileges after reading the logs
@@ -345,6 +351,11 @@ int daemon_init(struct snapraid_state* state)
 	 * Initialize scheduler while signals are still BLOCKED
 	 */
 	scheduler_init(state);
+
+	/*
+	 * The same for the other arrays
+	 */
+	arrays_ready();
 
 	/*
 	 * Initialize web resources
@@ -384,6 +395,11 @@ int daemon_init(struct snapraid_state* state)
 	 */
 	runner_start(state);
 
+	/*
+	 * Start the threads of the other arrays
+	 */
+	arrays_start();
+
 	return 0;
 }
 
@@ -395,12 +411,12 @@ int daemon_run(struct snapraid_state* state)
 		log_msg(LVL_INFO, "daemon ready");
 
 	while (daemon_is_running(state)) { /* stopped by signals */
-		if (state->daemon_reloading) {
+		if (state->host->daemon_reloading) {
 			/*
 			 * Clear before reloading. A SIGHUP received while reloading sets
 			 * the flag again and requests one additional pass.
 			 */
-			state->daemon_reloading = 0;
+			state->host->daemon_reloading = 0;
 
 			log_msg(LVL_INFO, "reload requested");
 
@@ -412,6 +428,10 @@ int daemon_run(struct snapraid_state* state)
 			} else if (ret > 0) {
 				reload_rest = 1;
 			}
+
+			/* the other arrays, also the ones added or removed in the arrays directory */
+			if (daemon_is_running(state))
+				arrays_reload_locked_yield();
 
 			int net_enabled = state->config.net_enabled;
 			char net_port[CONFIG_MAX];
@@ -435,7 +455,7 @@ int daemon_run(struct snapraid_state* state)
 				}
 			}
 
-			if (daemon_is_running(state) && net_enabled && !state->web.page_nocache) {
+			if (daemon_is_running(state) && net_enabled && !state->host->web.page_nocache) {
 				if (web_reload(state, net_web_root) != 0) {
 					log_msg(LVL_ERROR, "failed to reload web pages from %s, keeping previous cache", net_web_root);
 					/* do not bail */
@@ -448,7 +468,7 @@ int daemon_run(struct snapraid_state* state)
 				break;
 		}
 
-		scheduler_pulse(state);
+		arrays_pulse_locked();
 
 		/*
 		 * The sleep call is interrupted by signals even with SA_RESTART.
@@ -459,21 +479,21 @@ int daemon_run(struct snapraid_state* state)
 		state_lock();
 	}
 
-	if (state->daemon_aborting) {
+	if (state->host->daemon_aborting) {
 		state_unlock();
 		log_msg(LVL_ERROR, "daemon exiting due to emergency shutdown");
 		return -1;
 	}
 
-	if (state->daemon_failing) {
+	if (state->host->daemon_failing) {
 		state_unlock();
 		log_msg(LVL_ERROR, "daemon exiting due to failure");
 		return -1;
 	}
 
-	if (state->daemon_sig) {
+	if (state->host->daemon_sig) {
 		state_unlock();
-		log_msg(LVL_INFO, "daemon exiting due to signal=%s(%d)", os_signal_name(state->daemon_sig), state->daemon_sig);
+		log_msg(LVL_INFO, "daemon exiting due to signal=%s(%d)", os_signal_name(state->host->daemon_sig), state->host->daemon_sig);
 		return 0;
 	}
 
@@ -489,7 +509,7 @@ bail:
 	 * Docker containers.
 	 */
 	state_lock();
-	state->daemon_failing = 1;
+	state->host->daemon_failing = 1;
 	state_unlock();
 
 	log_msg(LVL_ERROR, "daemon exiting due to runtime error");
@@ -500,6 +520,7 @@ void daemon_done(struct snapraid_state* state)
 {
 	web_done(state);
 	rest_done(state, state->config.net_enabled);
+	arrays_done();
 	scheduler_done(state);
 	runner_done(state);
 	config_done(state);

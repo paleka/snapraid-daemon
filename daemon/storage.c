@@ -8,6 +8,8 @@
 #include "support.h"
 #include "log.h"
 #include "storage.h"
+#include "arrays.h"
+#include "memory.h"
 
 /****************************************************************************/
 /* storage */
@@ -149,6 +151,7 @@ static int fail(char* msg, size_t msg_size, int status, const char* fmt, ...)
 /* background job */
 
 #define JOB_RESULT_MAX 500 /**< Max number of entries reported by a job */
+#define JOB_CLAIMS_MAX 16 /**< Max number of arrays claimed by a job */
 
 struct storage_job {
 	int running; /**< A job is in progress */
@@ -177,6 +180,9 @@ struct storage_job {
 	int flag;
 	uint64_t max_bytes;
 	unsigned spread;
+	/* arrays whose data disks are being changed by the job */
+	char claims[JOB_CLAIMS_MAX][ARRAY_NAME_MAX];
+	unsigned claims_count;
 };
 
 static struct storage_job job;
@@ -222,6 +228,25 @@ static void job_finish(int status, const char* message)
 	pthread_mutex_unlock(&job_mutex);
 
 	log_msg(status == 0 ? LVL_INFO : LVL_WARNING, "storage: %s of %s ended: %s", job.kind, job.target, message);
+
+	/* the arrays that were waiting for the job can go on */
+	arrays_wake();
+}
+
+int storage_job_claims_array(const char* name)
+{
+	int found = 0;
+
+	pthread_mutex_lock(&job_mutex);
+	if (job.running) {
+		for (unsigned i = 0; i < job.claims_count; ++i) {
+			if (strcmp(job.claims[i], name) == 0)
+				found = 1;
+		}
+	}
+	pthread_mutex_unlock(&job_mutex);
+
+	return found;
 }
 
 /** Reserve the job slot. The caller fills the arguments and starts the thread. */
@@ -658,6 +683,40 @@ static int path_inside(const char* path, const char* dir)
 	return strncmp(path, dir, len) == 0 && (path[len] == 0 || path[len] == '/');
 }
 
+/** Check if the name is one of the policies of mergerfs. */
+static int valid_policy(const char* name)
+{
+	static const char* POLICIES[] = {
+		"all", "epall", "epff", "eplfs", "eplus", "epmfs", "eppfrd", "eprand", "erofs", "ff", "lfs", "lus",
+		"mfs", "msplfs", "msplus", "mspmfs", "msppfrd", "newest", "pfrd", "rand", 0
+	};
+
+	for (unsigned i = 0; POLICIES[i]; ++i) {
+		if (strcmp(name, POLICIES[i]) == 0)
+			return 1;
+	}
+
+	return 0;
+}
+
+/** Check if a comma separated list of mount options has the given one. */
+static int option_has(const char* options, const char* option)
+{
+	size_t len = strlen(option);
+	const char* p = options;
+
+	while (*p) {
+		size_t tok = strcspn(p, ",");
+		if (tok == len && strncmp(p, option, len) == 0)
+			return 1;
+		p += tok;
+		if (*p == ',')
+			++p;
+	}
+
+	return 0;
+}
+
 /****************************************************************************/
 /* mount table */
 
@@ -886,7 +945,29 @@ static void json_statvfs(ss_t* s, int level, const char* path)
 	}
 }
 
-static void json_mount_table(ss_t* s, int level, const char* field, const char* path, int with_space)
+/* what the arrays use, see the layout functions below */
+#define LAYOUT_MAX 512 /**< Max number of entries of all the arrays together */
+
+#define LAYOUT_DATA 'd'
+#define LAYOUT_PARITY 'p'
+#define LAYOUT_CONTENT 'c'
+
+struct layout_entry {
+	char array[ARRAY_NAME_MAX]; /**< Name of the array */
+	char role; /**< One of the LAYOUT_* */
+	char name[64]; /**< Name of the data disk, or of the parity level */
+	char path[PATH_MAX]; /**< Directory of the data disk, or parity or content file */
+	char mount[PATH_MAX]; /**< Mount point of the filesystem holding it. Empty if not known. */
+};
+
+struct layout {
+	struct layout_entry* entries;
+	unsigned count;
+};
+
+static void json_mount_use(ss_t* s, int level, const struct layout* layout, const char* target);
+
+static void json_mount_table(ss_t* s, int level, const char* field, const char* path, int with_space, const struct layout* layout)
 {
 	ss_t text;
 	struct mount_entry entry;
@@ -932,6 +1013,8 @@ static void json_mount_table(ss_t* s, int level, const char* field, const char* 
 			ss_json_bool(s, level, "is_dir", is_dir);
 			if (is_dir)
 				json_statvfs(s, level, entry.target);
+			if (layout != 0 && !is_mergerfs(entry.fstype))
+				json_mount_use(s, level, layout, entry.target);
 		}
 		ss_json_close(s, &level);
 	}
@@ -940,7 +1023,10 @@ static void json_mount_table(ss_t* s, int level, const char* field, const char* 
 	ss_done(&text);
 }
 
-static void json_pools(ss_t* s, int level)
+static const struct layout_entry* layout_find_dir(const struct layout* layout, const char* dir, int* partial);
+static const char* layout_role_name(char role);
+
+static void json_pools(ss_t* s, int level, const struct layout* layout)
 {
 	ss_t text;
 	ss_t fstab;
@@ -1009,6 +1095,16 @@ static void json_pools(ss_t* s, int level)
 				ss_json_str(s, level, "mode", mode);
 			}
 			json_statvfs(s, level, tok);
+
+			/* what protects the files written in this branch */
+			int partial;
+			const struct layout_entry* use = layout_find_dir(layout, tok, &partial);
+			if (use != 0) {
+				ss_json_str(s, level, "array", use->array);
+				ss_json_str(s, level, "role", layout_role_name(use->role));
+				ss_json_str(s, level, "disk", use->name);
+			}
+			ss_json_bool(s, level, "protected", use != 0 && use->role == LAYOUT_DATA && !partial);
 			ss_json_close(s, &level);
 		}
 		ss_json_array_close(s, &level);
@@ -1023,18 +1119,379 @@ static void json_pools(ss_t* s, int level)
 
 static void engine_conf_path(struct snapraid_state* state, char* path, size_t path_size)
 {
-	path[0] = 0;
-
-	if (state->engine_conf_arg[0] != 0) {
-		sncpy(path, path_size, state->engine_conf_arg);
-	} else {
-		state_lock();
-		sncpy(path, path_size, state->array.engine_conf);
-		state_unlock();
-	}
+	state_lock();
+	array_engine_conf_locked(state, path, path_size);
+	state_unlock();
 
 	if (path[0] == 0)
 		sncpy(path, path_size, ENGINE_CONF_DEFAULT);
+}
+
+/****************************************************************************/
+/* layout */
+
+/**
+ * What the arrays use: the directory of every data disk, and every parity
+ * and content file, as written in their SnapRAID configuration files.
+ *
+ * It tells which array protects a mount or the branch of a pool, and it
+ * keeps a disk from ending in two arrays.
+ */
+
+static void layout_init(struct layout* layout)
+{
+	layout->entries = malloc_nofail(LAYOUT_MAX * sizeof(struct layout_entry));
+	layout->count = 0;
+}
+
+static void layout_done(struct layout* layout)
+{
+	free(layout->entries);
+}
+
+static void layout_add(struct layout* layout, const char* array, char role, const char* name, const char* path)
+{
+	if (layout->count >= LAYOUT_MAX || path[0] == 0)
+		return;
+
+	struct layout_entry* e = &layout->entries[layout->count++];
+	sncpy(e->array, sizeof(e->array), array);
+	e->role = role;
+	sncpy(e->name, sizeof(e->name), name);
+	sncpy(e->path, sizeof(e->path), path);
+	e->mount[0] = 0;
+
+	/* /mnt/d1/ and /mnt/d1 are the same place */
+	size_t len = strlen(e->path);
+	while (len > 1 && e->path[len - 1] == '/')
+		e->path[--len] = 0;
+}
+
+/**
+ * Read the disks and files of an array from the text of its SnapRAID
+ * configuration: "data NAME DIR", "parity FILE[,FILE]", "N-parity FILE[,FILE]"
+ * and "content FILE".
+ */
+static void layout_parse(struct layout* layout, const char* array, const char* text)
+{
+	const char* line = text;
+
+	while (*line) {
+		char buf[PATH_MAX + 128];
+		const char* end = strchr(line, '\n');
+		size_t len = end ? (size_t)(end - line) : strlen(line);
+		const char* next = end ? end + 1 : line + len;
+
+		if (len >= sizeof(buf)) {
+			line = next;
+			continue;
+		}
+		memcpy(buf, line, len);
+		buf[len] = 0;
+		line = next;
+
+		/* trim */
+		char* s = buf;
+		while (*s && isspace((unsigned char)*s))
+			++s;
+		char* tail = s + strlen(s);
+		while (tail > s && isspace((unsigned char)tail[-1]))
+			*--tail = 0;
+		if (*s == 0 || *s == '#')
+			continue;
+
+		/* the keyword */
+		char* arg = s;
+		while (*arg && !isspace((unsigned char)*arg))
+			++arg;
+		if (*arg == 0)
+			continue;
+		*arg++ = 0;
+		while (*arg && isspace((unsigned char)*arg))
+			++arg;
+
+		size_t kl = strlen(s);
+		if (strcmp(s, "data") == 0 || strcmp(s, "disk") == 0) {
+			char* dir = arg;
+			while (*dir && !isspace((unsigned char)*dir))
+				++dir;
+			if (*dir == 0)
+				continue;
+			*dir++ = 0;
+			while (*dir && isspace((unsigned char)*dir))
+				++dir;
+			layout_add(layout, array, LAYOUT_DATA, arg, dir);
+		} else if (strcmp(s, "content") == 0) {
+			layout_add(layout, array, LAYOUT_CONTENT, "content", arg);
+		} else if (strcmp(s, "parity") == 0 || (kl == 8 && strcmp(s + 1, "-parity") == 0)) {
+			/* a parity can be split in more files */
+			char* save = 0;
+			for (char* tok = strtok_r(arg, ",", &save); tok; tok = strtok_r(0, ",", &save)) {
+				while (*tok && isspace((unsigned char)*tok))
+					++tok;
+				char* tok_end = tok + strlen(tok);
+				while (tok_end > tok && isspace((unsigned char)tok_end[-1]))
+					*--tok_end = 0;
+				layout_add(layout, array, LAYOUT_PARITY, s, tok);
+			}
+		}
+	}
+}
+
+/**
+ * Find for every entry the filesystem holding it: the mount point that is
+ * the longest prefix of its path.
+ * \param mounts Text of /proc/self/mounts.
+ */
+static void layout_mounts(struct layout* layout, const char* mounts)
+{
+	struct mount_entry entry;
+	const char* cursor = mounts;
+	int r;
+
+	while ((r = mount_next(&cursor, &entry, 0, 0)) >= 0) {
+		if (r != 1 || entry.target[0] != '/')
+			continue;
+		/* a pool is not where a disk is */
+		if (is_mergerfs(entry.fstype))
+			continue;
+		for (unsigned i = 0; i < layout->count; ++i) {
+			struct layout_entry* e = &layout->entries[i];
+			if (path_inside(e->path, entry.target) && strlen(entry.target) >= strlen(e->mount))
+				sncpy(e->mount, sizeof(e->mount), entry.target);
+		}
+	}
+}
+
+/**
+ * Load the layout of every array, or of all but one.
+ */
+static void layout_load(struct layout* layout, struct snapraid_state* exclude)
+{
+	struct snapraid_host* host = host_ptr();
+	char (*paths)[PATH_MAX];
+	char (*names)[ARRAY_NAME_MAX];
+	unsigned count = 0;
+	ss_t text;
+
+	layout_init(layout);
+
+	/* the files are read without holding the state lock */
+	state_lock();
+	unsigned max = tommy_list_count(&host->state_list);
+	paths = malloc_nofail((max + 1) * sizeof(*paths));
+	names = malloc_nofail((max + 1) * sizeof(*names));
+	for (tommy_node* i = tommy_list_head(&host->state_list); i; i = i->next) {
+		struct snapraid_state* state = i->data;
+		if (state == exclude)
+			continue;
+		array_engine_conf_locked(state, paths[count], PATH_MAX);
+		if (paths[count][0] == 0)
+			sncpy(paths[count], PATH_MAX, ENGINE_CONF_DEFAULT);
+		sncpy(names[count], ARRAY_NAME_MAX, state->name);
+		++count;
+	}
+	state_unlock();
+
+	for (unsigned i = 0; i < count; ++i) {
+		ss_init(&text, 4096);
+		if (file_read(paths[i], &text) == 0) {
+			ss_write(&text, "", 1);
+			layout_parse(layout, names[i], ss_ptr(&text));
+		}
+		ss_done(&text);
+	}
+
+	free(paths);
+	free(names);
+
+	ss_init(&text, 4096);
+	file_read("/proc/self/mounts", &text);
+	ss_write(&text, "", 1);
+	layout_mounts(layout, ss_ptr(&text));
+	ss_done(&text);
+}
+
+/**
+ * Check if two entries are on the same disk: on the same filesystem, when
+ * it's known and it isn't the root one, where different directories are
+ * the only way to tell things apart.
+ */
+static int layout_same_disk(const struct layout_entry* a, const struct layout_entry* b)
+{
+	return a->mount[0] != 0 && strcmp(a->mount, "/") != 0 && strcmp(a->mount, b->mount) == 0;
+}
+
+/**
+ * Check what an array is going to use against what the other arrays use.
+ *
+ * A disk belongs to one array only: with a disk in two arrays, a sync of
+ * the first makes the parity of the second out of date, and a recovery of
+ * the second would bring back old data.
+ *
+ * \param mine What the array is going to use.
+ * \param others What the other arrays use.
+ * \return 0 if nothing is shared, otherwise 409 with the reason in msg.
+ */
+static int layout_conflict(const struct layout* mine, const struct layout* others, char* msg, size_t msg_size)
+{
+	for (unsigned i = 0; i < mine->count; ++i) {
+		const struct layout_entry* a = &mine->entries[i];
+		for (unsigned j = 0; j < others->count; ++j) {
+			const struct layout_entry* b = &others->entries[j];
+
+			if (a->role == LAYOUT_CONTENT || b->role == LAYOUT_CONTENT) {
+				/* content files can be anywhere, also on the disks of another array, but not the same file */
+				if (a->role == b->role && strcmp(a->path, b->path) == 0)
+					return fail(msg, msg_size, 409, "The content file %s is already the one of the array '%s': every array needs its own content files", a->path, b->array);
+				continue;
+			}
+
+			int same_path = path_inside(a->path, b->path) || path_inside(b->path, a->path);
+
+			if (a->role == LAYOUT_DATA && b->role == LAYOUT_DATA) {
+				if (same_path || layout_same_disk(a, b))
+					return fail(msg, msg_size, 409, "%s is already the data disk '%s' of the array '%s': a disk can be in one array only", a->path, b->name, b->array);
+			} else if (a->role == LAYOUT_PARITY && b->role == LAYOUT_PARITY) {
+				if (strcmp(a->path, b->path) == 0)
+					return fail(msg, msg_size, 409, "The parity file %s is already the %s of the array '%s': every array needs its own parity", a->path, b->name, b->array);
+				if (layout_same_disk(a, b))
+					return fail(msg, msg_size, 409, "The parity file %s is on the disk that holds the %s of the array '%s': a parity disk can serve one array only", a->path, b->name, b->array);
+			} else if (same_path || layout_same_disk(a, b)) {
+				const struct layout_entry* data = a->role == LAYOUT_DATA ? a : b;
+				const struct layout_entry* parity = a->role == LAYOUT_DATA ? b : a;
+				return fail(msg, msg_size, 409, "The data disk '%s' (%s) of the array '%s' and the %s (%s) of the array '%s' are on the same disk: a disk is either data or parity, and of one array only", data->name, data->path, data->array, parity->name, parity->path, parity->array);
+			}
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * Find what protects a directory, like the branch of a pool.
+ *
+ * \param partial Set to 1 if the directory is only in part inside a data
+ *   disk: it contains the directory of a data disk, and also something else.
+ * \return The entry of the data disk the directory is in, or of the parity
+ *   kept on the same filesystem, or 0 if no array knows about it.
+ */
+static const struct layout_entry* layout_find_dir(const struct layout* layout, const char* dir, int* partial)
+{
+	const struct layout_entry* found = 0;
+
+	*partial = 0;
+
+	for (unsigned i = 0; i < layout->count; ++i) {
+		const struct layout_entry* e = &layout->entries[i];
+		if (e->role == LAYOUT_DATA && path_inside(dir, e->path))
+			return e;
+	}
+
+	for (unsigned i = 0; i < layout->count; ++i) {
+		const struct layout_entry* e = &layout->entries[i];
+		if (e->role == LAYOUT_DATA && path_inside(e->path, dir)) {
+			*partial = 1;
+			return e;
+		}
+		if (e->role == LAYOUT_PARITY && found == 0 && path_inside(e->path, dir))
+			found = e;
+	}
+
+	return found;
+}
+
+static const char* layout_role_name(char role)
+{
+	switch (role) {
+	case LAYOUT_DATA : return "data";
+	case LAYOUT_PARITY : return "parity";
+	}
+	return "content";
+}
+
+/**
+ * Emit what the arrays use.
+ */
+static void json_layout(ss_t* s, int level, const struct layout* layout)
+{
+	struct snapraid_host* host = host_ptr();
+	char (*names)[ARRAY_NAME_MAX];
+	char (*paths)[PATH_MAX];
+	unsigned count = 0;
+
+	state_lock();
+	unsigned max = tommy_list_count(&host->state_list);
+	names = malloc_nofail((max + 1) * sizeof(*names));
+	paths = malloc_nofail((max + 1) * sizeof(*paths));
+	for (tommy_node* i = tommy_list_head(&host->state_list); i; i = i->next) {
+		struct snapraid_state* state = i->data;
+		sncpy(names[count], ARRAY_NAME_MAX, state->name);
+		array_engine_conf_locked(state, paths[count], PATH_MAX);
+		if (paths[count][0] == 0)
+			sncpy(paths[count], PATH_MAX, ENGINE_CONF_DEFAULT);
+		++count;
+	}
+	state_unlock();
+
+	ss_json_array_open(s, &level, "arrays");
+	for (unsigned a = 0; a < count; ++a) {
+		struct stat st;
+
+		priv_enter();
+		int exists = stat(paths[a], &st) == 0;
+		priv_leave();
+
+		ss_json_open(s, &level);
+		ss_json_str(s, level, "name", names[a]);
+		ss_json_bool(s, level, "default", a == 0);
+		ss_json_str(s, level, "engine_conf", paths[a]);
+		ss_json_bool(s, level, "exists", exists);
+		ss_json_array_open(s, &level, "uses");
+		for (unsigned i = 0; i < layout->count; ++i) {
+			const struct layout_entry* e = &layout->entries[i];
+			if (strcmp(e->array, names[a]) != 0)
+				continue;
+			ss_json_open(s, &level);
+			ss_json_str(s, level, "role", layout_role_name(e->role));
+			ss_json_str(s, level, "name", e->name);
+			ss_json_str(s, level, "path", e->path);
+			if (e->mount[0] != 0)
+				ss_json_str(s, level, "mount", e->mount);
+			ss_json_close(s, &level);
+		}
+		ss_json_array_close(s, &level);
+		ss_json_close(s, &level);
+	}
+	ss_json_array_close(s, &level);
+
+	free(names);
+	free(paths);
+}
+
+/**
+ * Emit which array uses a mounted filesystem, and for what.
+ */
+static void json_mount_use(ss_t* s, int level, const struct layout* layout, const char* target)
+{
+	const struct layout_entry* best = 0;
+
+	/* data wins over parity, and parity over content: it's what matters for the disk */
+	for (unsigned i = 0; i < layout->count; ++i) {
+		const struct layout_entry* e = &layout->entries[i];
+		if (strcmp(e->mount, target) != 0)
+			continue;
+		if (best == 0
+			|| (e->role == LAYOUT_DATA && best->role != LAYOUT_DATA)
+			|| (e->role == LAYOUT_PARITY && best->role == LAYOUT_CONTENT))
+			best = e;
+	}
+
+	if (best != 0) {
+		ss_json_str(s, level, "array", best->array);
+		ss_json_str(s, level, "role", layout_role_name(best->role));
+		ss_json_str(s, level, "disk", best->name);
+	}
 }
 
 void storage_inventory_json(struct snapraid_state* state, ss_t* s, int level)
@@ -1132,9 +1589,14 @@ void storage_inventory_json(struct snapraid_state* state, ss_t* s, int level)
 	ss_json_array_close(s, &level);
 	ss_done(&text);
 
-	json_mount_table(s, level, "mounts", "/proc/self/mounts", 1);
-	json_mount_table(s, level, "fstab", fstab_path, 0);
-	json_pools(s, level);
+	struct layout layout;
+	layout_load(&layout, 0);
+	ss_json_str(s, level, "array", state->name);
+	json_layout(s, level, &layout);
+	json_mount_table(s, level, "mounts", "/proc/self/mounts", 1, &layout);
+	json_mount_table(s, level, "fstab", fstab_path, 0, 0);
+	json_pools(s, level, &layout);
+	layout_done(&layout);
 	storage_job_json(s, level);
 }
 
@@ -1156,7 +1618,32 @@ int storage_engine_conf_write(struct snapraid_state* state, const char* text, ch
 
 	engine_conf_path(state, path, sizeof(path));
 
+	/* a disk must not end in two arrays */
+	struct layout mine;
+	struct layout others;
+	ss_t mounts;
+	layout_init(&mine);
+	layout_parse(&mine, state->name, text);
+	ss_init(&mounts, 4096);
+	file_read("/proc/self/mounts", &mounts);
+	ss_write(&mounts, "", 1);
+	layout_mounts(&mine, ss_ptr(&mounts));
+	ss_done(&mounts);
+	layout_load(&others, state);
+	int conflict = layout_conflict(&mine, &others, msg, msg_size);
+	layout_done(&mine);
+	layout_done(&others);
+	if (conflict != 0)
+		return conflict;
+
 	pthread_mutex_lock(&storage_mutex);
+	char* slash = strrchr(path, '/');
+	if (slash != 0 && slash != path) {
+		/* the file of a new array may be the first one in its directory */
+		*slash = 0;
+		make_dirs(path);
+		*slash = '/';
+	}
 	int ret = file_replace(path, text, ".bak", 0644);
 	pthread_mutex_unlock(&storage_mutex);
 
@@ -1585,7 +2072,33 @@ int storage_mount(const char* source, const char* target, const char* fstype, co
 	}
 
 	if (persist) {
-		snprintf(line, sizeof(line), "%s %s %s %s 0 2", source, target, fstype, options);
+		/*
+		 * What goes in fstab must never stop the boot of the machine: with
+		 * "nofail" a dead or missing disk is skipped, and by UUID the line
+		 * keeps pointing to the same filesystem when the device names change.
+		 */
+		char by_uuid[128 + 8];
+		const char* saved_source = source;
+		if (strncmp(source, "/dev/", 5) == 0) {
+			static const char* blkid_keys[] = { "-c", "/dev/null", "-s", "UUID", "-o", "value", 0, 0 };
+			const char* blkid_args[8];
+			ss_t out;
+			memcpy(blkid_args, blkid_keys, sizeof(blkid_keys));
+			blkid_args[6] = source;
+			ss_init(&out, 128);
+			if (tool_run("blkid", blkid_args, 0, &out, 30) == 0) {
+				ss_write(&out, "", 1);
+				char* uuid = ss_ptr(&out);
+				size_t ul = strcspn(uuid, "\r\n");
+				uuid[ul] = 0;
+				if (ul != 0 && ul < 128 && valid_chars(uuid, "-", 128)) {
+					snprintf(by_uuid, sizeof(by_uuid), "UUID=%s", uuid);
+					saved_source = by_uuid;
+				}
+			}
+			ss_done(&out);
+		}
+		snprintf(line, sizeof(line), "%s %s %s %s%s 0 2", saved_source, target, fstype, options, option_has(options, "nofail") ? "" : ",nofail");
 		if (fstab_set(target, line) != 0) {
 			ret = fail(msg, msg_size, 500, "Mounted, but failed to update " FSTAB_PATH ", %s", strerror(errno));
 			goto bail;
@@ -1752,7 +2265,19 @@ int storage_pool(const char* mountpoint, const char* branches, const char* optio
 				continue;
 			*value++ = 0;
 			for (unsigned i = 0; pool_runtime_keys[i]; ++i) {
-				if (strcmp(tok, pool_runtime_keys[i]) == 0 && pool_put(mountpoint, tok, value) != 0) {
+				if (strcmp(tok, pool_runtime_keys[i]) != 0)
+					continue;
+
+				/*
+				 * Some versions of mergerfs accept a policy they don't know
+				 * without reporting an error, and are then left without a
+				 * usable one: check the name before it reaches the pool.
+				 */
+				if ((strncmp(tok, "category.", 9) == 0 || strncmp(tok, "func.", 5) == 0) && !valid_policy(value)) {
+					ret = fail(msg, msg_size, 400, "The pool refused %s=%s: it's not a policy of mergerfs", tok, value);
+					goto bail;
+				}
+				if (pool_put(mountpoint, tok, value) != 0) {
 					ret = fail(msg, msg_size, 400, "The pool refused %s=%s, %s", tok, value, strerror(errno));
 					goto bail;
 				}
@@ -1781,9 +2306,17 @@ int storage_pool(const char* mountpoint, const char* branches, const char* optio
 	}
 
 	if (persist) {
-		/* the mount helper of the mergerfs package decides the type name */
-		const char* type = tool_exists("mount.mergerfs") ? "mergerfs" : "fuse.mergerfs";
-		snprintf(line, sizeof(line), "%s %s %s %s 0 0", branches, mountpoint, type, options);
+		/*
+		 * A pool that cannot come up must never stop the boot of the machine,
+		 * and that takes the "nofail" option. The generic helper of FUSE
+		 * drops it before starting mergerfs, while the helper of the mergerfs
+		 * package hands it over, and mergerfs refuses what it doesn't know.
+		 * So go through the FUSE helper when there is one, and without it
+		 * keep the type of the mergerfs helper and leave the options alone.
+		 */
+		int fuse_helper = tool_exists("mount.fuse");
+		const char* type = fuse_helper || !tool_exists("mount.mergerfs") ? "fuse.mergerfs" : "mergerfs";
+		snprintf(line, sizeof(line), "%s %s %s %s%s 0 0", branches, mountpoint, type, options, fuse_helper && !option_has(options, "nofail") ? ",nofail" : "");
 		if (fstab_set(mountpoint, line) != 0) {
 			ret = fail(msg, msg_size, 500, "Pool active, but failed to update " FSTAB_PATH ", %s", strerror(errno));
 			goto bail;
@@ -2185,12 +2718,52 @@ int storage_balance_start(const char* mountpoint, uint64_t max_bytes, unsigned s
 	if (ret != 0)
 		return ret;
 
+	/*
+	 * Moving files under a sync, a scrub or a recovery of the same disks
+	 * makes the engine see files appear and disappear. The balance claims
+	 * the arrays it touches: it doesn't start while one of them works on
+	 * its disks, and they wait for the balance to end.
+	 */
+	struct layout layout;
+	char claims[JOB_CLAIMS_MAX][ARRAY_NAME_MAX];
+	unsigned claims_count = 0;
+	layout_load(&layout, 0);
+	for (unsigned i = 0; i < count; ++i) {
+		int partial;
+		const struct layout_entry* use = layout_find_dir(&layout, branches[i].path, &partial);
+		if (use == 0 || use->role != LAYOUT_DATA)
+			continue;
+		int known = 0;
+		for (unsigned j = 0; j < claims_count; ++j) {
+			if (strcmp(claims[j], use->array) == 0)
+				known = 1;
+		}
+		if (!known && claims_count < JOB_CLAIMS_MAX)
+			sncpy(claims[claims_count++], ARRAY_NAME_MAX, use->array);
+	}
+	layout_done(&layout);
+
+	state_lock();
+	for (unsigned i = 0; i < claims_count; ++i) {
+		const char* busy = array_heavy_command_locked(claims[i]);
+		if (busy != 0) {
+			ret = fail(msg, msg_size, 409, "The array '%s' is running a %s on the disks of this pool. Wait for it to finish, then balance.", claims[i], busy);
+			state_unlock();
+			return ret;
+		}
+	}
+
 	ret = job_begin("balance", mountpoint, msg, msg_size);
-	if (ret != 0)
+	if (ret != 0) {
+		state_unlock();
 		return ret;
+	}
 
 	job.max_bytes = max_bytes;
 	job.spread = spread;
+	memcpy(job.claims, claims, sizeof(claims));
+	job.claims_count = claims_count;
+	state_unlock();
 
 	return job_launch(balance_thread, msg, msg_size);
 }
@@ -2687,8 +3260,115 @@ static int test_pool(void)
 	return 0;
 }
 
+static int test_layout(void)
+{
+	struct layout a;
+	struct layout b;
+	char msg[MSG_MAX];
+	int partial;
+
+	static const char* MOUNTS =
+		"/dev/sda1 / ext4 rw 0 0\n"
+		"/dev/sdb1 /mnt/d1 ext4 rw 0 0\n"
+		"/dev/sdc1 /mnt/d2 xfs rw 0 0\n"
+		"/dev/sdd1 /mnt/p1 ext4 rw 0 0\n"
+		"/dev/sde1 /mnt/d3 ext4 rw 0 0\n"
+		"/dev/sdf1 /mnt/p2 ext4 rw 0 0\n"
+		"a:b /mnt/pool fuse.mergerfs rw 0 0\n";
+
+	layout_init(&a);
+	layout_parse(&a, "default",
+		"# comment\n"
+		"parity /mnt/p1/snapraid.parity\n"
+		"2-parity /mnt/q1/a.2-parity , /mnt/q2/b.2-parity\n"
+		"  content   /var/snapraid.content\n"
+		"content /mnt/d1/snapraid.content\r\n"
+		"data d1 /mnt/d1/\n"
+		"disk d2 /mnt/d2/files\n"
+		"data broken\n"
+		"exclude *.tmp\n"
+		"autosave 500\n"
+		"data last /mnt/with space/x");
+	CHECK(a.count == 8);
+	CHECK(a.entries[0].role == LAYOUT_PARITY && strcmp(a.entries[0].name, "parity") == 0 && strcmp(a.entries[0].path, "/mnt/p1/snapraid.parity") == 0);
+	CHECK(a.entries[1].role == LAYOUT_PARITY && strcmp(a.entries[1].name, "2-parity") == 0 && strcmp(a.entries[1].path, "/mnt/q1/a.2-parity") == 0);
+	CHECK(strcmp(a.entries[2].path, "/mnt/q2/b.2-parity") == 0);
+	CHECK(a.entries[3].role == LAYOUT_CONTENT && strcmp(a.entries[3].path, "/var/snapraid.content") == 0);
+	CHECK(strcmp(a.entries[4].path, "/mnt/d1/snapraid.content") == 0);
+	CHECK(a.entries[5].role == LAYOUT_DATA && strcmp(a.entries[5].name, "d1") == 0 && strcmp(a.entries[5].path, "/mnt/d1") == 0);
+	CHECK(strcmp(a.entries[6].name, "d2") == 0 && strcmp(a.entries[6].path, "/mnt/d2/files") == 0);
+	CHECK(strcmp(a.entries[7].name, "last") == 0 && strcmp(a.entries[7].path, "/mnt/with space/x") == 0);
+	CHECK(strcmp(a.entries[0].array, "default") == 0);
+
+	layout_mounts(&a, MOUNTS);
+	CHECK(strcmp(a.entries[0].mount, "/mnt/p1") == 0);
+	CHECK(strcmp(a.entries[3].mount, "/") == 0);
+	CHECK(strcmp(a.entries[5].mount, "/mnt/d1") == 0);
+	CHECK(strcmp(a.entries[6].mount, "/mnt/d2") == 0);
+
+	/* what protects a directory */
+	CHECK(layout_find_dir(&a, "/mnt/d1", &partial) == &a.entries[5] && !partial);
+	CHECK(layout_find_dir(&a, "/mnt/d1/sub", &partial) == &a.entries[5] && !partial);
+	CHECK(layout_find_dir(&a, "/mnt/d2/files/x", &partial) == &a.entries[6] && !partial);
+	CHECK(layout_find_dir(&a, "/mnt/d2", &partial) == &a.entries[6] && partial);
+	CHECK(layout_find_dir(&a, "/mnt/p1", &partial) == &a.entries[0]);
+	CHECK(layout_find_dir(&a, "/mnt/d10", &partial) == 0);
+	CHECK(layout_find_dir(&a, "/mnt/d3", &partial) == 0);
+
+	/* another array on its own disks */
+	layout_init(&b);
+	layout_parse(&b, "media", "parity /mnt/p2/snapraid.parity\ncontent /var/media.content\ncontent /mnt/d1/media.content\ndata m1 /mnt/d3\n");
+	layout_mounts(&b, MOUNTS);
+	CHECK(layout_conflict(&b, &a, msg, sizeof(msg)) == 0);
+	CHECK(layout_conflict(&a, &b, msg, sizeof(msg)) == 0);
+	layout_done(&b);
+
+#define CONFLICT(text, word) \
+	layout_init(&b); \
+	layout_parse(&b, "media", text); \
+	layout_mounts(&b, MOUNTS); \
+	CHECK(layout_conflict(&b, &a, msg, sizeof(msg)) == 409 && strstr(msg, word) != 0); \
+	layout_done(&b)
+
+	/* the same data disk, a directory inside it, and the disk that contains its directory */
+	CONFLICT("data m1 /mnt/d1\n", "one array only");
+	CONFLICT("data m1 /mnt/d1/inside\n", "one array only");
+	CONFLICT("data m1 /mnt/d2\n", "one array only");
+	/* another directory of the same filesystem */
+	CONFLICT("data m1 /mnt/d2/other\n", "one array only");
+	/* the parity */
+	CONFLICT("parity /mnt/p1/snapraid.parity\n", "own parity");
+	CONFLICT("parity /mnt/p1/media.parity\n", "one array only");
+	CONFLICT("parity /mnt/d1/media.parity\n", "either data or parity");
+	CONFLICT("data m1 /mnt/p1\n", "either data or parity");
+	/* the content */
+	CONFLICT("content /var/snapraid.content\n", "own content");
+#undef CONFLICT
+
+	/* on the root filesystem only the directories tell things apart */
+	layout_init(&b);
+	layout_parse(&b, "media", "parity /srv/p/media.parity\ndata m1 /srv/m1\ncontent /var/media.content\n");
+	layout_mounts(&b, MOUNTS);
+	CHECK(strcmp(b.entries[0].mount, "/") == 0);
+	layout_done(&a);
+	layout_init(&a);
+	layout_parse(&a, "default", "parity /srv/q/snapraid.parity\ndata d1 /srv/d1\n");
+	layout_mounts(&a, MOUNTS);
+	CHECK(layout_conflict(&b, &a, msg, sizeof(msg)) == 0);
+	layout_done(&b);
+	layout_done(&a);
+
+	CHECK(option_has("defaults,noatime,nofail", "nofail") && option_has("nofail", "nofail") && option_has("nofail,ro", "nofail"));
+	CHECK(!option_has("defaults,nofailover", "nofail") && !option_has("", "nofail") && !option_has("x-nofail", "nofail"));
+	CHECK(valid_policy("mfs") && valid_policy("epmfs") && valid_policy("pfrd") && !valid_policy("nosuchpolicy") && !valid_policy("") && !valid_policy("MFS"));
+
+	return 0;
+}
+
 int storage_selftest(void)
 {
+	if (test_layout() != 0)
+		return -1;
 	if (test_validation() != 0)
 		return -1;
 	if (test_mount_table() != 0)
@@ -2782,6 +3462,12 @@ void storage_job_json(ss_t* s, int level)
 int storage_job_stop(char* msg, size_t msg_size)
 {
 	return unsupported(msg, msg_size);
+}
+
+int storage_job_claims_array(const char* name)
+{
+	(void)name;
+	return 0;
 }
 
 int storage_format_start(const char* device, const char* fstype, const char* label, const char* purpose, int wipe, char* msg, size_t msg_size)

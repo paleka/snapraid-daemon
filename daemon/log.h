@@ -4,6 +4,8 @@
 #ifndef LOG_H
 #define LOG_H
 
+struct snapraid_state;
+
 /****************************************************************************/
 /* log */
 
@@ -13,6 +15,16 @@
  * @return 0 on success, -1 on error
  */
 int log_init(const char* ident);
+
+/**
+ * Tell that the current thread works for an array.
+ *
+ * From now on what it logs carries the name of the array, if not the default
+ * one, and its task messages are collected for the tasks of that array.
+ *
+ * @param state State of the array, or 0 to unbind
+ */
+void log_bind(struct snapraid_state* state);
 
 /**
  * Cleanup logging system.

@@ -23,8 +23,8 @@ static void app_signal_handler_term(int sig)
 {
 	struct snapraid_state* state = state_ptr();
 
-	state->daemon_sig = sig;
-	state->daemon_terminating = 1;
+	state->host->daemon_sig = sig;
+	state->host->daemon_terminating = 1;
 }
 
 static void app_signal_handler_hup(int sig)
@@ -33,7 +33,7 @@ static void app_signal_handler_hup(int sig)
 
 	(void)sig;
 
-	state->daemon_reloading = 1;
+	state->host->daemon_reloading = 1;
 }
 
 /****************************************************************************/
@@ -687,8 +687,8 @@ int main(int argc, char* argv[])
 
 	int pidfd = -1;
 	int startup_fd = -1;
-	if (!state->log.foreground) {
-		pidfd = os_daemonize(pidfile, sizeof(pidfile), state->config.pidfile_arg, state->instance, &startup_fd);
+	if (!state->host->log.foreground) {
+		pidfd = os_daemonize(pidfile, sizeof(pidfile), state->config.pidfile_arg, state->host->instance, &startup_fd);
 		if (pidfd == -1) {
 			daemon_startup_close(&startup_fd);
 			exit(EXIT_FAILURE);
@@ -737,7 +737,7 @@ int main(int argc, char* argv[])
 	 * is already terminating. Evaluate the final daemon status only after all worker threads
 	 * have stopped.
 	 */
-	if (state->daemon_failing || state->daemon_aborting)
+	if (state->host->daemon_failing || state->host->daemon_aborting)
 		ret = -1;
 
 	state_done(state);
