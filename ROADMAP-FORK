@@ -1,0 +1,92 @@
+Roadmap of this fork
+====================
+
+Work planned on the 'storage' branch, on top of what CHANGES-FORK lists.
+The order inside each section is the order of priority.
+
+Everything here is built on SnapRAID, mergerfs and standard Linux tools,
+under GPL-3.0-or-later.
+
+
+Open items
+==========
+
+- Look at the reworked Replace dialog in a browser. Only its rules are tested.
+- Pool options: read a mergerfs option back after setting it. Some mergerfs
+  versions accept an unknown policy without reporting an error.
+- Guided step for an array left degraded by a recovery whose closing sync
+  stopped on a full parity. Today the way out is to free space and then use
+  Recover, "accept the disks as they are".
+- When a disk is not mounted, name the disk and offer to mount or replace it.
+  Never lead with the --force-empty hint.
+- Extend the tests of disks of different sizes to xfs and btrfs data disks.
+- Test with real multi-TB disks, and the 16 TiB limit of a parity file on ext4.
+- Balance: when nothing can be moved because the files are recent, say so
+  in the result instead of "Nothing more can be moved".
+
+
+Features
+========
+
+1. Parity swap wizard
+   - A new disk larger than the parity becomes the parity, and the old parity
+     becomes a data disk, in one guided operation.
+   - Offer it from the Replace and Add dialogs when the chosen disk is larger
+     than the parity, and from the "parity is full" finding.
+   - Keep the old parity untouched until the new one is complete and checked.
+
+2. Cache tier and mover
+   - A second set of branches on SSD in front of the pool, written first.
+   - Daemon job moving files to the array by age or by fill level, followed
+     by a sync. Reuse the engine of the balance.
+   - Schedule, manual run, and a per-folder choice to stay on the cache.
+   - Warn that files on the cache are not protected by parity until moved.
+
+3. Protection window
+   - Show how much data changed since the last sync, and for how long it has
+     been unprotected. SnapRAID parity is a snapshot, not real time.
+   - Optional sync when the changes pass a threshold, and after the mover.
+
+4. Shares
+   - Top-level folders of the pool as shares, with their size and disks.
+   - Export over SMB and NFS from the UI (Samba and exports configuration).
+   - Keep a folder together on one disk (mergerfs "ep" policies), include and
+     exclude disks per share.
+
+5. Disk burn-in
+   - SMART extended test and a full surface pass (badblocks) before a new
+     disk is trusted, as a background job with a report.
+
+6. Empty a disk, move between disks
+   - "Evacuate this disk" to the others of the pool, before removing it.
+   - Move a folder to a chosen disk from the file browser.
+
+7. Notification channels
+   - Ready-made email, ntfy, Telegram and Discord on top of the notify hook
+     of the daemon, with a test button.
+
+8. History of sync and scrub
+   - Duration, speed, errors found and fixed for every run, as a chart.
+
+9. Encrypted disks
+   - LUKS at format time, unlock at boot with a key file, state in the
+     inventory.
+
+10. External disks and remote mounts
+    - Mount and eject USB disks with one click.
+    - SMB and NFS mounts as sources to copy data into the array.
+
+11. Multiple arrays
+    - One daemon handling more than one snapraid.conf.
+
+12. UPS
+    - Pause sync and scrub on battery (NUT, apcupsd).
+
+
+Out of scope
+============
+
+- Real-time parity: a different engine from the snapshot parity of SnapRAID.
+- Docker, virtual machines, application catalog, remote access service.
+- Management of ZFS pools. Detect and show them only.
+- Cloud backup: point to restic and rclone.
