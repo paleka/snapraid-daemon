@@ -16,6 +16,39 @@ Screenshots of the Storage page, and a lab to try it with emulated disks:
 
     https://github.com/paleka/snapraid-lab#screenshots
 
+Installation of the fork
+------------------------
+
+On Debian, Ubuntu, Proxmox and other systems using apt, on x86-64, one
+command installs everything:
+
+    curl -fsSL https://raw.githubusercontent.com/paleka/snapraid-daemon/storage/installer.sh | sudo sh
+
+It installs the SnapRAID engine from the releases of its author, if it is
+missing or older than 15.0, then the daemon from the releases of this fork,
+with mergerfs and the other tools used by the Storage page. At the end it
+prints the address of the web UI and its password. Run it again to upgrade:
+the configuration is kept.
+
+To keep the web UI reachable only from the machine itself, and the Storage
+page read-only, as in the original project:
+
+    curl -fsSL https://raw.githubusercontent.com/paleka/snapraid-daemon/storage/installer.sh | sudo SNAPRAIDD_LOCAL=1 sh
+
+The packages (.deb, .rpm, and the source code) are in the releases:
+
+    https://github.com/paleka/snapraid-daemon/releases
+
+The package is named 'snapraid-daemon-storage'. It takes the place of the
+'snapraid-daemon' package of the original project, with the same program,
+service and configuration file, and the two cannot be installed together.
+To go back to the original, install its package: the configuration is kept.
+
+Versions are the version of SnapRAID Daemon they are based on, followed by
+the number of the release of the fork, like 2.2.s1.
+
+To build from the source code, follow the INSTALL file.
+
 The additions are not part of SnapRAID Daemon, and they are not reviewed or
 endorsed by its author. Please report problems of the Storage page here:
 

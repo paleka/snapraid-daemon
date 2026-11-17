@@ -1,0 +1,54 @@
+# Release of the fork: builds the packages and publishes them when a tag
+# like v2.2.s1 is pushed (version of SnapRAID Daemon, then the number of the
+# release of the fork).
+name: Release
+
+on:
+  push:
+    tags: [ "v*.s*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # The oldest runner, so that the program runs on older systems too
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v5
+      with:
+        fetch-depth: 0
+        fetch-tags: true
+    - name: Fetch the tags as they are, annotated
+      run: git fetch --tags --force
+    - name: Install the build tools
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y -q autoconf automake zip zlib1g-dev libzstd-dev rpm
+    - name: Build the source package
+      run: |
+        autoreconf -i
+        ./configure
+        make dist
+    - name: Check that the version is the tag
+      run: test -f "snapraid-daemon-storage-${GITHUB_REF_NAME#v}.tar.gz"
+    - name: Build the .deb package
+      run: bash makedeb.sh
+    - name: Build the .rpm package
+      run: bash makerpm.sh
+    - name: Checksums
+      run: sha256sum snapraid-daemon-storage*.tar.gz snapraid-daemon-storage*.deb snapraid-daemon-storage*.x86_64.rpm > SHA256SUMS
+    - name: Publish the release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "$GITHUB_REF_NAME" \
+          --title "SnapRAID Daemon with the Storage page ${GITHUB_REF_NAME#v}" \
+          --notes "Unofficial fork of SnapRAID Daemon by Andrea Mazzoleni, with the Storage page. Based on SnapRAID Daemon ${GITHUB_REF_NAME%.s*}.
+
+        Install or upgrade on Debian, Ubuntu and Proxmox:
+
+            curl -fsSL https://raw.githubusercontent.com/paleka/snapraid-daemon/storage/installer.sh | sudo sh
+
+        See the README for the details, and CHANGES-FORK for what the fork adds." \
+          snapraid-daemon-storage*.tar.gz snapraid-daemon-storage*.deb snapraid-daemon-storage*.x86_64.rpm SHA256SUMS

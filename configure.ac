@@ -2,7 +2,7 @@ dnl Process this file with autoconf to produce a configure script.
 AC_PREREQ([2.70])
 dnl Get version number from git
 m4_define([git_revision], m4_esyscmd_s([./autover.sh]))
-AC_INIT([SnapRAID Daemon],[git_revision],[],[snapraid-daemon],[https://www.snapraid.it])
+AC_INIT([SnapRAID Daemon],[git_revision],[],[snapraid-daemon-storage],[https://github.com/paleka/snapraid-daemon])
 AC_CANONICAL_HOST
 AC_CANONICAL_BUILD
 AC_CANONICAL_TARGET

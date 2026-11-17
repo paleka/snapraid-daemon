@@ -173,6 +173,7 @@ LIST_XML = doc/snapraidd.xml $(patsubst %, doc/snapraidd-%.xml, $(LANG_CODES))
 EXTRA_DIST = \
 	autogen.sh autover.sh \
 	README HISTORY INSTALL AUTHORS BLUEBOX \
+	CHANGES-FORK ROADMAP-FORK installer.sh \
 	COPYING LICENSES/GPL-3.0 LICENSES/BSD-2-Clause LICENSES/MIT LICENSES/OFL \
 	$(LIST_D) \
 	$(LIST_MAN) \

@@ -3,9 +3,18 @@ Version: @PACKAGE_VERSION@-1
 Section: utils
 Priority: optional
 Architecture: amd64
-Maintainer: Andrea Mazzoleni <amadvance@gmail.com>
+Maintainer: Robert Paleka <paleka@users.noreply.github.com>
 Depends: zlib1g, libzstd1, snapraid (>= 15.0), systemd
-Description: A background service with a built-in Web UI that automates SnapRAID operations
+Recommends: mergerfs, parted, fdisk, util-linux, e2fsprogs, xfsprogs, btrfs-progs, rsync, smartmontools, curl
+Conflicts: snapraid-daemon
+Replaces: snapraid-daemon
+Provides: snapraid-daemon
+Description: SnapRAID Daemon with the Storage page (unofficial fork)
+ This is an unofficial fork of SnapRAID Daemon by Andrea Mazzoleni. It adds a
+ Storage page to the web UI, to set up and maintain a SnapRAID array, with or
+ without a mergerfs pool. It replaces the snapraid-daemon package and uses the
+ same program, service and configuration file.
+ .
  SnapRAID Daemon is a lightweight background service that transforms manual parity
  tasks into an automated workflow. It integrates directly with SnapRAID to
  coordinate sync and scrub operations via intelligent scheduling, ensuring your
@@ -14,5 +23,5 @@ Description: A background service with a built-in Web UI that automates SnapRAID
  both visual oversight and programmatic control. While the dashboard offers
  real-time status and health alerts, the API enables seamless integration into
  external monitoring stacks for persistent and reliable data protection.
-Homepage: https://www.snapraid.it/
+Homepage: https://github.com/paleka/snapraid-daemon
 License: GPL-3.0-or-later

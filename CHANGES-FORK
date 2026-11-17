@@ -7,7 +7,7 @@ by Andrea Mazzoleni (https://github.com/amadvance/snapraid-daemon).
 The original project is licensed under GPL-3.0-or-later, and so are the
 additions. Files that already existed keep the copyright of their author.
 The new files (daemon/storage.c, daemon/storage.h, js/storage.js of both UIs,
-test/ui/) are copyright of Robert Paleka.
+test/ui/, installer.sh) are copyright of Robert Paleka.
 
 The additions were written with the help of an AI coding assistant (Claude).
 The AGENTS.md file of the original project asks agents to never commit to
@@ -61,7 +61,14 @@ Changes to existing files
     doc/snapraidd.d/.1/.txt    documentation of the new option and endpoints
     snapraidd.yaml             OpenAPI description of the new endpoints
     snapraidd.conf.example     example of the new option
-    README                     note about the fork
+    README                     note about the fork, and its installation
+    configure.ac               package named snapraid-daemon-storage
+    pkg/control.in, .spec.in   package of the fork, replacing snapraid-daemon
+    makedeb.sh.in, makerpm.sh.in  names of the packages
+    Makefile.am                files of the fork in the source package
+    daemon/version.c           the update check reads the releases of the fork
+    installer.sh                 installer for systems using apt (new file)
+    .github/workflows/release.yml  build of the releases (new file)
 
 
 How it is tested
@@ -74,6 +81,27 @@ filesystems, are in a separate repository:
 
 The screenshots of the Storage page are there too. No picture is added to
 this repository, to keep the difference from the original project small.
+
+
+Packages and releases
+---------------------
+
+The package is named 'snapraid-daemon-storage', and it declares that it
+replaces and conflicts with 'snapraid-daemon', the package of the original
+project. The program, the service and the configuration file are the same.
+
+A release is made pushing an annotated tag on the 'storage' branch. The tag is the
+version of SnapRAID Daemon the branch is based on, followed by the number of
+the release of the fork:
+
+    git tag -a v2.2.s1 -m "SnapRAID Daemon with the Storage page 2.2.s1"
+    git push origin v2.2.s1
+
+The Release workflow then builds the source package, the .deb and the .rpm,
+and publishes them with their checksums. The tags of the original project
+have to be in the fork, because the version is taken from them:
+
+    git push origin --tags
 
 
 Keeping up with the original project

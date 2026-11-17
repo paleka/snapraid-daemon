@@ -220,7 +220,7 @@ int version_check_locked_yield(struct snapraid_state* state)
 
 	int ret = 0;
 
-	if (check_repo_version(curl_path, "amadvance/snapraid-daemon", daemon_version, sizeof(daemon_version)) != 0)
+	if (check_repo_version(curl_path, "paleka/snapraid-daemon", daemon_version, sizeof(daemon_version)) != 0)
 		ret = -1;
 
 	if (check_repo_version(curl_path, "amadvance/snapraid", engine_version, sizeof(engine_version)) != 0)
