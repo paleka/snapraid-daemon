@@ -1491,6 +1491,62 @@ GET lists the directory `path` of the pool `pool`, both passed in the query
 string, telling for every entry in which branches it is present, and whether
 a file exists in more than one.
 
+---- 7.7.14 /snapraid/v1/arrays ----
+More than one array can be handled by the same daemon. The array of the main
+configuration file is named `default` and always exists. Every other array has
+a configuration file of its own, NAME.conf, in the arrays directory next to the
+main one: /etc/snapraidd.conf gives /etc/snapraidd.d/NAME.conf. The file has
+the same options of the main one, plus `engine_conf` with the SnapRAID
+configuration file of the array, and without the options of the machine: sys_*,
+net_*, check_updates, array_parallel and notify_syslog_*. The files are read at
+startup and at every reload.
+
+Every array has its own disks, schedule, thresholds, scrub plan, hooks,
+notifications, tasks and log directory, a sub directory of `sys_log_directory`
+with the name of the array. A disk can be in one array only: a SnapRAID
+configuration that uses a data or parity disk, or a content file, of another
+array is refused.
+
+By default one array at a time runs the commands working on the whole disks
+(diff, sync, scrub, fix and check), and the others wait their turn. Commands
+that only look at the disks are never delayed. Setting `array_parallel` to 1 in
+the main configuration file lets arrays that share no physical disk run
+together.
+
+GET returns the list of the arrays, each with its name, health, SnapRAID
+configuration file, number of disks, space, what is running and, if it's
+waiting, the array it waits for in `waiting_for`.
+
+POST creates an array with the given `name`, made of up to 31 lowercase
+letters, digits, `-` and `_`. The optional `engine_conf` is the path of its
+SnapRAID configuration file: an existing one is taken over as it is. The new
+array starts with the options of the default one. It requires the
+`net_storage_admin` option.
+
+---- 7.7.15 /snapraid/v1/arrays/NAME ----
+GET returns the summary of one array.
+
+DELETE makes the daemon stop handling the array. Its configuration file is
+renamed to NAME.conf.removed, and nothing else is touched: the SnapRAID
+configuration, the content files, the parity and the data stay where they are.
+The default array, and an array with tasks running or queued, cannot be
+removed. It requires the `net_storage_admin` option.
+
+---- 7.7.16 /snapraid/v1/arrays/NAME/... ----
+Every endpoint of an array is available under this prefix, in its latest
+version: `state`, `array`, `disks`, `tasks`, `activity`, `config`, `schedule`,
+`maintenance`, `heal`, `undelete`, `suspend_idle`, `refresh`, `stop`, `clear`,
+`report`, `hold_off` and `storage` with its sub paths. The same endpoints
+without the prefix keep working on the default array.
+
+The storage inventory reports in `arrays` what every array uses, and for every
+mounted filesystem and every branch of a pool the array it belongs to, if any.
+A filesystem that is in no array is not protected by any parity.
+
+The Prometheus metrics of an array other than the default one are at
+/metrics?array=NAME. The health of every array is always exported as
+`snapraid_arrays_health` with the array as label.
+
 
 8 MULTIPLE ARRAYS IN LINUX SYSTEMD
 ==================================

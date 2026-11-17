@@ -1157,12 +1157,187 @@ paths:
           description: Server error.
           $ref: '#/components/responses/CommandResult'
 
+  /snapraid/v1/arrays:
+    get:
+      summary: List the arrays
+      description: >
+        More than one array can be handled by the same daemon. The array of
+        the main configuration file is named `default` and always exists. Every
+        other array has a configuration file NAME.conf in the arrays directory,
+        next to the main one, with its own `engine_conf`, schedule, thresholds,
+        hooks and notifications.
+
+        By default one array at a time runs the commands working on the whole
+        disks (diff, sync, scrub, fix, check). An array that waits reports in
+        `waiting_for` the name of the array it waits for, `storage` if it
+        waits for a balance of its own disks, or `*` if it's a shutdown of the
+        machine waiting for the other arrays.
+      responses:
+        '200':
+          description: Arrays retrieved successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  array_parallel:
+                    type: boolean
+                    description: Arrays that share no physical disk run at the same time.
+                  arrays_dir:
+                    type: string
+                    description: Directory of the configuration files of the arrays.
+                  arrays:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ArraySummary'
+        '4XX':
+          description: Client error.
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+    post:
+      summary: Create an array
+      description: >
+        Requires the net_storage_admin option. The array starts with the
+        options of the default one, written in its own configuration file.
+        The SnapRAID configuration file is not created: the array is reported
+        as not configured until it's written. An existing SnapRAID
+        configuration file is taken over as it is.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              additionalProperties: false
+              properties:
+                name:
+                  type: string
+                  pattern: '^[a-z0-9][a-z0-9_-]{0,30}$'
+                  example: media
+                engine_conf:
+                  type: string
+                  description: >
+                    Absolute path of the SnapRAID configuration file. If
+                    missing it's NAME.conf in the `snapraid` directory next to
+                    the main configuration file of the daemon.
+                  example: /etc/snapraid/media.conf
+      responses:
+        '201':
+          description: Array created and started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArraySummary'
+        '4XX':
+          description: >
+            Client error: 400 invalid name or path, 403 storage administration
+            not allowed, 409 name or SnapRAID configuration already in use.
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/arrays/{name}:
+    parameters:
+      - $ref: '#/components/parameters/ArrayName'
+    get:
+      summary: Get the summary of an array
+      responses:
+        '200':
+          description: Summary retrieved successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArraySummary'
+        '4XX':
+          description: Client error, 404 if there is no array with this name.
+          $ref: '#/components/responses/CommandResult'
+    delete:
+      summary: Remove an array
+      description: >
+        Requires the net_storage_admin option. The daemon stops handling the
+        array and renames its configuration file to NAME.conf.removed. Nothing
+        else is touched: the SnapRAID configuration, the content files, the
+        parity and the data stay where they are. The default array, and an
+        array with tasks running or queued, cannot be removed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        '200':
+          description: Array removed.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: >
+            Client error: 403 storage administration not allowed, 404 no array
+            with this name, 409 default array or array with tasks.
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/arrays/{name}/{endpoint}:
+    parameters:
+      - $ref: '#/components/parameters/ArrayName'
+      - name: endpoint
+        in: path
+        required: true
+        description: >
+          One of the endpoints of an array: state, array, disks, tasks,
+          activity, config, schedule, maintenance, heal, undelete,
+          suspend_idle, refresh, stop, clear, report, hold_off, storage and
+          the sub paths of storage.
+        schema:
+          type: string
+    get:
+      summary: Endpoints of an array
+      description: >
+        Every endpoint documented as /snapraid/v1/ENDPOINT, or
+        /snapraid/v2/ENDPOINT where a second version exists, is available for
+        every array as /snapraid/v1/arrays/NAME/ENDPOINT, with the same
+        methods, requests and answers, always in its latest version. The
+        endpoints without the prefix work on the default array.
+
+        `state` adds `array`, `arrays_count` and `waiting_for`. `config` adds
+        `array` and `array_parallel`; the options of the machine
+        (`check_updates`, `array_parallel`, `notify_syslog_enabled`,
+        `notify_syslog_level`) can be changed only in the default array.
+        `storage` adds `array`, the list `arrays` with what every array uses,
+        `array`, `role` and `disk` in the mounts that belong to an array, and
+        `array`, `role`, `disk` and `protected` in the branches of the pools.
+        `storage/engine_conf` refuses with 409 a configuration using a data
+        disk, a parity disk or a content file of another array.
+      responses:
+        '200':
+          description: See the endpoint without the prefix.
+        '4XX':
+          description: Client error, 404 if there is no array with this name.
+          $ref: '#/components/responses/CommandResult'
+
   /metrics:
     get:
       summary: Prometheus metrics
       security: []
+      parameters:
+        - name: array
+          in: query
+          required: false
+          description: Name of the array, if not the default one.
+          schema:
+            type: string
       description: >
         Returns daemon metrics in Prometheus exposition format.
+
+        The metrics are of the default array, or of the array given in the
+        `array` query parameter: scrape every array on its own. The health of
+        every array is always exported as `snapraid_arrays_health{array="NAME"}`.
 
         The endpoint respects all `net_acl` and other network settings but
         requires no authentication.
@@ -1182,6 +1357,15 @@ paths:
                   snapraid_array_health 1
 
 components:
+  parameters:
+    ArrayName:
+      name: name
+      in: path
+      required: true
+      description: Name of the array. `default` is the one of the main configuration file.
+      schema:
+        type: string
+        pattern: '^[a-z0-9][a-z0-9_-]{0,30}$'
   securitySchemes:
     basicAuth:
       type: http
@@ -1273,6 +1457,71 @@ components:
                   Number of pending tasks removed from the queue.
 
   schemas:
+    ArraySummary:
+      type: object
+      description: What an array is and what it is doing, for the list of the arrays.
+      properties:
+        name:
+          type: string
+        default:
+          type: boolean
+          description: True for the array of the main configuration file.
+        daemon_conf:
+          type: string
+          description: Configuration file of the daemon with the options of the array.
+        engine_conf:
+          type: string
+          description: SnapRAID configuration file of the array.
+        configured:
+          type: boolean
+          description: False until the SnapRAID configuration defines its disks.
+        health:
+          type: string
+          enum: [pending, passed, corrupt, degraded, prefail, failing]
+        health_reason:
+          type: string
+        data_disks_count:
+          type: integer
+        parity_disks_count:
+          type: integer
+        total_space_bytes:
+          type: integer
+          format: int64
+        free_space_bytes:
+          type: integer
+          format: int64
+        last_sync_at:
+          type: string
+          format: date-time
+        last_scrub_at:
+          type: string
+          format: date-time
+        block_unsynced:
+          type: integer
+          format: int64
+        block_bad:
+          type: integer
+          format: int64
+        diff_pending:
+          type: integer
+          format: int64
+          description: Files added, removed or changed since the last sync, as found by the last diff.
+        active_command:
+          type: string
+        progress:
+          type: integer
+        eta_seconds:
+          type: integer
+        pending_count:
+          type: integer
+          description: Tasks queued.
+        waiting_for:
+          type: string
+          description: >
+            Present when the next task waits: the name of the array holding
+            the engine, `storage` for a balance of its own disks, `*` for a
+            shutdown waiting for the other arrays.
+
     ValueHistory:
       type: object
       description: >

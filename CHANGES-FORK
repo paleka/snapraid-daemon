@@ -6,8 +6,9 @@ by Andrea Mazzoleni (https://github.com/amadvance/snapraid-daemon).
 
 The original project is licensed under GPL-3.0-or-later, and so are the
 additions. Files that already existed keep the copyright of their author.
-The new files (daemon/storage.c, daemon/storage.h, js/storage.js of both UIs,
-test/ui/, installer.sh) are copyright of Robert Paleka.
+The new files (daemon/storage.c, daemon/storage.h, daemon/arrays.c,
+daemon/arrays.h, js/storage.js and js/arrays.js of both UIs, test/ui/,
+installer.sh) are copyright of Robert Paleka.
 
 The additions were written with the help of an AI coding assistant (Claude).
 The AGENTS.md file of the original project asks agents to never commit to
@@ -43,14 +44,50 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
 
 * Arrays up to the limits of SnapRAID: six parity levels, split parity.
 
+* More arrays in the same daemon. The array of the main configuration file
+  is the "default" one; every other array has a file of its own in the arrays
+  directory (/etc/snapraidd.d/NAME.conf) with its SnapRAID configuration,
+  schedule, thresholds, hooks and notifications, and its own tasks and logs.
+  Arrays are created and removed from the UI, from the REST API, or putting
+  and removing the file and reloading the daemon. An installation with one
+  array works as before, with the same files and the same API.
+
+* One array at a time runs the commands working on the whole disks, unless
+  'array_parallel' is set: then arrays that share no physical disk run
+  together. Commands that only look at the disks are never delayed.
+
+* A disk belongs to one array: a SnapRAID configuration using a data disk,
+  a parity disk or a content file of another array is refused.
+
+* More pools, and filesystems that are in no array. The inventory tells for
+  every mount and every branch of a pool which array protects it, or that
+  nothing does.
+
+* Arrays page in both UIs: the health of every array, a map of arrays, pools
+  and separate mounts, and the move of a data disk with its files to another
+  array. A switcher in the sidebar chooses the array the other pages work on.
+
+* A balance and a sync of the same disks keep away from each other: the
+  balance is refused while an array of the pool is working, and the array
+  waits for a running balance.
+
+* What is saved in /etc/fstab never stops the boot: filesystems are saved by
+  UUID and with 'nofail', pools with 'nofail' through the helper of FUSE.
+
+* A policy that mergerfs doesn't know is refused before it reaches the pool.
+
+* Reports, notification subjects and hooks (SNAPRAID_ARRAY) name the array.
+
 * Tests: 'make check' also runs a selftest of the storage code and, if
-  Node.js is installed, the tests of the logic of the Storage page.
+  Node.js is installed, the tests of the logic of the Storage and Arrays
+  pages.
 
 
 Changes to existing files
 -------------------------
 
-    Makefile.am                new sources and UI files, tests in check-local
+    Makefile.am                new sources and UI files, tests in check-local,
+                               dependencies of the objects that had none
     daemon/conf.c, state.h     'net_storage_admin' option, recover command
     daemon/elem.c              name of the recover command
     daemon/rest.c              /snapraid/v1/storage endpoints
@@ -58,6 +95,28 @@ Changes to existing files
     daemon/scheduler.c/.h      schedule_recover()
     daemon/selftest.c          call of storage_selftest()
     commander/, brutale/       index.html, css/style.css, js/app.js, js/utils.js
+
+For more arrays:
+
+    daemon/state.c, state.h    the state is of one array; what is of the
+                               machine (lifecycle flags, locks, web, log,
+                               system, instance) moved to 'struct
+                               snapraid_host', reached as state->host
+    every daemon/*.c           state->X became state->host->X for those fields
+    daemon/conf.c, conf.h      'array_parallel' and 'engine_conf' options,
+                               options of the machine refused in the file of
+                               an array and copied from the default one
+    daemon/daemon.c            start, reload and stop of the other arrays
+    daemon/log.c, log.h        messages and task log of the thread of an array
+    daemon/runner.c            wait for the arbiter, one runner per array,
+                               SNAPRAID_ARRAY for the hooks
+    daemon/scheduler.c         one scheduler per array
+    daemon/rest.c              /snapraid/v1/arrays endpoints, every endpoint
+                               also under arrays/NAME, /metrics?array=NAME
+    daemon/report.c, notify.c  name of the array
+    daemon/elem.c              reason of an array not configured
+    commander/, brutale/       index.html, css/style.css, js/api.js, js/app.js,
+                               js/ui.js, js/utils.js
     doc/snapraidd.d/.1/.txt    documentation of the new option and endpoints
     snapraidd.yaml             OpenAPI description of the new endpoints
     snapraidd.conf.example     example of the new option

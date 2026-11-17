@@ -317,6 +317,32 @@ net_web_root = commander.zip
 # For security reasons, some of them can be set via the REST API only if the
 # net_config_full_access option is enabled.
 
+# More than one array can be handled by this daemon. The array of this file
+# is named "default". Every other array has a file of its own, NAME.conf, in
+# the directory named like this file with ".d" in place of ".conf": for
+# /etc/snapraidd.conf it's /etc/snapraidd.d/NAME.conf.
+#
+# The file of an array has the options of this file that are not of the
+# machine (everything but sys_*, net_*, check_updates, array_parallel and
+# notify_syslog_*), plus the mandatory one telling its SnapRAID configuration:
+#
+#   engine_conf = /etc/snapraid/NAME.conf
+#
+# Arrays are also created and removed from the Arrays page of the dashboard,
+# and with the REST API, if net_storage_admin is enabled.
+#
+# The array_parallel flag controls whether more arrays can run at the same
+# time the commands working on the whole disks: diff, sync, scrub, fix, check.
+#
+# When disabled (0), one array at a time runs them, and the others wait their
+# turn: the disks of the machine don't work, and heat, all together.
+# When enabled (1), arrays that share no physical disk run together.
+# Commands that only look at the disks, like probe, are never delayed.
+#
+# This option is accessible and modifiable via the REST API.
+# 0 = disabled (default), 1 = enabled.
+#array_parallel = 0
+
 # The check_updates flag controls whether the daemon periodically
 # queries the GitHub API (via curl) to check if new versions of SnapRAID
 # Daemon and SnapRAID engine are available.

@@ -9,7 +9,9 @@ Andrea Mazzoleni:
 
 The 'master' branch is kept identical to the original project. The 'storage'
 branch adds a Storage page to the web UI, to set up and maintain a SnapRAID
-array, with or without a mergerfs pool, from the browser. The additions are
+array, with or without a mergerfs pool, from the browser. One daemon can
+handle more arrays, each with its own parity, schedule and settings, along
+with more pools and with disks that are in no array. The additions are
 listed in the CHANGES-FORK file.
 
 Screenshots of the Storage page, and a lab to try it with emulated disks:

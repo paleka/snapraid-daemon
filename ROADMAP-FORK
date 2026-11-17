@@ -12,8 +12,6 @@ Open items
 ==========
 
 - Look at the reworked Replace dialog in a browser. Only its rules are tested.
-- Pool options: read a mergerfs option back after setting it. Some mergerfs
-  versions accept an unknown policy without reporting an error.
 - Guided step for an array left degraded by a recovery whose closing sync
   stopped on a full parity. Today the way out is to free space and then use
   Recover, "accept the disks as they are".
@@ -76,11 +74,14 @@ Features
     - Mount and eject USB disks with one click.
     - SMB and NFS mounts as sources to copy data into the array.
 
-11. Multiple arrays
-    - One daemon handling more than one snapraid.conf.
-
-12. UPS
+11. UPS
     - Pause sync and scrub on battery (NUT, apcupsd).
+
+12. More arrays, what is left
+    - Windows: built from the same sources, but not compiled nor tried.
+    - Pools saved in fstab: an explicit order after their branches for
+      systemd, on top of "nofail" and of the protected mount points.
+    - Per-array metrics in one scrape, with the array as label.
 
 
 Out of scope
