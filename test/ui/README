@@ -1,0 +1,8 @@
+Tests of the logic of the Storage page (commander/js/storage.js).
+
+They need only Node.js 18 or later, no browser and no dependencies:
+
+    node --test test/ui/
+
+What needs real disks is tested by tests/api-test.sh of the lab, inside its
+container: https://github.com/paleka/snapraid-lab

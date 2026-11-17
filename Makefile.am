@@ -464,6 +464,11 @@ endif
 
 check-local: snapraidd$(EXEEXT)
 	./snapraidd$(EXEEXT) test
+	@if command -v node >/dev/null 2>&1; then \
+		node --test $(srcdir)/test/ui/storage.test.mjs; \
+	else \
+		echo "node not found: skipping the tests of the Storage page"; \
+	fi
 
 MANUAL=./snapraidd -f -N -i manual
 
