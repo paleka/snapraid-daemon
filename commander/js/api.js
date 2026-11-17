@@ -1,11 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2025 Andrea Mazzoleni
 
+// The array the pages work on. The default one keeps the addresses it always had.
+export const ARRAY_DEFAULT = 'default';
+let currentArray = ARRAY_DEFAULT;
+try {
+    const saved = localStorage.getItem('array');
+    if (saved && /^[a-z0-9][a-z0-9_-]{0,30}$/.test(saved)) currentArray = saved;
+} catch (ignore) { /* no storage */ }
+
 async function request(endpoint, options = {}) {
     const version = options.version || 'v1';
-    const baseUrl = `/snapraid/${version}`;
+    // what is of the machine, and not of an array, has only one address
+    const global = options.global || currentArray === ARRAY_DEFAULT;
+    const baseUrl = global ? `/snapraid/${version}` : `/snapraid/v1/arrays/${currentArray}`;
     const cleanOptions = { ...options };
     delete cleanOptions.version;
+    delete cleanOptions.global;
     try {
         const response = await fetch(`${baseUrl}${endpoint}`, {
             headers: { 'Content-Type': 'application/json', 'X-Pinggy-No-Screen': 'true' },
@@ -54,7 +65,20 @@ export const API = {
         return request(`/tasks${query ? `?${query}` : ''}`);
     },
     getConfig: () => request('/config', { version: 'v2' }),
-    getSystem: () => request('/system'),
+    getSystem: () => request('/system', { global: true }),
+
+    // Arrays
+    array: () => currentArray,
+    setArray: (name) => {
+        currentArray = name || ARRAY_DEFAULT;
+        try { localStorage.setItem('array', currentArray); } catch (ignore) { /* no storage */ }
+    },
+    /** Address of the endpoints of the selected array. */
+    base: () => (currentArray === ARRAY_DEFAULT ? '/snapraid/v1' : `/snapraid/v1/arrays/${currentArray}`),
+    getArrays: () => request('/arrays', { global: true }),
+    createArray: (name, engineConf) => request('/arrays', { method: 'POST', global: true, body: JSON.stringify(engineConf ? { name, engine_conf: engineConf } : { name }) }),
+    removeArray: (name) => request(`/arrays/${name}`, { method: 'DELETE', global: true, body: '{}' }),
+    getInventory: () => request('/storage', { global: true }),
     updateConfig: (config) => request('/config', { method: 'PATCH', body: JSON.stringify(config), version: 'v2' }),
 
     schedule: (tasks) => request('/schedule', { method: 'POST', body: JSON.stringify({ tasks }) }),

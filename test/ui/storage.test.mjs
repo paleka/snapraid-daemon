@@ -455,7 +455,7 @@ test('advisor: pool policies that surprise', () => {
     // a data disk left out, and a branch that is not in the array
     const g = findings(healthy({ pools: [pool('/mnt/storage', ['/mnt/disk1', '/mnt/disk2', '/mnt/other'])] }));
     assert.ok(has(g, 'tip', /d3 not in the pool/));
-    assert.ok(has(g, 'warn', /Part of the pool is not protected.*\/mnt\/other/));
+    assert.ok(has(g, 'warn', /Part of the pool \/mnt\/storage is not protected.*\/mnt\/other/));
 });
 
 test('advisor: cloned disk, full parity, big parity on ext4, memory', () => {

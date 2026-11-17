@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2025 Andrea Mazzoleni
 
-import { API } from './api.js';
+import { API, ARRAY_DEFAULT } from './api.js';
 import { loadStorage, initStorage } from './storage.js';
+import { loadArrays, refreshArrays, renderSwitcher, initArrays } from './arrays.js';
 import { Icons, showToast, showConfirm, showConfirmDown, showConfirmDownThreshold, showModal, formatElapsedTime, formatDiskSize, formatSeconds, formatAttr } from './utils.js';
 import { renderDashboard, renderDisks, renderTasks, renderDifferences, renderRecovery, renderSettings, renderTempSparkline, renderScrubHistory, renderHealthBanner, escHtml } from './ui.js';
 
@@ -24,7 +25,9 @@ const app = {
         dashboardArray: null,
         dashboardActivity: null,
         disks: null,
-        instance: null
+        instance: null,
+        arrays: null,
+        arraysCount: 1
     },
 
     init: () => {
@@ -108,6 +111,7 @@ const app = {
         });
 
         initStorage();
+        initArrays(app.selectArray);
 
         // Navigation
         window.addEventListener('hashchange', app.handleRoute);
@@ -208,9 +212,62 @@ const app = {
         app.state.pollingInterval = null;
     },
 
+    /** Work on another array: what was loaded belongs to the previous one. */
+    selectArray: () => {
+        app.state.pulse = {};
+        app.state.dashboardArray = null;
+        app.state.dashboardActivity = null;
+        app.state.disks = null;
+        app.state.config = null;
+        app.updateSwitcher();
+        app.handleRoute();
+    },
+
+    updateSwitcher: () => {
+        const box = document.getElementById('array-switcher');
+        if (box) box.innerHTML = renderSwitcher(app.state.arrays);
+    },
+
+    /** With more arrays: the switcher, and a notice for the arrays in trouble that are not the one shown. */
+    pollArrays: async (count) => {
+        const many = count > 1;
+        if (!many && app.state.currentRoute !== '#/arrays') {
+            if (app.state.arrays) { app.state.arrays = null; app.updateSwitcher(); }
+            app.state.arraysCount = count;
+            return '';
+        }
+        const arrays = await API.getArrays();
+        const changed = app.state.arraysCount !== count;
+        app.state.arrays = arrays;
+        app.state.arraysCount = count;
+        app.updateSwitcher();
+        if (changed) app.updatePageTitle();
+        if (app.state.currentRoute === '#/arrays') await refreshArrays(arrays);
+        return arrays.arrays
+            .filter(a => a.name !== API.array() && a.configured && ['corrupt', 'degraded', 'prefail', 'failing'].includes(a.health))
+            .map(a => `
+                <div class="health-banner ${escHtml(a.health)}">
+                    <div class="health-banner-title">ARRAY ${escHtml(a.name.toUpperCase())}: ${escHtml(a.health.toUpperCase())}</div>
+                    <div class="text-sm">${escHtml(a.health_reason || '')}
+                        <button class="btn btn-secondary btn-sm" data-ar="open" data-name="${escHtml(a.name)}" data-to="#/">Open ${escHtml(a.name)}</button></div>
+                </div>`).join('');
+    },
+
     pollState: async () => {
         try {
-            const state = await API.getState();
+            let state;
+            try {
+                state = await API.getState();
+            } catch (e) {
+                // the array shown was removed, here or by somebody else: go back to the one that always exists
+                if (API.array() !== ARRAY_DEFAULT && /no array/i.test(e.message)) {
+                    API.setArray(ARRAY_DEFAULT);
+                    app.selectArray();
+                    return;
+                }
+                throw e;
+            }
+            const otherAlerts = await app.pollArrays(state.arrays_count || 1).catch(() => '');
             if (state.instance && app.state.instance !== state.instance) {
                 app.state.instance = state.instance;
                 app.updatePageTitle();
@@ -320,7 +377,7 @@ const app = {
             // Global Health Banner
             const globalAlerts = document.getElementById('global-alerts');
             if (globalAlerts && state) {
-                globalAlerts.innerHTML = renderHealthBanner(state);
+                globalAlerts.innerHTML = renderHealthBanner(state) + otherAlerts;
             }
 
             app.state.pulse = pulse;
@@ -328,6 +385,16 @@ const app = {
             console.error("Pulse check failed", e);
             app.setConnection(false);
         }
+    },
+
+    /** Something changed in the arrays page: show it in the switcher without waiting for the next poll. */
+    updateSwitcherNow: async () => {
+        try {
+            app.state.arrays = await API.getArrays();
+            app.state.arraysCount = app.state.arrays.arrays.length;
+            if (app.state.arraysCount < 2) app.state.arrays = app.state.currentRoute === '#/arrays' ? app.state.arrays : null;
+            app.updateSwitcher();
+        } catch (ignore) { /* the next poll tries again */ }
     },
 
     setConnection: (isConnected) => {
@@ -356,6 +423,7 @@ const app = {
             case '#/diff': return 'Differences';
             case '#/recovery': return 'Recovery';
             case '#/storage': return 'Storage';
+            case '#/arrays': return 'Arrays';
             case '#/settings': return 'Settings';
             default: return 'Page Not Found';
         }
@@ -365,7 +433,10 @@ const app = {
         const route = app.state.currentRoute || '#/';
         const title = baseTitle || app.getRouteTitle(route);
         const titleEl = document.getElementById('page-title');
-        if (titleEl) {
+        if (titleEl && app.state.arraysCount > 1 && route !== '#/arrays') {
+            // with more arrays every page says which one it's about
+            titleEl.innerText = `${API.array()} · ${title}`;
+        } else if (titleEl) {
             if (app.state.instance) {
                 const capInstance = app.state.instance.charAt(0).toUpperCase() + app.state.instance.slice(1);
                 titleEl.innerText = `${capInstance} ${title}`;
@@ -453,6 +524,12 @@ const app = {
                     } catch (e) {
                         throw e;
                     }
+                    break;
+                case '#/arrays':
+                    app.updatePageTitle('Arrays');
+                    actions.innerHTML = '';
+                    await loadArrays(view, app.updateSwitcherNow);
+                    app.setConnection(true);
                     break;
                 case '#/settings':
                     app.updatePageTitle('Settings');
@@ -852,7 +929,7 @@ const app = {
             }
 
             // Handle unchecked booleans (FormData doesn't include them)
-            ['sync_prehash', 'sync_prevent_truncations', 'touch_zero_subseconds', 'notify_syslog_enabled', 'notify_differences', 'check_updates'].forEach(key => {
+            ['sync_prehash', 'sync_prevent_truncations', 'touch_zero_subseconds', 'notify_syslog_enabled', 'notify_differences', 'check_updates', 'array_parallel'].forEach(key => {
                 if (!fullAccess && protectedFields.includes(key)) return;
                 const el = form.querySelector(`[name="${key}"]`);
                 if (el) updates[key] = el.checked;

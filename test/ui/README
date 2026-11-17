@@ -1,8 +1,9 @@
-Tests of the logic of the Storage page (commander/js/storage.js).
+Tests of the logic of the Storage page (commander/js/storage.js) and of more
+arrays in the same daemon (commander/js/arrays.js).
 
 They need only Node.js 18 or later, no browser and no dependencies:
 
-    node --test test/ui/storage.test.mjs
+    node --test test/ui/storage.test.mjs test/ui/arrays.test.mjs
 
-What needs real disks is tested by tests/api-test.sh of the lab, inside its
+What needs real disks is tested by tests/api-test.sh and tests/multi-array-test.sh of the lab, inside its
 container: https://github.com/paleka/snapraid-lab

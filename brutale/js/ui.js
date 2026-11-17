@@ -1079,6 +1079,10 @@ export const renderSettings = (config) => {
 
     const logLevels = ['critical', 'error', 'warning', 'info'];
 
+    // some options are of the machine: they are set in the array of the main configuration, for every array
+    const isMain = !config.array || config.array === 'default';
+    const machineNote = isMain ? '' : ' Set for the whole machine in the settings of the default array.';
+
     return `
         ${!fullAccess ? `
         <div class="restricted-banner">
@@ -1112,7 +1116,8 @@ export const renderSettings = (config) => {
             <!-- Monitor -->
             <div class="card">
                 <h3>Monitor</h3>
-                ${boolField('check_updates', 'Check for Updates', 'Periodically checks for a new version of the daemon and engine.')}
+                ${isMain ? boolField('array_parallel', 'Run Arrays Together', 'With more than one array: lets arrays that share no disk sync and scrub at the same time. When off, one array works at a time and the others wait their turn.') : ''}
+                ${boolField('check_updates', 'Check for Updates', 'Periodically checks for a new version of the daemon and engine.' + machineNote, !isMain)}
                 ${inputField('probe_interval_minutes', 'Probe Interval (mins)', 'text', 'Determines how often the daemon collects health data from disks that are currently spinning. Set to 0 to disable.', false, 'inputmode="numeric"')}
                 ${inputField('spindown_idle_minutes', 'Data & Parity Spindown Timeout (mins)', 'text', 'Puts these disks into standby after inactivity. Enter one value for both, or two comma-separated values for data and parity (e.g., 15, 30). Set to 0 to disable.')}
             </div>
@@ -1125,8 +1130,8 @@ export const renderSettings = (config) => {
               
                 <h4 class="font-bold mb-3 mt-1">Syslog</h4>
                 <div class="form-row">
-                     ${boolField('notify_syslog_enabled', 'Enable Syslog', 'Sends daemon activity and task status messages to the operating system\'s standard system log')}
-                     ${selectField('notify_syslog_level', 'Log Level', logLevels, 'The minimum task severity required to trigger a system log entry.')}
+                     ${boolField('notify_syslog_enabled', 'Enable Syslog', 'Sends daemon activity and task status messages to the operating system\'s standard system log.' + machineNote, !isMain)}
+                     ${selectField('notify_syslog_level', 'Log Level', logLevels, 'The minimum task severity required to trigger a system log entry.', !isMain)}
                 </div>
 
                 <h4 class="font-bold mb-3">Heartbeat</h4>

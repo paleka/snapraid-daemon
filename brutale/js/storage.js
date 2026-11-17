@@ -60,7 +60,7 @@ export const serializeConf = (entries) => entries.map(e => {
 }).join('\n') + '\n';
 
 /** Insert an entry after the last one of the same type, to keep the file tidy. */
-const confInsert = (entries, entry) => {
+export const confInsert = (entries, entry) => {
     let at = -1;
     entries.forEach((e, i) => { if (e.type === entry.type) at = i; });
     if (at < 0) {
@@ -73,9 +73,9 @@ const confInsert = (entries, entry) => {
 
 const confOption = (entries, key) => entries.find(e => e.type === 'option' && e.key === key);
 
-const stripSlash = (p) => (p.length > 1 ? p.replace(/\/+$/, '') : p);
+export const stripSlash = (p) => (p.length > 1 ? p.replace(/\/+$/, '') : p);
 const dirname = (p) => { const s = stripSlash(p); const i = s.lastIndexOf('/'); return i <= 0 ? '/' : s.slice(0, i); };
-const isUnder = (path, dir) => { const p = stripSlash(path), d = stripSlash(dir); return p === d || d === '/' || p.startsWith(d + '/'); };
+export const isUnder = (path, dir) => { const p = stripSlash(path), d = stripSlash(dir); return p === d || d === '/' || p.startsWith(d + '/'); };
 
 /* ------------------------------------------------------------------ */
 /* inventory model                                                     */
@@ -116,7 +116,10 @@ export const buildModel = (inv) => {
 
     const systemSources = new Set(mounts.filter(m => SYSTEM_TARGETS.includes(m.target) && m.source.startsWith('/dev/')).map(m => m.source));
     const blkid = new Map((inv.blkid || []).map(b => [b.device, b]));
-    const pools = inv.pools || [];
+    // the pools showing disks of this array come first
+    const ownPaths = new Set(dataEntries.map(e => stripSlash(e.path)));
+    const isOwnPool = (p) => p.branches.some(b => ownPaths.has(stripSlash(b.path)));
+    const pools = [...(inv.pools || [])].sort((a, b) => Number(isOwnPool(b)) - Number(isOwnPool(a)));
     const poolTargets = new Set(pools.map(p => p.mountpoint));
     const branchSet = new Set(pools.flatMap(p => p.branches.map(b => stripSlash(b.path))));
 
@@ -136,7 +139,10 @@ export const buildModel = (inv) => {
         const id = blkid.get(path) || {};
         const fstype = node.fstype || id.fstype || '';
         const mount = mounts.find(m => m.source === path) || null;
+        // a filesystem used by another array of this machine is not free to take
+        const owner = mount && mount.array && mount.array !== (inv.array || 'default') ? mount.array : '';
         return {
+            owner,
             path,
             size: Number(node.size) || 0,
             fstype,
@@ -166,8 +172,10 @@ export const buildModel = (inv) => {
             const filesystems = (below.length ? nodes : [self]).filter(n => n.fstype && !MEMBER_TYPES.includes(n.fstype));
             const all = [self, ...nodes];
             let state;
+            const owner = (all.find(n => n.owner) || {}).owner || '';
             if (all.some(n => n.system)) state = 'system';
             else if (all.some(n => n.roles.length)) state = 'array';
+            else if (owner) state = 'foreign';
             else if (!below.length && !self.fstype && !self.pttype) state = 'blank';
             else if (!filesystems.length) state = layered || all.some(n => MEMBER_TYPES.includes(n.fstype)) ? 'other' : 'unformatted';
             else if (filesystems.some(f => f.mount)) state = 'mounted';
@@ -176,7 +184,7 @@ export const buildModel = (inv) => {
                 path: self.path, name: d.name, size: self.size,
                 model: (d.model || '').trim(), serial: (d.serial || '').trim(),
                 rotational: truthy(d.rota), transport: d.tran || (d.type === 'loop' ? 'loop' : ''),
-                removable: truthy(d.rm), parts, filesystems, state, layered
+                removable: truthy(d.rm), parts, filesystems, state, layered, owner
             };
         });
 
@@ -193,7 +201,15 @@ export const buildModel = (inv) => {
         };
     };
 
+    // the pool of this array is the one showing its data disks; the others belong to other disks
+    const dataPaths = new Set(dataEntries.map(e => stripSlash(e.path)));
+    const pool = pools.find(p => p.branches.some(b => dataPaths.has(stripSlash(b.path)))) || null;
+    const arrayName = inv.array || 'default';
+    let poolDefault = arrayName === 'default' ? '/mnt/storage' : `/mnt/storage-${arrayName}`;
+    for (let i = 2; poolTargets.has(poolDefault); ++i) poolDefault = `${arrayName === 'default' ? '/mnt/storage' : `/mnt/storage-${arrayName}`}${i}`;
+
     return {
+        pool, poolDefault, array: arrayName,
         inv, conf, disks, mounts, pools, mountOf, describe, branchSet, poolTargets,
         data: dataEntries.map(e => ({ ...e, ...describe(e.path), removing: e.path.startsWith(REMOVED_BASE + '/') })),
         parity: parityEntries.map(e => {
@@ -211,14 +227,14 @@ export const buildModel = (inv) => {
     };
 };
 
-const REMOVED_BASE = '/mnt/snapraid-removed';
+export const REMOVED_BASE = '/mnt/snapraid-removed';
 
 /* ------------------------------------------------------------------ */
 /* API                                                                 */
 /* ------------------------------------------------------------------ */
 
 const call = async (endpoint, method, body) => {
-    const response = await fetch(`/snapraid/v1/storage${endpoint}`, {
+    const response = await fetch(`${API.base()}/storage${endpoint}`, {
         method,
         headers: { 'Content-Type': 'application/json' },
         body: body ? JSON.stringify(body) : undefined
@@ -333,7 +349,7 @@ const getOption = (options, key) => {
 };
 
 /** A dialog with our own buttons, on top of the modal styles of the app. */
-const dialog = ({ title, body, large = true, buttons }) => {
+export const dialog = ({ title, body, large = true, buttons }) => {
     const overlay = document.createElement('div');
     overlay.className = 'modal-overlay';
     overlay.innerHTML = `
@@ -484,19 +500,22 @@ const renderPoolCard = (m) => {
             <tr>
                 <td class="font-mono text-xs">${escHtml(b.path)}</td>
                 <td>${badge(b.mode || 'RW', b.mode === 'RO' ? 'grey' : 'green')}
-                    ${dataPaths.has(stripSlash(b.path)) ? badge('protected', 'blue') : badge('not in array', 'orange')}</td>
+                    ${(pr => badge(pr.text, pr.color))(branchProtection(b, m.inv.array || 'default', dataPaths))}</td>
                 <td class="st-usage-cell">${usageBar(b.total_bytes, b.free_bytes)}</td>
                 <td class="text-right"><button class="btn btn-secondary btn-sm" data-st="pool-branch-remove" data-pool="${idx}" data-path="${escAttr(b.path)}"
                     data-tooltip="Stop showing this disk in the pool. Its files stay on the disk." ${p.branches.length > 1 ? '' : 'disabled'}>Remove</button></td>
             </tr>`).join('');
         const fills = p.branches.filter(b => b.total_bytes).map(b => (b.total_bytes - b.free_bytes) * 100 / b.total_bytes);
         const spread = fills.length ? Math.round(Math.max(...fills) - Math.min(...fills)) : 0;
-        const candidates = m.data.filter(d => d.ok && !d.removing && !p.branches.some(b => stripSlash(b.path) === stripSlash(d.path)));
+        // the disks of this array are proposed for its own pool, not for the one of another array
+        const own = p.branches.some(b => dataPaths.has(stripSlash(b.path)));
+        const others = [...new Set(p.branches.filter(b => b.protected && b.array && b.array !== m.array).map(b => b.array))];
+        const candidates = own || !others.length ? m.data.filter(d => d.ok && !d.removing && !p.branches.some(b => stripSlash(b.path) === stripSlash(d.path))) : [];
 
         return `
             <div class="card">
                 <div class="flex justify-between items-center flex-wrap gap-2 mb-2">
-                    <h3>mergerfs pool <span class="font-mono">${escHtml(p.mountpoint)}</span></h3>
+                    <h3>mergerfs pool <span class="font-mono">${escHtml(p.mountpoint)}</span>${own || !others.length ? '' : ` <span class="text-xs text-muted">of the array ${escHtml(others.join(', '))}</span>`}</h3>
                     <div>${p.persistent ? badge('mounted at boot', 'green') : badge('not saved in fstab', 'orange')}
                         ${p.version ? badge(`mergerfs ${p.version}`, 'grey') : ''}</div>
                 </div>
@@ -532,14 +551,42 @@ const renderPoolCard = (m) => {
     }).join('');
 };
 
+/** With more pools: one more can be made, and the tools work on the chosen one. */
+const renderPoolMore = (m) => {
+    if (!m.pools.length) return '';
+    const idx = Math.min(state.pool || 0, m.pools.length - 1);
+    const tools = m.inv.tools || {};
+    return `
+        <div class="card">
+            <div class="flex justify-between items-center flex-wrap gap-2">
+                <div class="text-sm">${m.pools.length > 1 ? `Balance, duplicates and file browser work on:
+                    ${m.pools.map((p, i) => `<button class="btn btn-sm ${i === idx ? 'btn-primary' : 'btn-secondary'}" data-st="pool-select" data-pool="${i}">${escHtml(p.mountpoint)}</button>`).join(' ')}`
+                    : 'A machine can have more pools: one for each array, or one for disks that need no parity.'}</div>
+                ${tools.mergerfs ? `<button class="btn btn-secondary btn-sm" data-st="pool-create" data-tooltip="Another folder joining a different set of disks">Create another pool</button>` : ''}
+            </div>
+        </div>
+        ${renderToolsCard(m, m.pools[idx], idx)}`;
+};
+
 const STATE_BADGE = {
     system: ['system', 'grey'], array: ['in array', 'green'], other: ['part of RAID, LVM or encryption', 'grey'],
-    blank: ['blank', 'blue'], unformatted: ['no filesystem', 'blue'], mounted: ['mounted, unused', 'yellow'], unmounted: ['not mounted', 'yellow']
+    blank: ['blank', 'blue'], unformatted: ['no filesystem', 'blue'], mounted: ['mounted, unused', 'yellow'], unmounted: ['not mounted', 'yellow'],
+    foreign: ['in another array', 'purple']
+};
+
+/** How a branch of a pool is protected, as told by the daemon that knows every array. */
+export const branchProtection = (b, array, dataPaths) => {
+    // a daemon handling one array only doesn't tell: the branch is protected if it's a data disk
+    if (b.protected === undefined) return dataPaths.has(stripSlash(b.path)) ? { text: 'protected', color: 'blue', ok: true, mine: true } : { text: 'not in array', color: 'orange', ok: false, mine: false };
+    if (b.protected && b.array === array) return { text: 'protected', color: 'blue', ok: true, mine: true };
+    if (b.protected) return { text: `protected by ${b.array}`, color: 'purple', ok: true, mine: false };
+    if (b.role === 'parity') return { text: `parity of ${b.array}`, color: 'red', ok: false, mine: b.array === array };
+    return { text: 'not protected', color: 'orange', ok: false, mine: false };
 };
 
 const renderDisksCard = (m) => {
     const rows = m.disks.map(d => {
-        const [text, color] = STATE_BADGE[d.state];
+        const [text, color] = d.state === 'foreign' ? [`in array ${d.owner}`, 'purple'] : STATE_BADGE[d.state];
         const fs = d.filesystems.map(f => `
             <div class="text-xs"><span class="font-mono">${escHtml(f.path)}</span> ${escHtml(f.fstype)}${f.label ? ` “${escHtml(f.label)}”` : ''}
                 ${f.mount ? `→ <span class="font-mono">${escHtml(f.mount.target)}</span>` : ''}
@@ -632,7 +679,11 @@ const renderConfCard = (m) => {
 
 /** What the diagram draws, taken from the current state. */
 const layoutOf = (m) => ({
-    pools: m.pools.map(p => ({ mountpoint: p.mountpoint, policy: p.options['category.create'] || '', total: p.total_bytes, free: p.free_bytes, branches: p.branches.map(b => stripSlash(b.path)) })),
+    // only the pools showing disks of this array: the others are in the Arrays page
+    pools: m.pools.filter(p => p.branches.some(b => m.data.some(d => stripSlash(d.path) === stripSlash(b.path)))).map(p => ({
+        mountpoint: p.mountpoint, policy: p.options['category.create'] || '', total: p.total_bytes, free: p.free_bytes, branches: p.branches.map(b => stripSlash(b.path)),
+        owners: Object.fromEntries(p.branches.filter(b => b.protected && b.array && b.array !== m.array).map(b => [stripSlash(b.path), b.array]))
+    })),
     data: m.data.map(d => ({ name: d.name, path: stripSlash(d.path), total: d.total, free: d.free, missing: !d.ok, removing: d.removing, health: state.health[d.name] })),
     parity: m.parity.flatMap(p => p.files.map((f, i) => ({ name: p.files.length > 1 ? `${p.key} ${i + 1}/${p.files.length}` : p.key, level: p.key, total: f.total, free: f.free, missing: !f.ok, health: state.health[p.key] }))),
     spare: m.disks.filter(d => ['blank', 'unformatted', 'mounted', 'unmounted'].includes(d.state)).map(d => ({ name: d.path.replace('/dev/', ''), total: d.size, state: d.state }))
@@ -641,7 +692,7 @@ const layoutOf = (m) => ({
 const diskTile = (role, d) => {
     const pct = d.total && d.free != null ? Math.min(100, Math.round((d.total - d.free) * 100 / d.total)) : 0;
     const bad = d.missing || (d.health && !['passed', 'pending'].includes(d.health));
-    const note = d.missing ? 'not mounted' : d.removing ? 'being removed' : d.isNew ? 'new' : role === 'spare'
+    const note = d.owner ? `in ${d.owner}` : d.missing ? 'not mounted' : d.removing ? 'being removed' : d.isNew ? 'new' : role === 'spare'
         ? ({ blank: 'blank', unformatted: 'blank', mounted: 'unused', unmounted: 'unused' }[d.state])
         : (d.free != null ? `${pct}% full` : '');
     return `
@@ -675,9 +726,10 @@ const renderDiagram = (l) => {
                 </div>
                 <div class="tp-tiles tp-stems">
                     ${members.map(d => diskTile('data', d)).join('')}
-                    ${foreign.map(b => diskTile('foreign', { name: b.split('/').pop(), path: b, total: null, free: null })).join('')}
+                    ${foreign.map(b => diskTile('foreign', { name: b.split('/').pop(), path: b, total: null, free: null, owner: (pool.owners || {})[b] })).join('')}
                 </div>
-                <div class="tp-caption">Data disks${foreign.length ? ' · dashed ones are in the pool but not protected' : ''}</div>
+                <div class="tp-caption">Data disks${foreign.some(b => !(pool.owners || {})[b]) ? ' · dashed ones are in the pool but not protected'
+                    : foreign.length ? ' · dashed ones are protected by another array' : ''}</div>
             </div>`);
     });
 
@@ -864,17 +916,33 @@ const advise = (m) => {
 
     m.pools.forEach(p => {
         if (!p.persistent) add('warn', `The pool ${p.mountpoint} is not saved`, 'It works now but disappears at the next reboot. Press Apply in the Pool tab to save it.', { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
-        const foreign = p.branches.filter(b => !m.data.some(d => stripSlash(d.path) === stripSlash(b.path)));
-        if (foreign.length) add('warn', 'Part of the pool is not protected', `${foreign.map(b => b.path).join(', ')} ${foreign.length === 1 ? 'is' : 'are'} in the pool but not in the array: files landing there have no parity.`, { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
+        const dataPaths = new Set(m.data.map(d => stripSlash(d.path)));
+        const prot = p.branches.map(b => branchProtection(b, m.inv.array || 'default', dataPaths));
+        const mine = prot.some(pr => pr.mine);
+        // a pool made only of disks of other arrays is their business
+        if (!mine && prot.some(pr => pr.ok)) return;
+        // a pool of disks that are in no array is a choice: it's recalled once, where the machine is set up
+        if (!mine && m.data.length) {
+            if (m.array === 'default') add('tip', `The pool ${p.mountpoint} has no parity`, 'None of its disks is in an array: a disk that fails takes its files with it. Fine for what can be downloaded or made again.', { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
+            return;
+        }
+        const foreign = p.branches.filter((b, i) => !prot[i].ok);
+        if (foreign.length) add('warn', `Part of the pool ${p.mountpoint} is not protected`, `${foreign.map(b => b.path).join(', ')} ${foreign.length === 1 ? 'is' : 'are'} in the pool but in no array: files landing there have no parity.`, { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
+        const others = [...new Set(p.branches.filter((b, i) => prot[i].ok && !prot[i].mine).map(b => b.array))];
+        if (mine && others.length) add('tip', `The pool ${p.mountpoint} spans more arrays`, `Some of its disks are protected by ${others.join(', ')}. It works, but a file can land on a disk of either array: each array protects only what is on its own disks, and syncs on its own schedule.`, { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
         const outside = live.filter(d => d.ok && !p.branches.some(b => stripSlash(b.path) === stripSlash(d.path)));
         if (outside.length && m.pools.length === 1) add('tip', `${outside.map(d => d.name).join(', ')} not in the pool`, 'Protected by the array, but its space does not show up in the pool folder.', { label: 'Open the pool', st: 'tab', data: { tab: 'pool' } });
         const fills = p.branches.filter(b => b.total_bytes).map(b => (b.total_bytes - b.free_bytes) * 100 / b.total_bytes);
         if (fills.length > 1 && Math.max(...fills) - Math.min(...fills) >= 40)
             add('tip', 'The disks are unevenly filled', 'Normal after adding an empty disk. With the “mfs” policy new files go to the emptiest disk and the levels even out over time.');
     });
-    if (!m.pools.length && live.length > 1)
+    if (!m.pool && live.length > 1)
         add('tip', 'No pool', tools.mergerfs ? 'Each data disk is a separate folder. A mergerfs pool shows them as one, without moving any file.' : 'Each data disk is a separate folder. Install the mergerfs package to join them in one.',
             tools.mergerfs ? { label: 'Create a pool', st: 'pool-create' } : null);
+
+    // with every copy of the content on the data disks, the list of what the array holds is lost with them
+    if (m.content.length && m.content.every(c => m.data.some(d => isUnder(c, d.path))))
+        add('tip', 'Every content file is on a data disk', 'SnapRAID needs its content file to rebuild a disk. Keep one more copy outside of the data disks of this array, for example on the system disk.', { label: 'Edit configuration', st: 'tab', data: { tab: 'config' } });
 
     live.filter(d => d.ok && d.total && d.free / d.total < 0.05).forEach(d => add('warn', `${d.name} is almost full`, `${size(d.free)} left. ${m.pools.length ? 'The pool sends new files to the other disks, but files growing in place can still fail.' : 'Move something to another disk or add one.'}`));
 
@@ -926,7 +994,7 @@ const renderOverview = (m) => {
             ${stat('Usable space', size(usable), `${size(usable - used)} free`)}
             ${stat('Protection', k ? `${plural(k, 'disk', 'disks')}` : 'none', k ? 'can fail without losing data' : 'no parity configured')}
             ${stat('Disks', `${m.data.length} + ${k}`, `data + parity${parityBytes && usable ? ` · ${Math.round(parityBytes * 100 / (parityBytes + usable))}% of the space is parity` : ''}`)}
-            ${stat('Pool', m.pools.length ? escHtml(m.pools[0].mountpoint) : 'none', m.pools.length ? 'one folder for all the data' : 'each disk is its own folder')}
+            ${stat('Pool', m.pool ? escHtml(m.pool.mountpoint) : 'none', m.pool ? 'one folder for all the data' : 'each disk is its own folder')}
         </div>`}
         <div class="card">
             <div class="flex justify-between items-center flex-wrap gap-2 mb-2">
@@ -962,7 +1030,7 @@ const render = () => {
             </div>
             ${state.tab === 'overview' ? renderOverview(m) : ''}
             ${state.tab === 'array' ? renderArrayCard(m) + renderDisksCard(m) : ''}
-            ${state.tab === 'pool' ? renderPoolCard(m) + (m.pools.length ? renderToolsCard(m, m.pools[0], 0) : '') : ''}
+            ${state.tab === 'pool' ? renderPoolCard(m) + renderPoolMore(m) : ''}
             ${state.tab === 'config' ? renderConfCard(m) : ''}
         </div>`;
     applyWidths(state.view);
@@ -1047,7 +1115,7 @@ const runSteps = async (dlg, steps, doneText) => {
     return true;
 };
 
-const stepList = (steps) => `
+export const stepList = (steps) => `
     <ol class="st-steps">
         ${steps.map(s => `
             <li class="st-step ${s.danger ? 'st-step-danger' : ''}">
@@ -1192,7 +1260,9 @@ const buildPlan = (m, w) => {
     const contents = conf.filter(e => e.type === 'content');
     if (!contents.length) {
         const confPath = m.inv.engine_conf.path;
-        confInsert(conf, { type: 'content', path: confPath === '/etc/snapraid.conf' ? '/var/snapraid.content' : `${dirname(confPath)}/snapraid.content` });
+        // every array needs content files of its own: the one next to the configuration takes its name
+        const confBase = confPath.slice(confPath.lastIndexOf('/') + 1).replace(/\.conf$/, '') || 'snapraid';
+        confInsert(conf, { type: 'content', path: confPath === '/etc/snapraid.conf' ? '/var/snapraid.content' : `${dirname(confPath)}/${confBase}.content` });
     }
     dataAll.forEach(d => {
         const have = conf.filter(e => e.type === 'content');
@@ -1236,6 +1306,10 @@ const buildPlan = (m, w) => {
         if (dirs.some(d => isUnder(mp, d) || isUnder(d, mp)))
             errors.push(`The pool folder ${mp} overlaps a disk folder. Keep it apart, for example /mnt/storage with disks in /mnt/disk1, /mnt/disk2…`);
         const existing = m.pools.find(p => p.mountpoint === mp);
+        if (existing && existing !== m.pool && m.pool !== null)
+            errors.push(`${mp} is another pool, not the one of this array (${m.pool.mountpoint}).`);
+        else if (existing && existing !== m.pool && existing.branches.some(b => b.array && b.array !== m.array))
+            errors.push(`${mp} is the pool of the array ${existing.branches.find(b => b.array && b.array !== m.array).array}. Choose another folder for the pool of this array.`);
         const branches = existing ? existing.branches.map(b => stripSlash(b.path)) : m.data.filter(d => !d.removing).map(d => stripSlash(d.path));
         newData.forEach(d => { if (!branches.includes(d.path)) branches.push(d.path); });
         const options = existing?.fstab_options
@@ -1312,9 +1386,9 @@ const openWizard = () => {
     const w = {
         cands, roles: {}, step: 0,
         fstype: fsChoices(tools)[0] || '', base: '/mnt',
-        pool: !!tools.mergerfs, poolPath: m.pools[0]?.mountpoint || '/mnt/storage',
-        policy: m.pools[0]?.options['category.create'] || 'pfrd',
-        minfree: m.pools[0]?.options.minfreespace ? shortSize(m.pools[0].options.minfreespace) : '',
+        pool: !!tools.mergerfs, poolPath: m.pool?.mountpoint || m.poolDefault,
+        policy: m.pool?.options['category.create'] || 'pfrd',
+        minfree: m.pool?.options.minfreespace ? shortSize(m.pool.options.minfreespace) : '',
         excludes: true, sync: true
     };
     const bySize = [...cands].sort((a, b) => b.size - a.size);
@@ -1637,24 +1711,40 @@ const poolUpdate = async (idx, change, okText, ask) => {
 const poolCreate = () => {
     if (!adminGuard()) return;
     const m = state.model;
-    const branches = m.data.filter(d => d.ok && !d.removing).map(d => stripSlash(d.path));
+    const taken = new Set(m.pools.flatMap(p => p.branches.map(b => stripSlash(b.path))));
+    // the data disks of this array, and the filesystems that are of no array
+    const choices = [
+        ...m.data.filter(d => d.ok && !d.removing).map(d => ({ path: stripSlash(d.path), label: `${d.name}, data disk of this array`, prot: true })),
+        ...m.disks.filter(d => d.state === 'mounted').flatMap(d => d.filesystems.filter(f => f.mount && !f.roles.length && !f.owner))
+            .map(f => ({ path: stripSlash(f.mount.target), label: `${f.path}, in no array`, prot: false }))
+    ];
+    // what is not yet in a pool is proposed, unless it's without parity
+    const anyFree = choices.some(c => c.prot && !taken.has(c.path));
+    const rows = choices.map((c, i) => `
+        <label class="st-check"><input type="checkbox" data-branch="${i}" ${c.prot && (!anyFree || !taken.has(c.path)) ? 'checked' : ''}>
+            <span class="font-mono">${escHtml(c.path)}</span> <span class="text-muted text-xs">${escHtml(c.label)}${taken.has(c.path) ? ' · already in a pool' : ''}</span>
+            ${c.prot ? '' : badge('not protected', 'orange')}</label>`).join('');
     dialog({
         title: 'Create a mergerfs pool',
         body: `
-            <p class="text-sm text-muted mb-4">Joins the ${branches.length} data disks in one folder. Nothing is moved or changed on the disks.</p>
+            <p class="text-sm text-muted mb-4">Joins the chosen disks in one folder. Nothing is moved or changed on the disks.</p>
             <div class="form-row">
-                <div class="form-group"><label for="c-path">Pool folder</label><input class="form-control font-mono" id="c-path" value="/mnt/storage"></div>
+                <div class="form-group"><label for="c-path">Pool folder</label><input class="form-control font-mono" id="c-path" value="${escAttr(m.poolDefault)}"></div>
                 <div class="form-group"><label for="c-minfree">Keep free on each disk</label><input class="form-control" id="c-minfree" value="4G"></div>
             </div>
             <div class="form-group"><label for="c-policy">Where new files go</label>
                 <select class="form-control" id="c-policy">${POLICIES.map(([k, d]) => `<option value="${k}">${k} — ${escHtml(d)}</option>`).join('')}</select></div>
-            <p class="text-xs text-muted mt-2">Parity disks are never added: a pool that includes one fills it with data.</p>
-            <div class="text-xs text-muted font-mono">${escHtml(branches.join(':'))}</div>`,
+            <div class="form-group"><label>Disks in the pool</label>${rows || '<div class="text-sm text-muted">No disk to join: set up the array first, or mount a disk.</div>'}</div>
+            <p class="text-xs text-muted mt-2">Parity disks are never added: a pool that includes one fills it with data.
+                Files written on a disk that is in no array have no parity: fine for what can be downloaded or made again, not for what must not be lost.</p>`,
         buttons: [
             { label: 'Cancel', onClick: (dl) => dl.close() },
             {
                 label: 'Create', cls: 'btn-primary', onClick: async (dl) => {
                     const q = (id) => dl.body.querySelector(id).value.trim();
+                    const branches = [...dl.body.querySelectorAll('[data-branch]')].filter(el => el.checked).map(el => choices[Number(el.dataset.branch)].path);
+                    if (!branches.length) { showToast('Choose at least one disk', 'warning'); return; }
+                    if (m.poolTargets.has(stripSlash(q('#c-path')))) { showToast(`${q('#c-path')} is already a pool: change it from its card, or choose another folder`, 'warning'); return; }
                     if (parseSize(q('#c-minfree')) == null) { showToast('The space to keep free must be a size like 20G or 500M', 'warning'); return; }
                     try {
                         await StorageAPI.pool(q('#c-path'), branches, defaultPoolOptions(q('#c-policy'), q('#c-minfree')));
@@ -2092,7 +2182,8 @@ const removeDisk = (name) => {
     const m = state.model;
     const d = m.data.find(x => x.name === name);
     if (!d) return;
-    const placeholder = `${REMOVED_BASE}/${name}`;
+    // two arrays can have a disk with the same name: each one gets its own stand-in folder
+    const placeholder = m.array === 'default' ? `${REMOVED_BASE}/${name}` : `${REMOVED_BASE}/${m.array}-${name}`;
     const pool = m.pools.find(p => p.branches.some(b => stripSlash(b.path) === stripSlash(d.path)));
     const contentOnIt = m.content.filter(c => isUnder(c, d.path));
     const used = d.ok ? d.total - d.free : 0;
@@ -2271,6 +2362,7 @@ export const initStorage = () => {
             case 'remove': removeDisk(ds.name); break;
             case 'remove-finish': removeFinish(ds.name); break;
             case 'pool-create': poolCreate(); break;
+            case 'pool-select': state.pool = Number(ds.pool); state.browse = null; render(); break;
             case 'tab': state.tab = ds.tab; render(); window.scrollTo(0, 0); document.getElementById('view-container')?.scrollTo?.(0, 0); break;
             case 'pool-apply':
                 poolUpdate(Number(ds.pool), b => b, 'Pool updated', (p) => ({
@@ -2321,5 +2413,5 @@ export const initStorage = () => {
 export const __test = {
     parseConf, serializeConf, buildModel, buildPlan, candidates, advise, layoutOf, balanceNeed,
     parseSize, shortSize, setOption, getOption, recommendedParity, defaultPoolOptions, state,
-    MAX_DATA, MAX_SPLIT, EXT4_FILE_MAX, replaceCheck, lastSyncOf
+    MAX_DATA, MAX_SPLIT, EXT4_FILE_MAX, replaceCheck, lastSyncOf, branchProtection
 };
