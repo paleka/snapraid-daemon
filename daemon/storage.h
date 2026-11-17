@@ -99,3 +99,4 @@ int storage_mkdir(const char* path, char* msg, size_t msg_size);
 int storage_selftest(void);
 
 #endif
+
