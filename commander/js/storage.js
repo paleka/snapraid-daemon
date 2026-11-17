@@ -266,7 +266,7 @@ const StorageAPI = {
 /* small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-const state = { model: null, health: {}, view: null, tab: 'overview', array: {}, changed: [], system: null, browse: null, watching: false };
+const state = { model: null, health: {}, known: {}, lastSync: null, view: null, tab: 'overview', array: {}, changed: [], system: null, browse: null, watching: false };
 
 const size = (bytes) => (bytes == null ? '–' : formatDiskSize(bytes));
 const badge = (text, color) => `<span class="badge badge-${color}">${escHtml(text)}</span>`;
@@ -718,6 +718,18 @@ const renderDiagram = (l) => {
 /* ------------------------------------------------------------------ */
 
 /**
+ * What the most recent sync says about the parity space: the files SnapRAID
+ * could not fit ("outofparity") when a data disk outgrew the parity.
+ */
+const lastSyncOf = (tasks) => {
+    const sync = (tasks?.history || []).find(t => t.command === 'sync' && t.status === 'terminated');
+    if (!sync || !sync.exit_code) return { outOfParity: [] };
+    const texts = (sync.messages || []).map(x => x.text || '');
+    const full = texts.some(t => /Insufficient parity space|Failed to allocate all the required parity space/.test(t));
+    return { outOfParity: full ? texts.filter(t => t.startsWith('outofparity ')).map(t => t.slice(12)) : [], parityFull: full };
+};
+
+/**
  * Look at the whole setup like an experienced admin would, and say in plain
  * words what deserves attention, most serious first.
  */
@@ -741,6 +753,14 @@ const advise = (m) => {
         add('bad', `The array is ${state.array.health}`,
             `${state.array.health_reason || ''} Maintenance is suspended until this is solved. If a disk was replaced or reformatted, the recovery rebuilds it and brings the array back.`,
             { label: 'Recover…', st: 'recover' });
+
+    if (state.lastSync?.parityFull) {
+        const files = state.lastSync.outOfParity;
+        add('bad', 'The last sync stopped: the parity is full',
+            `A data disk holds more than the parity can protect${files.length ? `: ${plural(files.length, 'file', 'files')} did not fit, starting with ${files[0]}` : ''}. `
+            + 'What was synced before is still protected, the new files are not. Move those files to another data disk or free space on that disk, then sync again. To use the whole disk, move the parity to a disk at least as large.',
+            m.parity[0] ? { label: 'Replace the parity', st: 'replace', data: { kind: 'parity', name: m.parity[0].key } } : null);
+    }
 
     // SnapRAID keeps the hashes of every block in memory
     if (state.system?.memory_total_bytes && m.data.length) {
@@ -824,6 +844,9 @@ const advise = (m) => {
     m.parity.filter(p => p.ok && p.total < largest * 0.9).forEach(p => add('bad', `${p.key} is smaller than a data disk`,
         `Parity must be at least as large as the largest data disk (${size(largest)}), or the sync stops when it fills up.`,
         { label: 'Replace it', st: 'replace', data: { kind: 'parity', name: p.key } }));
+    // close, but not enough to fill the largest data disk to the top
+    m.parity.filter(p => p.ok && p.total >= largest * 0.9 && p.total < largest * 0.99).forEach(p => add('warn', `${p.key} is a little smaller than the largest data disk`,
+        `${p.key} has ${size(p.total)} and the largest data disk ${size(largest)}. Everything works until that disk holds more than ${size(p.total)}: then the sync stops. Keep ${size(largest - p.total)} free on it, or move the parity to a larger disk.`));
 
     const live = m.data.filter(d => !d.removing);
     const want = recommendedParity(live.length);
@@ -947,18 +970,22 @@ const render = () => {
 
 export const loadStorage = async (view) => {
     state.view = view || state.view;
-    const [inv, disks, array, system] = await Promise.all([StorageAPI.get(), API.getDisks().catch(() => null), API.getState().catch(() => null), API.getSystem().catch(() => null)]);
+    const [inv, disks, array, system, tasks] = await Promise.all([StorageAPI.get(), API.getDisks().catch(() => null), API.getState().catch(() => null), API.getSystem().catch(() => null), API.getTasks().catch(() => null)]);
     state.health = {};
+    state.known = {};
     state.changed = [];
     if (disks) {
         [...(disks.data_disks || []), ...(disks.parity_disks || [])].forEach(d => {
             state.health[d.name] = d.health;
+            // the size and the content recorded at the last sync: all that is known of a dead disk
+            if (d.total_space_bytes) state.known[d.name] = { total: d.total_space_bytes, used: d.total_space_bytes - (d.free_space_bytes || 0) };
             // a filesystem different than the one recorded at the last sync
             if ((d.splits || []).some(sp => sp.stored_uuid && sp.uuid !== sp.stored_uuid)) state.changed.push(d.name);
         });
     }
     state.array = array || {};
     state.system = system;
+    state.lastSync = lastSyncOf(tasks);
     state.model = buildModel(inv);
     render();
     if (inv.job?.running) watchJob();
@@ -1641,6 +1668,49 @@ const poolCreate = () => {
 
 /* --- replace --- */
 
+/** What a candidate offers once it is in use: a new filesystem takes some of the disk for itself. */
+const usableSize = (c) => (c.kind === 'blank' ? c.size * 0.93 : c.size);
+
+/**
+ * Can this disk take the place of that one? Disks of different sizes are
+ * welcome, within two rules: a data disk must hold what the old one held,
+ * and a parity must hold as much as the fullest data disk.
+ * \return { blocked: reason or null, warnings: [text] }
+ */
+const replaceCheck = (m, kind, name, c, fstype) => {
+    const warnings = [];
+    const usable = usableSize(c);
+    const live = m.data.filter(d => !d.removing);
+    const usedOf = (d) => (d.ok ? d.total - d.free : state.known[d.name]?.used || 0);
+    const totalOf = (d) => (d.ok ? d.total : state.known[d.name]?.total || 0);
+
+    if (kind === 'data') {
+        const entry = m.data.find(d => d.name === name);
+        const held = entry ? usedOf(entry) : 0;
+        const was = entry ? totalOf(entry) : 0;
+        // a filesystem with content brings its own files along
+        const room = c.kind === 'fs' && c.fs.mount ? c.fs.mount.free_bytes : usable;
+        if (held && room < held * 1.02)
+            return { blocked: `too small: ${name} held ${size(held)}`, warnings };
+        if (was && usable < was * 0.98)
+            warnings.push(`This disk is smaller than the old one (${size(usable)} instead of ${size(was)}). The ${size(held)} of files recorded on ${name} fit, with ${size(Math.max(0, usable - held))} left.`);
+        const parity = m.parity.filter(p => p.ok && p.total);
+        const smallest = parity.length ? Math.min(...parity.map(p => p.total)) : 0;
+        if (smallest && usable > smallest * 1.02)
+            warnings.push(`This disk is larger than the parity (${size(usable)} against ${size(smallest)}). It works, but only the first ${size(smallest)} of files on it can be protected: beyond that the sync stops with “insufficient parity space”. To use all of it, make the largest disk the parity instead, or replace the parity first.`);
+    } else {
+        const fullest = Math.max(0, ...live.map(usedOf));
+        const largest = Math.max(0, ...live.map(totalOf));
+        if (fullest && usable < fullest * 1.02)
+            return { blocked: `too small: a data disk holds ${size(fullest)}`, warnings };
+        if (c.size > EXT4_FILE_MAX && (c.kind === 'blank' ? fstype : c.fs.fstype) === 'ext4')
+            warnings.push('This disk is larger than 16 TiB and ext4 cannot hold a parity file that big: the space beyond is wasted. Choose xfs.');
+        if (largest && usable < largest * 0.99)
+            warnings.push(`This disk is smaller than the largest data disk (${size(usable)} against ${size(largest)}). It holds today's files (the fullest data disk has ${size(fullest)}), but when a data disk grows beyond ${size(usable)} the sync stops. A parity at least as large as the largest data disk never has this problem.`);
+    }
+    return { blocked: null, warnings };
+};
+
 const replaceDisk = (kind, name) => {
     if (!adminGuard()) return;
     const m = state.model;
@@ -1649,12 +1719,23 @@ const replaceDisk = (kind, name) => {
     const oldPath = kind === 'data' ? stripSlash(entry.path) : (entry.files[0].mount?.target && entry.files[0].mount.target !== '/' ? entry.files[0].mount.target : dirname(entry.paths[0]));
     const cands = candidates(m).filter(c => !(c.kind === 'fs' && c.fs.mount));
     const fss = fsChoices(m.inv.tools || {});
-    const needed = entry.ok ? entry.total : 0;
+    const verdict = (c, fstype) => replaceCheck(m, kind, name, c, fstype);
 
     if (!cands.length) {
         dialog({
             title: `Replace ${name}`, large: false,
             body: 'There is no blank disk and no unmounted filesystem to use as replacement. Connect the new disk first.',
+            buttons: [{ label: 'Close', onClick: (d) => d.close() }]
+        });
+        return;
+    }
+
+    // the first disk that can do the job is proposed
+    const firstFit = cands.findIndex(c => !verdict(c, fss[0]).blocked);
+    if (firstFit < 0) {
+        dialog({
+            title: `Replace ${name}`, large: false,
+            body: `None of the free disks is large enough: ${cands.map(c => `${escHtml(c.title)} (${size(c.size)}) is ${escHtml(verdict(c, fss[0]).blocked)}`).join(', ')}. Connect a larger disk.`,
             buttons: [{ label: 'Close', onClick: (d) => d.close() }]
         });
         return;
@@ -1684,7 +1765,7 @@ const replaceDisk = (kind, name) => {
             detail: `fix -d ${name}${check && kind === 'data' ? ` → check -d ${name} -a` : ''} → sync`,
             run: () => StorageAPI.recover([name], check && kind === 'data')
         });
-        return { steps, c };
+        return { steps, c, ...verdict(c, fstype) };
     };
 
     const dlg = dialog({
@@ -1698,7 +1779,7 @@ const replaceDisk = (kind, name) => {
             <div class="form-row">
                 <div class="form-group"><label for="r-new">New disk</label>
                     <select class="form-control" id="r-new">
-                        ${cands.map(c => `<option value="${escAttr(c.id)}" ${c.size < needed ? 'disabled' : ''}>${escHtml(c.title)} · ${size(c.size)} · ${c.kind === 'blank' ? 'blank' : escHtml(c.sub)}${c.size < needed ? ' (too small)' : ''}</option>`).join('')}
+                        ${cands.map((c, i) => { const v = verdict(c, fss[0]); return `<option value="${escAttr(c.id)}" ${v.blocked ? 'disabled' : ''} ${i === firstFit ? 'selected' : ''}>${escHtml(c.title)} · ${size(c.size)} · ${c.kind === 'blank' ? 'blank' : escHtml(c.sub)}${v.blocked ? ` (${escHtml(v.blocked)})` : ''}</option>`; }).join('')}
                     </select></div>
                 <div class="form-group"><label for="r-fstype">Filesystem</label>
                     <select class="form-control" id="r-fstype">${fss.map(f => `<option>${f}</option>`).join('')}</select></div>
@@ -1721,7 +1802,7 @@ const replaceDisk = (kind, name) => {
     });
     const draw = () => {
         const p = plan(dlg);
-        dlg.body.querySelector('#r-plan').innerHTML = stepList(p.steps) + eraseConfirm(p.steps);
+        dlg.body.querySelector('#r-plan').innerHTML = p.warnings.map(w => `<div class="text-sm text-amber mb-4">${escHtml(w)}</div>`).join('') + stepList(p.steps) + eraseConfirm(p.steps);
     };
     dlg.body.querySelectorAll('select, input[type=checkbox]').forEach(el => el.addEventListener('change', draw));
     draw();
@@ -2240,5 +2321,5 @@ export const initStorage = () => {
 export const __test = {
     parseConf, serializeConf, buildModel, buildPlan, candidates, advise, layoutOf, balanceNeed,
     parseSize, shortSize, setOption, getOption, recommendedParity, defaultPoolOptions, state,
-    MAX_DATA, MAX_SPLIT, EXT4_FILE_MAX
+    MAX_DATA, MAX_SPLIT, EXT4_FILE_MAX, replaceCheck, lastSyncOf
 };

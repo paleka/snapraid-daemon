@@ -102,7 +102,7 @@ const healthy = (over = {}) => machine({
 });
 
 const resetState = (over = {}) => {
-    Object.assign(T.state, { health: {}, array: {}, changed: [], system: null }, over);
+    Object.assign(T.state, { health: {}, known: {}, lastSync: null, array: {}, changed: [], system: null }, over);
 };
 
 const findings = (inv, stateOver) => {
@@ -510,6 +510,132 @@ test('advisor: failing disk, removal in progress, read-only mode, no excludes', 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* disks of different sizes                                            */
+/* ------------------------------------------------------------------ */
+
+/** An array of 2, 4 and 8 TB data disks with an 8 TB parity, plus free disks to choose from. */
+const mixed = (spares = [], over = {}) => machine({
+    disks: [
+        { name: 'sdb', size: 8 * TB, fs: 'ext4', label: 'parity1', mount: '/mnt/parity1', used: 5 * TB, ...over.parity },
+        { name: 'sdc', size: 2 * TB, fs: 'ext4', label: 'disk1', mount: '/mnt/disk1', used: 1.5 * TB },
+        { name: 'sdd', size: 4 * TB, fs: 'ext4', label: 'disk2', mount: over.dead ? undefined : '/mnt/disk2', used: 1 * TB },
+        { name: 'sde', size: 8 * TB, fs: 'xfs', label: 'disk3', mount: '/mnt/disk3', used: 5 * TB },
+        ...spares
+    ],
+    conf: ['parity /mnt/parity1/snapraid.parity', 'content /var/snapraid.content', 'content /mnt/disk1/snapraid.content',
+        'data d1 /mnt/disk1', 'data d2 /mnt/disk2', 'data d3 /mnt/disk3', 'exclude *.tmp', 'autosave 500', ''].join('\n')
+});
+const verdictOf = (inv, kind, name, dev, stateOver, fstype = 'ext4') => {
+    resetState({ known: {}, ...stateOver });
+    const m = T.buildModel(inv);
+    const c = T.candidates(m).find(x => x.id === dev);
+    assert.ok(c, `${dev} is not a candidate`);
+    return T.replaceCheck(m, kind, name, c, fstype);
+};
+
+test('sizes: the setup gives the largest disks to the parity whatever the order', () => {
+    const m = T.buildModel(machine({ disks: [{ name: 'sdb', size: 2 * TB }, { name: 'sdc', size: 12 * TB }, { name: 'sdd', size: 4 * TB }, { name: 'sde', size: 8 * TB }] }));
+    const p = plan(m, { '/dev/sdb': 'data', '/dev/sdc': 'p0', '/dev/sdd': 'data', '/dev/sde': 'data' });
+    assert.deepEqual(p.errors, []);
+    // the same disks with a small one as parity are refused
+    const q = plan(m, { '/dev/sdb': 'p0', '/dev/sdc': 'data', '/dev/sdd': 'data', '/dev/sde': 'data' });
+    assert.ok(q.errors.some(e => /less than the largest data disk/.test(e)));
+    // two small disks joined on one level are enough
+    const r = plan(m, { '/dev/sdb': 'data', '/dev/sdc': 'ignore', '/dev/sdd': 'p0', '/dev/sde': 'p0' });
+    assert.ok(r.errors.some(e => /less than the largest|at least one data/.test(e)) === false, r.errors.join(' | '));
+    assert.match(r.text, /^parity \S+snapraid\.parity,\S+snapraid\.parity$/m);
+});
+
+test('sizes: growing an array with a disk larger than the parity is refused with the way out', () => {
+    const m = T.buildModel(mixed([{ name: 'sdf', size: 16 * TB }, { name: 'sdg', size: 1 * TB }]));
+    resetState({ known: {} });
+    const big = plan(m, { '/dev/sdf': 'data' }, { pool: false });
+    assert.ok(big.errors.some(e => /parity has .* less than the largest data disk/.test(e)), big.errors.join(' | '));
+    const small = plan(m, { '/dev/sdg': 'data' }, { pool: false });
+    assert.deepEqual(small.errors, []);
+});
+
+test('sizes: a data disk can be replaced by a smaller one when its files fit', () => {
+    // d2 is a 4 TB disk holding 1 TB
+    const inv = mixed([{ name: 'sdf', size: 2 * TB }, { name: 'sdg', size: 1 * TB }, { name: 'sdh', size: 4 * TB }]);
+    const smaller = verdictOf(inv, 'data', 'd2', '/dev/sdf');
+    assert.equal(smaller.blocked, null);
+    assert.ok(smaller.warnings.some(w => /smaller than the old one/.test(w)));
+    assert.match(verdictOf(inv, 'data', 'd2', '/dev/sdg').blocked, /too small: d2 held/);
+    const same = verdictOf(inv, 'data', 'd2', '/dev/sdh');
+    assert.equal(same.blocked, null);
+    assert.deepEqual(same.warnings, []);
+});
+
+test('sizes: the replacement of a dead disk is judged on what the last sync recorded', () => {
+    const inv = mixed([{ name: 'sdf', size: 2 * TB }, { name: 'sdg', size: 6 * TB }], { dead: true });
+    const known = { d2: { total: 3.7 * TB, used: 3 * TB } };
+    assert.match(verdictOf(inv, 'data', 'd2', '/dev/sdf', { known }).blocked, /too small/);
+    assert.equal(verdictOf(inv, 'data', 'd2', '/dev/sdg', { known }).blocked, null);
+    // nothing known (never synced): nothing to refuse
+    assert.equal(verdictOf(inv, 'data', 'd2', '/dev/sdf').blocked, null);
+});
+
+test('sizes: a data disk larger than the parity is allowed and explained', () => {
+    const v = verdictOf(mixed([{ name: 'sdf', size: 16 * TB }]), 'data', 'd1', '/dev/sdf');
+    assert.equal(v.blocked, null);
+    assert.ok(v.warnings.some(w => /larger than the parity/.test(w) && /insufficient parity space/.test(w)));
+});
+
+test('sizes: a parity must hold the fullest data disk, and is warned when smaller than the largest', () => {
+    // the fullest data disk holds 5 TB, the largest is 8 TB
+    const inv = mixed([{ name: 'sdf', size: 4 * TB }, { name: 'sdg', size: 6 * TB }, { name: 'sdh', size: 8 * TB }, { name: 'sdi', size: 20 * TB }]);
+    assert.match(verdictOf(inv, 'parity', 'parity', '/dev/sdf').blocked, /too small: a data disk holds/);
+    const tight = verdictOf(inv, 'parity', 'parity', '/dev/sdg');
+    assert.equal(tight.blocked, null);
+    assert.ok(tight.warnings.some(w => /smaller than the largest data disk/.test(w)));
+    assert.deepEqual(verdictOf(inv, 'parity', 'parity', '/dev/sdh'), { blocked: null, warnings: [] });
+    assert.ok(verdictOf(inv, 'parity', 'parity', '/dev/sdi', {}, 'ext4').warnings.some(w => /16 TiB/.test(w)));
+    assert.deepEqual(verdictOf(inv, 'parity', 'parity', '/dev/sdi', {}, 'xfs').warnings, []);
+});
+
+test('sizes: the advisor tells a parity that is too small from one that is only tight', () => {
+    const arr = (paritySize) => machine({
+        disks: [{ name: 'sdb', size: paritySize, fs: 'ext4', mount: '/mnt/parity1' }, { name: 'sdc', size: 8 * TB, fs: 'ext4', mount: '/mnt/disk1', used: 1 * TB }, { name: 'sdd', size: 2 * TB, fs: 'ext4', mount: '/mnt/disk2' }],
+        conf: ['parity /mnt/parity1/snapraid.parity', 'content /var/snapraid.content', 'content /mnt/disk1/snapraid.content', 'data d1 /mnt/disk1', 'data d2 /mnt/disk2', 'exclude *.tmp', ''].join('\n')
+    });
+    const small = findings(arr(4 * TB));
+    assert.ok(has(small, 'bad', /parity is smaller than a data disk/));
+    const tight = findings(arr(7.6 * TB));
+    assert.ok(!has(tight, 'bad', /smaller than a data disk/));
+    assert.ok(has(tight, 'warn', /a little smaller than the largest data disk/));
+    const fine = findings(arr(8 * TB));
+    assert.ok(!has(fine, 'bad', /smaller/) && !has(fine, 'warn', /a little smaller/));
+    const larger = findings(arr(16 * TB));
+    assert.ok(!has(larger, 'warn', /a little smaller/));
+});
+
+test('sizes: a sync stopped by a full parity is explained with the files involved', () => {
+    const task = (exit, texts) => ({ command: 'sync', status: 'terminated', exit_code: exit, messages: texts.map(text => ({ level: 'fatal', text })) });
+    const stopped = T.lastSyncOf({ history: [
+        { command: 'probe', status: 'terminated', exit_code: 0, messages: [] },
+        task(1, ['Failed to allocate all the required parity space. You miss 99614720 bytes.', 'outofparity /mnt/disk1/Movies/a.mkv', 'outofparity /mnt/disk1/Movies/b.mkv', 'Insufficient parity space. Data requires more parity than available.']),
+        task(0, [])] });
+    assert.deepEqual(stopped.outOfParity, ['/mnt/disk1/Movies/a.mkv', '/mnt/disk1/Movies/b.mkv']);
+    const f = findings(healthy(), { lastSync: stopped });
+    assert.ok(has(f, 'bad', /parity is full.*2 files did not fit, starting with \/mnt\/disk1\/Movies\/a\.mkv/));
+    // a later good sync clears it, and another kind of failure is not mistaken for it
+    assert.equal(T.lastSyncOf({ history: [task(0, []), stopped] }).parityFull, undefined);
+    assert.ok(!T.lastSyncOf({ history: [task(1, ['Disk d1 is not accessible'])] }).parityFull);
+    assert.ok(!T.lastSyncOf(null).parityFull);
+    assert.ok(!has(findings(healthy()), 'bad', /parity is full/));
+});
+
+test('sizes: the pool balance looks at fill levels, not at bytes', () => {
+    // 1 TB of 2 TB is fuller than 2 TB of 8 TB
+    const need = T.balanceNeed({ branches: [
+        { path: '/mnt/disk1', mode: 'RW', total_bytes: 2 * TB, free_bytes: 1 * TB },
+        { path: '/mnt/disk2', mode: 'RW', total_bytes: 8 * TB, free_bytes: 6 * TB }] });
+    assert.equal(Math.round(need.spread), 25);
+    assert.ok(need.bytes > 0.35 * TB && need.bytes < 0.45 * TB, String(need.bytes));   // 0.4 TB brings both to 30%
+});
 
 test('helpers: sizes', () => {
     assert.equal(T.parseSize('20G'), 20 * 1024 ** 3);
