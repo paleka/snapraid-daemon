@@ -1761,6 +1761,29 @@ static void runner_postcondition_locked(struct snapraid_state* state)
 			}
 		}
 	}
+
+	if (task->high_cmd == CMD_SUSPEND_IDLE && task->cmd == CMD_PROBE) {
+		/*
+		 * SnapRAID can be used from the command line while the daemon runs.
+		 * A sync made there writes the content file, and what the daemon
+		 * knows of the array (files, blocks to sync and to scrub) gets stale
+		 * until its next command. The periodic probe tells it: read the
+		 * content file again.
+		 *
+		 * A read that fails leaves content_last_unixtime as it is: remember
+		 * the modification time that asked for it, to not ask again at every
+		 * probe for the same file.
+		 */
+		if (state->array.content_last_unixtime != 0
+			&& state->array.content_probe_unixtime > state->array.content_last_unixtime
+			&& state->array.content_probe_unixtime != state->array.content_reread_unixtime
+		) {
+			if (runner_locked(state, CMD_STARTUP, CMD_READ, 0, 0, 0, msg, sizeof(msg), &status) == 0)
+				state->array.content_reread_unixtime = state->array.content_probe_unixtime;
+			else
+				log_msg(LVL_ERROR, "failed to read again the content file changed from the command line");
+		}
+	}
 }
 
 static void runner_spindown_inactive_locked(struct snapraid_state* state)

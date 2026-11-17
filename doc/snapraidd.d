@@ -1349,7 +1349,7 @@ REST API
 
     /snapraid/v1/storage/engine_conf
 	PUT replaces the SnapRAID configuration file with `text`. The previous file
-	is kept with the .bak extension.
+	is kept with the .snapraidd.bak extension.
 
     /snapraid/v1/storage/format
 	POST creates a GPT partition table with a single partition on the whole disk

@@ -1398,7 +1398,7 @@ state of the last background operation.
 
 ---- 7.7.2 /snapraid/v1/storage/engine_conf ----
 PUT replaces the SnapRAID configuration file with `text`. The previous file
-is kept with the .bak extension.
+is kept with the .snapraidd.bak extension.
 
 ---- 7.7.3 /snapraid/v1/storage/format ----
 POST creates a GPT partition table with a single partition on the whole disk

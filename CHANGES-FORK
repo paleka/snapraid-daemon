@@ -78,6 +78,21 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
 
 * Reports, notification subjects and hooks (SNAPRAID_ARRAY) name the array.
 
+* A machine where SnapRAID is already used from the command line: the
+  installer converts a content file of SnapRAID 13 or older before upgrading
+  the engine, stops without changing anything when that takes a real sync or
+  the engine was built from the sources, and starts the daemon without a
+  schedule and without spin down. The Storage page tells a content file in
+  the old format, and a daemon without a schedule. See "An array already in
+  use" in the README.
+
+* A sync made from the command line while the daemon runs reaches it at the
+  next periodic probe: the content file is read again.
+
+* The SnapRAID configuration replaced from the UI is kept as
+  snapraid.conf.snapraidd.bak, and no more as .bak, a name people use for
+  their own copy.
+
 * Tests: 'make check' also runs a selftest of the storage code and, if
   Node.js is installed, the tests of the logic of the Storage and Arrays
   pages.
@@ -91,7 +106,10 @@ Changes to existing files
     daemon/conf.c, state.h     'net_storage_admin' option, recover command
     daemon/elem.c              name of the recover command
     daemon/rest.c              /snapraid/v1/storage endpoints
-    daemon/runner.c            recover command allowed on a degraded array
+    daemon/runner.c            recover command allowed on a degraded array;
+                               content file read again after a periodic probe
+                               finds it changed
+    daemon/state.h             content_reread_unixtime
     daemon/scheduler.c/.h      schedule_recover()
     daemon/selftest.c          call of storage_selftest()
     commander/, brutale/       index.html, css/style.css, js/app.js, js/utils.js

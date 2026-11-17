@@ -212,7 +212,7 @@ net_config_full_access = 0
 #   - partition and format whole disks that are not in use
 #   - mount and unmount filesystems, and edit their /etc/fstab entries
 #   - create and change mergerfs pools
-#   - replace the SnapRAID configuration file (the previous one is kept as .bak)
+#   - replace the SnapRAID configuration file (the previous one is kept as .snapraidd.bak)
 #   - start the rebuild of a replaced disk while the array is DEGRADED
 #
 #   - balance a mergerfs pool moving files between its disks

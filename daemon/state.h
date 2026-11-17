@@ -519,6 +519,7 @@ struct snapraid_array {
 	char content[PATH_MAX]; /**< Content file. */
 	int64_t content_probe_unixtime; /**< Modification time of the content file. 0 if unknown. */
 	int64_t content_last_unixtime; /**< Last write or read of the content file. 0 if unknown. */
+	int64_t content_reread_unixtime; /**< Modification time of the content file that last made a periodic probe read it again. 0 if none. */
 	unsigned blocksize; /**< Block size */
 	int64_t last_time; /**< Time of the latest command */
 	char last_cmd[64]; /**< Last command started */

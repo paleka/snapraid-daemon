@@ -1644,13 +1644,13 @@ int storage_engine_conf_write(struct snapraid_state* state, const char* text, ch
 		make_dirs(path);
 		*slash = '/';
 	}
-	int ret = file_replace(path, text, ".bak", 0644);
+	int ret = file_replace(path, text, ".snapraidd.bak", 0644);
 	pthread_mutex_unlock(&storage_mutex);
 
 	if (ret != 0)
 		return fail(msg, msg_size, 500, "Failed to write %s, %s", path, strerror(errno));
 
-	log_msg(LVL_INFO, "storage: engine configuration %s replaced, previous one kept as .bak", path);
+	log_msg(LVL_INFO, "storage: engine configuration %s replaced, previous one kept as .snapraidd.bak", path);
 	return 0;
 }
 

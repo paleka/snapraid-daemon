@@ -282,7 +282,7 @@ const StorageAPI = {
 /* small helpers                                                       */
 /* ------------------------------------------------------------------ */
 
-const state = { model: null, health: {}, known: {}, lastSync: null, view: null, tab: 'overview', array: {}, changed: [], system: null, browse: null, watching: false };
+const state = { model: null, health: {}, known: {}, lastSync: null, legacyContent: false, config: null, view: null, tab: 'overview', array: {}, changed: [], system: null, browse: null, watching: false };
 
 const size = (bytes) => (bytes == null ? '–' : formatDiskSize(bytes));
 const badge = (text, color) => `<span class="badge badge-${color}">${escHtml(text)}</span>`;
@@ -785,6 +785,15 @@ const lastSyncOf = (tasks) => {
 };
 
 /**
+ * Tell if the last command that loaded the content file found it in the
+ * format of SnapRAID 13 and older, that SnapRAID 15 refuses to read.
+ */
+const legacyContentOf = (tasks) => {
+    const last = (tasks?.history || []).find(t => t.status === 'terminated' && !['probe', 'up', 'down', 'down_idle', 'report'].includes(t.command));
+    return !!last && !!last.exit_code && (last.messages || []).some(x => /Legacy content format is no longer supported/.test(x.text || ''));
+};
+
+/**
  * Look at the whole setup like an experienced admin would, and say in plain
  * words what deserves attention, most serious first.
  */
@@ -808,6 +817,12 @@ const advise = (m) => {
         add('bad', `The array is ${state.array.health}`,
             `${state.array.health_reason || ''} Maintenance is suspended until this is solved. If a disk was replaced or reformatted, the recovery rebuilds it and brings the array back.`,
             { label: 'Recover…', st: 'recover' });
+
+    if (state.legacyContent)
+        add('bad', 'The content file is in an old format',
+            'It was written by SnapRAID 13 or older, and SnapRAID 15 cannot read it: sync, scrub and fix stop right away, from here and from the command line. '
+            + 'Nothing is lost. The content file has to be written again by a sync made with SnapRAID 14.10. '
+            + 'The installer of this package does it: run it again. By hand: install SnapRAID 14.10, run “snapraid sync”, then install SnapRAID 15 again.');
 
     if (state.lastSync?.parityFull) {
         const files = state.lastSync.outOfParity;
@@ -961,6 +976,12 @@ const advise = (m) => {
             { label: 'Replace it', st: 'replace', data: { kind: isParity ? 'parity' : 'data', name } });
     });
 
+    // an array taken over from the command line starts this way
+    if (state.config && !String(state.config.maintenance_schedule || '').trim())
+        add('tip', 'No automatic maintenance',
+            'The daemon has no schedule for this array: sync and scrub run only when you start them, from here, from the command line or from your own scheduled jobs. '
+            + 'To let the daemon do it, set a Maintenance Schedule in the Settings page, and remove your own jobs.');
+
     if (blank.length) add('tip', `${plural(blank.length, 'blank disk', 'blank disks')} available`, 'Use them to grow the array, as extra parity, or keep them as spares ready for a replacement.', { label: 'Add disks', st: 'wizard' });
     if (!m.inv.admin) add('tip', 'Read-only mode', `This page can show everything but change nothing. ${m.inv.admin_reason || ''}`);
 
@@ -1047,7 +1068,7 @@ const render = () => {
 
 export const loadStorage = async (view) => {
     state.view = view || state.view;
-    const [inv, disks, array, system, tasks] = await Promise.all([StorageAPI.get(), API.getDisks().catch(() => null), API.getState().catch(() => null), API.getSystem().catch(() => null), API.getTasks().catch(() => null)]);
+    const [inv, disks, array, system, tasks, config] = await Promise.all([StorageAPI.get(), API.getDisks().catch(() => null), API.getState().catch(() => null), API.getSystem().catch(() => null), API.getTasks().catch(() => null), API.getConfig().catch(() => null)]);
     state.health = {};
     state.known = {};
     state.changed = [];
@@ -1063,6 +1084,8 @@ export const loadStorage = async (view) => {
     state.array = array || {};
     state.system = system;
     state.lastSync = lastSyncOf(tasks);
+    state.legacyContent = legacyContentOf(tasks);
+    state.config = config;
     state.model = buildModel(inv);
     render();
     if (inv.job?.running) watchJob();
@@ -2271,7 +2294,7 @@ const confSave = async () => {
             'Excluded files leave the array at the next sync: they stay on disk but are no longer protected.',
             'The daemon reloads the array right away.'
         ],
-        safe: ['Disks, parity and pool are not touched.', 'The previous configuration is kept next to it as .bak.'],
+        safe: ['Disks, parity and pool are not touched.', 'The previous configuration is kept next to it as .snapraidd.bak.'],
         label: 'Save'
     }))) return;
     const lines = (id) => document.getElementById(id).value.split('\n').map(s => s.trim()).filter(Boolean);
@@ -2314,7 +2337,7 @@ const confSave = async () => {
         setOpt('nohidden', '', nohidden);
         await StorageAPI.saveConf(serializeConf(conf));
         await afterConfChange();
-        showToast('Configuration saved. The previous one is kept as .bak', 'info');
+        showToast('Configuration saved. The previous one is kept as .snapraidd.bak', 'info');
         reload();
     } catch (e) {
         showToast(e.message, 'error');
@@ -2326,7 +2349,7 @@ const confRaw = () => {
     dialog({
         title: m.inv.engine_conf.path,
         body: `
-            <p class="text-sm text-muted mb-2">The file as it is. A wrong line stops every SnapRAID command, the previous version is kept as .bak.</p>
+            <p class="text-sm text-muted mb-2">The file as it is. A wrong line stops every SnapRAID command, the previous version is kept as .snapraidd.bak.</p>
             <textarea id="conf-raw" class="form-control font-mono text-sm" rows="22" spellcheck="false">${escHtml(m.inv.engine_conf.text)}</textarea>`,
         buttons: [
             { label: 'Cancel', onClick: (dl) => dl.close() },
@@ -2422,5 +2445,5 @@ export const initStorage = () => {
 export const __test = {
     parseConf, serializeConf, buildModel, buildPlan, candidates, advise, layoutOf, balanceNeed,
     parseSize, shortSize, setOption, getOption, recommendedParity, defaultPoolOptions, state,
-    MAX_DATA, MAX_SPLIT, EXT4_FILE_MAX, replaceCheck, lastSyncOf, branchProtection
+    MAX_DATA, MAX_SPLIT, EXT4_FILE_MAX, replaceCheck, lastSyncOf, legacyContentOf, branchProtection
 };

@@ -102,7 +102,7 @@ const healthy = (over = {}) => machine({
 });
 
 const resetState = (over = {}) => {
-    Object.assign(T.state, { health: {}, known: {}, lastSync: null, array: {}, changed: [], system: null }, over);
+    Object.assign(T.state, { health: {}, known: {}, lastSync: null, legacyContent: false, config: null, array: {}, changed: [], system: null }, over);
 };
 
 const findings = (inv, stateOver) => {
@@ -610,6 +610,31 @@ test('sizes: the advisor tells a parity that is too small from one that is only 
     assert.ok(!has(fine, 'bad', /smaller/) && !has(fine, 'warn', /a little smaller/));
     const larger = findings(arr(16 * TB));
     assert.ok(!has(larger, 'warn', /a little smaller/));
+});
+
+test('existing array: a content file of SnapRAID 13 or older is told, and not called right', () => {
+    const task = (command, exit, texts) => ({ command, status: 'terminated', exit_code: exit, messages: texts.map(text => ({ level: 'fatal', text })) });
+    const legacy = ['Legacy content format is no longer supported.', "Run 'snapraid sync' with SnapRAID 14.x to upgrade the content file."];
+    // the probes that follow the failed read don't hide it
+    const tasks = { history: [task('probe', 0, []), task('read', 1, legacy), task('probe', 0, [])] };
+    assert.equal(T.legacyContentOf(tasks), true);
+    const f = findings(healthy(), { legacyContent: true });
+    assert.ok(has(f, 'bad', /written by SnapRAID 13 or older.*SnapRAID 14\.10/));
+    assert.ok(!f.some(x => x.level === 'ok'));
+    // once converted, the next read clears it; other failures are not mistaken for it
+    assert.equal(T.legacyContentOf({ history: [task('read', 0, []), task('read', 1, legacy)] }), false);
+    assert.equal(T.legacyContentOf({ history: [task('sync', 1, ['Disk d1 is not accessible'])] }), false);
+    assert.equal(T.legacyContentOf({ history: [] }), false);
+    assert.equal(T.legacyContentOf(null), false);
+});
+
+test('existing array: a daemon without a schedule says who runs the maintenance', () => {
+    assert.ok(has(findings(healthy(), { config: { maintenance_schedule: '' } }), 'tip', /No automatic maintenance.*Settings page/));
+    assert.ok(!has(findings(healthy(), { config: { maintenance_schedule: '02:00' } }), 'tip', /No automatic maintenance/));
+    // the configuration of the daemon not loaded: nothing is said
+    assert.ok(!has(findings(healthy()), 'tip', /No automatic maintenance/));
+    // it stays a tip: the array is still right
+    assert.ok(findings(healthy(), { config: { maintenance_schedule: '' } }).some(x => x.level === 'ok'));
 });
 
 test('sizes: a sync stopped by a full parity is explained with the files involved', () => {

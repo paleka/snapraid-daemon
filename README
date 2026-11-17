@@ -37,6 +37,57 @@ page read-only, as in the original project:
 
     curl -fsSL https://raw.githubusercontent.com/paleka/snapraid-daemon/storage/installer.sh | sudo SNAPRAIDD_LOCAL=1 sh
 
+An array already in use
+-----------------------
+
+The daemon can be added to a machine where SnapRAID is already used from the
+command line, and then removed again, without anything to redo. The
+installer and the daemon do not touch the array, the content and parity
+files, /etc/snapraid.conf, /etc/fstab, a mergerfs pool or your scheduled
+jobs. They are changed only by what you start yourself from the web UI, and
+the file is saved first, as snapraid.conf.snapraidd.bak and
+fstab.snapraidd.bak.
+
+'snapraid' keeps working from the shell while the daemon runs. SnapRAID lets
+one command at a time work on an array: the second one, whoever starts it,
+stops with "SnapRAID is already in use" and changes nothing. A sync made
+from the shell shows up in the web UI within a few minutes.
+
+What the installer does differently when it finds an array:
+
+* The daemon starts without a maintenance schedule and without spinning down
+  the disks. It watches the array and the health of the disks, and runs a
+  sync or a scrub only when you start one. To hand the maintenance over to
+  it, set a schedule in the Settings page and remove your own scheduled
+  jobs. Add SNAPRAIDD_AUTO=1 to the command to start with the defaults of
+  the daemon instead: sync and scrub every night at 02:00, idle disks spun
+  down after 15 minutes.
+
+* The SnapRAID engine is upgraded to 15, that the daemon needs. SnapRAID 15
+  does not read a content file written by SnapRAID 13 or older, like the
+  ones of the packages of Debian and Ubuntu: it has to be converted by a
+  sync made with SnapRAID 14. The installer does it before upgrading, with
+  SnapRAID 14.10 run from a temporary directory. If the array has nothing to
+  sync, only the content files are written again and the parity is not
+  touched. If it has changes not synced yet, the installer stops before
+  installing anything and tells what to do: a real sync is your choice.
+  After the conversion the older SnapRAID still reads the array.
+
+* A SnapRAID built from the sources in /usr/local stops the installer, with
+  the two commands to run first: otherwise the shell would use one engine
+  and the daemon another.
+
+If you install the packages by hand, none of this is done: convert the
+content file first, and set 'maintenance_schedule' and
+'spindown_idle_minutes' in /etc/snapraidd.conf as you want them before
+starting the daemon. With a content file in the old format, the Storage
+page tells it.
+
+During the maintenance the daemon runs 'snapraid touch' before the sync
+('touch_zero_subseconds'), which sets the sub-second part of the timestamp
+of the files that have it at zero. It is what 'snapraid status' suggests,
+and it can be turned off in the Settings page.
+
 The packages (.deb, .rpm, and the source code) are in the releases:
 
     https://github.com/paleka/snapraid-daemon/releases
