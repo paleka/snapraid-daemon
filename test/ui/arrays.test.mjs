@@ -293,3 +293,33 @@ test('the content file of a new array is named after its configuration', () => {
     const bad = S.buildPlan(m, { cands, roles, fstype: 'ext4', base: '/mnt', pool: true, poolPath: '/mnt/storage', policy: 'pfrd', minfree: '20G', excludes: true, sync: true });
     assert.ok(bad.errors.some(e => /pool of the array default/.test(e)), bad.errors.join(' | '));
 });
+
+test('the advisor speaks of the pools of its array, and names them', () => {
+    const surprising = (array) => {
+        const inv = twoArrays(array);
+        // every pool with the two options the advisor has a tip about
+        inv.pools.forEach(p => { p.options = { 'category.create': 'epmfs', moveonenospc: 'false' }; });
+        return S.advise(S.buildModel(inv)).map(f => f.title).filter(t => /no space left|growing on a full disk/.test(t));
+    };
+    // the default array: its own pool, and the one of the disks that are in no array
+    assert.deepEqual(surprising('default').sort(), [
+        'A file growing on a full disk of /mnt/scratch will fail',
+        'A file growing on a full disk of /mnt/storage will fail',
+        'The pool /mnt/scratch can report “no space left” with space free',
+        'The pool /mnt/storage can report “no space left” with space free'
+    ]);
+    // another array: its own pool only
+    assert.deepEqual(surprising('media').sort(), [
+        'A file growing on a full disk of /mnt/media will fail',
+        'The pool /mnt/media can report “no space left” with space free'
+    ]);
+});
+
+test('a mounted disk of no array is not called unused', () => {
+    const l = S.layoutOf(S.buildModel(twoArrays('default')));
+    // sdh is a branch of the pool /mnt/scratch, sdi is blank
+    assert.deepEqual(l.spare.map(d => [d.name, d.state]), [['sdh', 'pooled'], ['sdi', 'blank']]);
+    const inv = twoArrays('default');
+    inv.pools = inv.pools.filter(p => p.mountpoint !== '/mnt/scratch');
+    assert.deepEqual(S.layoutOf(S.buildModel(inv)).spare.map(d => [d.name, d.state]), [['sdh', 'mounted'], ['sdi', 'blank']]);
+});

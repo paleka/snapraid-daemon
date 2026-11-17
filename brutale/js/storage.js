@@ -570,7 +570,7 @@ const renderPoolMore = (m) => {
 
 const STATE_BADGE = {
     system: ['system', 'grey'], array: ['in array', 'green'], other: ['part of RAID, LVM or encryption', 'grey'],
-    blank: ['blank', 'blue'], unformatted: ['no filesystem', 'blue'], mounted: ['mounted, unused', 'yellow'], unmounted: ['not mounted', 'yellow'],
+    blank: ['blank', 'blue'], unformatted: ['no filesystem', 'blue'], mounted: ['mounted, in no array', 'yellow'], pooled: ['in a pool, in no array', 'yellow'], unmounted: ['not mounted', 'yellow'],
     foreign: ['in another array', 'purple']
 };
 
@@ -586,7 +586,7 @@ export const branchProtection = (b, array, dataPaths) => {
 
 const renderDisksCard = (m) => {
     const rows = m.disks.map(d => {
-        const [text, color] = d.state === 'foreign' ? [`in array ${d.owner}`, 'purple'] : STATE_BADGE[d.state];
+        const [text, color] = d.state === 'foreign' ? [`in array ${d.owner}`, 'purple'] : STATE_BADGE[d.state === 'mounted' && inPool(m, d) ? 'pooled' : d.state];
         const fs = d.filesystems.map(f => `
             <div class="text-xs"><span class="font-mono">${escHtml(f.path)}</span> ${escHtml(f.fstype)}${f.label ? ` “${escHtml(f.label)}”` : ''}
                 ${f.mount ? `→ <span class="font-mono">${escHtml(f.mount.target)}</span>` : ''}
@@ -614,7 +614,7 @@ const renderDisksCard = (m) => {
     return `
         <div class="card">
             <h3>Disks</h3>
-            <div class="text-sm text-muted mt-2 mb-4">Every disk this machine sees. Disks marked blank or unused can be taken by the guided setup.</div>
+            <div class="text-sm text-muted mt-2 mb-4">Every disk this machine sees. Disks that are blank or in no array can be taken by the guided setup.</div>
             <div class="overflow-x-auto">
                 <table class="data-table dense">
                     <thead><tr><th>Disk</th><th>Size</th><th>State</th><th>Filesystems</th><th></th></tr></thead>
@@ -677,6 +677,9 @@ const renderConfCard = (m) => {
 /* layout diagram                                                      */
 /* ------------------------------------------------------------------ */
 
+/** A disk of no array with a filesystem that is a branch of a pool: mounted and in use, only without parity. */
+const inPool = (m, d) => d.filesystems.some(f => f.mount && m.branchSet.has(stripSlash(f.mount.target)));
+
 /** What the diagram draws, taken from the current state. */
 const layoutOf = (m) => ({
     // only the pools showing disks of this array: the others are in the Arrays page
@@ -686,14 +689,14 @@ const layoutOf = (m) => ({
     })),
     data: m.data.map(d => ({ name: d.name, path: stripSlash(d.path), total: d.total, free: d.free, missing: !d.ok, removing: d.removing, health: state.health[d.name] })),
     parity: m.parity.flatMap(p => p.files.map((f, i) => ({ name: p.files.length > 1 ? `${p.key} ${i + 1}/${p.files.length}` : p.key, level: p.key, total: f.total, free: f.free, missing: !f.ok, health: state.health[p.key] }))),
-    spare: m.disks.filter(d => ['blank', 'unformatted', 'mounted', 'unmounted'].includes(d.state)).map(d => ({ name: d.path.replace('/dev/', ''), total: d.size, state: d.state }))
+    spare: m.disks.filter(d => ['blank', 'unformatted', 'mounted', 'unmounted'].includes(d.state)).map(d => ({ name: d.path.replace('/dev/', ''), total: d.size, state: d.state === 'mounted' && inPool(m, d) ? 'pooled' : d.state }))
 });
 
 const diskTile = (role, d) => {
     const pct = d.total && d.free != null ? Math.min(100, Math.round((d.total - d.free) * 100 / d.total)) : 0;
     const bad = d.missing || (d.health && !['passed', 'pending'].includes(d.health));
     const note = d.owner ? `in ${d.owner}` : d.missing ? 'not mounted' : d.removing ? 'being removed' : d.isNew ? 'new' : role === 'spare'
-        ? ({ blank: 'blank', unformatted: 'blank', mounted: 'unused', unmounted: 'unused' }[d.state])
+        ? ({ blank: 'blank', unformatted: 'blank', mounted: 'no parity', pooled: 'in a pool', unmounted: 'not mounted' }[d.state])
         : (d.free != null ? `${pct}% full` : '');
     return `
         <div class="tp-tile tp-${role} ${d.isNew ? 'tp-new' : ''} ${bad ? 'tp-bad' : ''}" data-tooltip="${escAttr(`${d.name}${d.path ? ` · ${d.path}` : ''} · ${size(d.total)}${d.free != null ? ` · ${size(d.free)} free` : ''}${d.health && d.health !== 'passed' ? ` · health ${d.health}` : ''}`)}">
@@ -758,7 +761,7 @@ const renderDiagram = (l) => {
         groups.push(`
             <div class="tp-group tp-group-spare">
                 <div class="tp-tiles">${l.spare.map(d => diskTile('spare', d)).join('')}</div>
-                <div class="tp-caption">Not used yet</div>
+                <div class="tp-caption">In no array</div>
             </div>`);
     }
 
@@ -876,6 +879,10 @@ const advise = (m) => {
 
     m.pools.forEach(pool => {
         const policy = pool.options['category.create'] || '';
+        // the pools of other arrays have their say in the page of those arrays; the ones of no array, in the default one
+        const paths = new Set(m.data.map(d => stripSlash(d.path)));
+        const prot = pool.branches.map(b => branchProtection(b, m.inv.array || 'default', paths));
+        if (m.data.length && !prot.some(pr => pr.mine) && (prot.some(pr => pr.ok) || m.array !== 'default')) return;
         // with more pools, say which one
         const which = m.pools.length > 1 ? ` ${pool.mountpoint}` : '';
         if (policy.startsWith('ep'))
@@ -1001,7 +1008,7 @@ const renderOverview = (m) => {
         <div class="card">
             <div class="flex justify-between items-center flex-wrap gap-2 mb-2">
                 <h3>Layout</h3>
-                <div class="tp-legend"><span class="tp-key tp-key-data"></span>data <span class="tp-key tp-key-parity"></span>parity <span class="tp-key tp-key-spare"></span>unused</div>
+                <div class="tp-legend"><span class="tp-key tp-key-data"></span>data <span class="tp-key tp-key-parity"></span>parity <span class="tp-key tp-key-spare"></span>in no array</div>
             </div>
             <div class="text-sm text-muted mb-4">${empty
                 ? 'These are the disks found on this machine. Once set up, this picture shows how they work together.'
