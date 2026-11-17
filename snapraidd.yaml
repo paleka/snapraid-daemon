@@ -749,6 +749,414 @@ paths:
           description: Server error.
           $ref: '#/components/responses/CommandResult'
 
+  /snapraid/v1/storage:
+    get:
+      summary: Get the storage inventory
+      description: >
+        Returns block devices (lsblk), detected filesystems, mounted filesystems
+        with space, /etc/fstab entries, mergerfs pools, available tools and the
+        text of the SnapRAID configuration file. Linux only.
+      responses:
+        '200':
+          description: Inventory retrieved successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+        '4XX':
+          description: Client error.
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/engine_conf:
+    put:
+      summary: Replace the SnapRAID configuration file
+      description: >
+        Requires the net_storage_admin option. Executed synchronously.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - text
+              properties:
+                text:
+                  type: string
+                  description: 'The new content. The previous file is kept as .bak.'
+      responses:
+        '200':
+          description: Done.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, or storage administration disabled (403).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/format:
+    post:
+      summary: Partition and format a whole disk
+      description: >
+        Requires the net_storage_admin option. Runs in background: read the outcome from /storage/job.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - device
+                - fstype
+                - label
+                - purpose
+              properties:
+                device:
+                  type: string
+                  description: 'Whole disk, like /dev/sdb.'
+                fstype:
+                  type: string
+                  description: 'ext4, xfs or btrfs.'
+                label:
+                  type: string
+                  description: 'Filesystem label, up to 12 characters.'
+                purpose:
+                  type: string
+                  description: 'data or parity.'
+                wipe:
+                  type: boolean
+                  description: 'Allow disks that are not blank.'
+      responses:
+        '200':
+          description: Done.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, or storage administration disabled (403).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/mount:
+    post:
+      summary: Mount a filesystem
+      description: >
+        Requires the net_storage_admin option. Executed synchronously.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - source
+                - target
+                - fstype
+              properties:
+                source:
+                  type: string
+                  description: 'UUID=..., LABEL=... or /dev/...'
+                target:
+                  type: string
+                  description: 'Mount point.'
+                fstype:
+                  type: string
+                  description: 'Filesystem type.'
+                options:
+                  type: string
+                  description: 'Mount options.'
+                persist:
+                  type: boolean
+                  description: 'Record the mount in /etc/fstab.'
+      responses:
+        '200':
+          description: Done.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, or storage administration disabled (403).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/unmount:
+    post:
+      summary: Unmount a filesystem
+      description: >
+        Requires the net_storage_admin option. Executed synchronously.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - target
+              properties:
+                target:
+                  type: string
+                  description: 'Mount point.'
+                forget:
+                  type: boolean
+                  description: 'Remove the entry from /etc/fstab.'
+      responses:
+        '200':
+          description: Done.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, or storage administration disabled (403).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/pool:
+    post:
+      summary: Create or change a mergerfs pool
+      description: >
+        Requires the net_storage_admin option. Executed synchronously.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mountpoint
+                - branches
+                - options
+              properties:
+                mountpoint:
+                  type: string
+                  description: 'Pool mount point.'
+                branches:
+                  type: string
+                  description: 'Colon separated branch directories.'
+                options:
+                  type: string
+                  description: 'mergerfs options.'
+                persist:
+                  type: boolean
+                  description: 'Record the pool in /etc/fstab.'
+      responses:
+        '200':
+          description: Done.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, or storage administration disabled (403).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/mkdir:
+    post:
+      summary: Create a directory
+      description: >
+        Requires the net_storage_admin option. Executed synchronously.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - path
+              properties:
+                path:
+                  type: string
+                  description: 'Absolute path.'
+      responses:
+        '200':
+          description: Done.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, or storage administration disabled (403).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/recover:
+    post:
+      summary: Recover an array with replaced disks
+      description: >
+        Schedules probe, fix -d DISK for every listed disk, optionally check -d DISK -a, sync and report. The only sequence allowed while the array is DEGRADED, PREFAIL or FAILING. Requires net_storage_admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - disks
+              properties:
+                disks:
+                  type: string
+                  description: 'Comma separated data disk names and parity levels to rebuild.'
+                check:
+                  type: boolean
+                  description: 'Verify the rebuilt data disks before the sync.'
+                accept:
+                  type: boolean
+                  description: 'Skip the rebuild and only sync, for disks restored by other means.'
+                force_uuid:
+                  type: boolean
+                  description: 'Add -U, --force-uuid: needed when more disks changed UUID than the parity levels.'
+      responses:
+        '200':
+          description: Done, or started for the background operations.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, storage administration not allowed (403), or another operation running (409).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/balance:
+    post:
+      summary: Balance a mergerfs pool
+      description: >
+        Moves files with rsync from the fullest branch to the emptiest, in background. Follow it with /storage/job and run a sync when done. Requires net_storage_admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mountpoint
+                - max_bytes
+                - spread
+              properties:
+                mountpoint:
+                  type: string
+                  description: 'Pool mount point.'
+                max_bytes:
+                  type: string
+                  description: 'Maximum amount of data to move, in bytes.'
+                spread:
+                  type: string
+                  description: 'Stop when the fill levels are within this many percent points (1-50).'
+      responses:
+        '200':
+          description: Done, or started for the background operations.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, storage administration not allowed (403), or another operation running (409).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/duplicates:
+    post:
+      summary: Find files present in more than one branch
+      description: >
+        Scans the branches of the pool in background. The result is in /storage/job. Requires net_storage_admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mountpoint
+              properties:
+                mountpoint:
+                  type: string
+                  description: 'Pool mount point.'
+      responses:
+        '200':
+          description: Done, or started for the background operations.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, storage administration not allowed (403), or another operation running (409).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/job_stop:
+    post:
+      summary: Stop the background operation
+      description: >
+        Asks the running balance or duplicates search to stop at the first safe point. Requires net_storage_admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                {}
+      responses:
+        '200':
+          description: Done, or started for the background operations.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, storage administration not allowed (403), or another operation running (409).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or a required tool is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/job:
+    get:
+      summary: Get the state of the last background operation
+      description: >
+        Kind, target, progress counters, and when finished outcome and results of the last format, balance or duplicates search.
+      responses:
+        '200':
+          description: Retrieved successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+        '4XX':
+          description: Client error.
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/browse:
+    get:
+      summary: List a pool directory with the branches of every entry
+      description: >
+        Tells in which branches each file and directory of the pool is present.
+      parameters:
+        - name: pool
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Pool mount point.
+        - name: path
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Directory inside the pool, starting with /.
+      responses:
+        '200':
+          description: Retrieved successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+        '4XX':
+          description: Client error.
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+
   /metrics:
     get:
       summary: Prometheus metrics

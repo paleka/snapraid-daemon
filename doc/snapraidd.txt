@@ -570,7 +570,28 @@ notify_start - The command used to notify the start of maintenance, heal,
 notify_result - The command used for sending task reports.
 notify_result_level - The severity threshold for sending notifications.
 
----- 6.2.7 net_web_root ----
+---- 6.2.7 net_storage_admin ----
+A security flag that determines whether the storage of the machine can be
+changed via the REST API and the Storage page of the Web UI.
+
+By default (0), the storage endpoints are read-only: they report disks,
+filesystems, mounts, mergerfs pools and the SnapRAID configuration, but
+refuse any change.
+
+When set to 1, a client can partition and format whole disks that are not in
+use, mount and unmount filesystems updating /etc/fstab, create, change and
+balance mergerfs pools, replace the SnapRAID configuration file, and start
+the recovery of an array with replaced disks.
+
+These are root level and potentially destructive operations. For this reason
+the flag alone is not enough when the daemon is reachable from the network:
+the changes are accepted only if the daemon listens exclusively on the
+loopback interface, or `net_auth_credential` is set, or `net_acl` is set.
+Otherwise they are refused and the Web UI reports the reason.
+
+This option is not accessible from the REST API.
+
+---- 6.2.8 net_web_root ----
 Specifies the source of the web dashboard assets. The daemon supports
 both a standard directory and a single compressed ZIP file for asset
 delivery.
@@ -602,7 +623,7 @@ UI until the daemon is restarted. This behavior can be bypassed by using
 the -N, --no-cache option during daemon startup, which is recommended
 for development environments only.
 
----- 6.2.8 net_auth_credential ----
+---- 6.2.9 net_auth_credential ----
 Specifies the credentials required to access the REST API and dashboard
 via HTTP Basic Authentication. If empty or omitted, authentication is
 disabled.
@@ -1352,6 +1373,123 @@ report - Generates a comprehensive summary of the last operations and
     repair status of the array.
 down_idle - Executes a conditional spindown operation of the disks that
     have exceeded the `spindown_idle_minutes` threshold.
+
+
+7.7 Storage
+-----------
+
+These endpoints prepare and maintain the storage the array lives on: disks,
+filesystems, mounts, mergerfs pools and the SnapRAID configuration file.
+They are available only on Linux.
+
+The endpoints changing the system require the `net_storage_admin` option,
+are refused while another storage operation is running, and write the
+previous content of /etc/fstab to /etc/fstab.snapraidd.bak before changing
+it. Paths, labels and options are accepted only if made of letters, digits
+and a small set of punctuation characters, and system directories are
+refused as mount points.
+
+---- 7.7.1 /snapraid/v1/storage ----
+GET returns the storage inventory: the block devices as reported by lsblk,
+the filesystems found on them, the mounted filesystems with their space, the
+entries of /etc/fstab, the mergerfs pools with branches and runtime options,
+the available tools, the text of the SnapRAID configuration file, and the
+state of the last background operation.
+
+---- 7.7.2 /snapraid/v1/storage/engine_conf ----
+PUT replaces the SnapRAID configuration file with `text`. The previous file
+is kept with the .bak extension.
+
+---- 7.7.3 /snapraid/v1/storage/format ----
+POST creates a GPT partition table with a single partition on the whole disk
+`device`, and a `fstype` (ext4, xfs or btrfs) filesystem labeled `label` in
+it. `purpose` is `data` or `parity`: ext4 parity filesystems are created
+with `-m 0 -T largefile4` as suggested by the SnapRAID manual, data ones
+with `-m 0`.
+
+Disks that are mounted, used as swap, or members of RAID, LVM or encrypted
+volumes are always refused. Disks that are not blank are refused unless
+`wipe` is true.
+
+The operation runs in background: the request returns immediately and the
+outcome, with the new partition and filesystem UUID, is read from
+/snapraid/v1/storage/job.
+
+---- 7.7.4 /snapraid/v1/storage/mount ----
+POST mounts `source` (UUID=, LABEL= or a /dev/ path) at `target` with
+`fstype` and `options`. If `persist` is true the mount is recorded in
+/etc/fstab, before any mergerfs pool. The request is refused if the mount
+point is not empty, or if the same filesystem is already mounted elsewhere.
+Before mounting, the empty mount point gets the immutable flag where the
+filesystem supports it: if one day the disk fails to mount, nothing can be
+written in its place on the system disk. The result is verified, because
+with the `nofail` option mount reports success also for a missing device.
+
+---- 7.7.5 /snapraid/v1/storage/unmount ----
+POST unmounts `target`. If `forget` is true its entry is removed from
+/etc/fstab and the immutable flag of the mount point is cleared.
+
+---- 7.7.6 /snapraid/v1/storage/pool ----
+POST creates the mergerfs pool `mountpoint` with the colon separated
+`branches` and `options`. If the pool is already mounted, branches and
+runtime options are changed on the fly through its control file, without
+unmounting. If `persist` is true the pool is recorded in /etc/fstab. A
+branch is refused if it is listed twice, if it overlaps the pool mount
+point, or if it holds a SnapRAID parity file: a parity disk inside a pool
+gets filled with data.
+
+---- 7.7.7 /snapraid/v1/storage/mkdir ----
+POST creates the directory `path`.
+
+---- 7.7.8 /snapraid/v1/storage/recover ----
+POST schedules the recovery of an array with replaced or changed disks,
+following the recovering procedure of the SnapRAID manual: `probe`, `fix -d
+NAME` for every disk in the comma separated list `disks`, `check -d NAME -a`
+for the data disks if `check` is true, `sync` and `report`.
+
+If `accept` is true nothing is rebuilt and only the `sync` runs: it is meant
+for disks whose content was cloned or restored by other means, where only
+the filesystem UUID is new.
+
+SnapRAID accepts by itself as many disks with a changed UUID as the parity
+levels. To go beyond, set `force_uuid` to true to add the -U, --force-uuid
+option to every command.
+
+This is the only sequence allowed to run `fix`, `check` and `sync` while the
+array is DEGRADED, PREFAIL or FAILING, because those are the states a
+recovery starts from. Every other task remains suspended.
+
+---- 7.7.9 /snapraid/v1/storage/balance ----
+POST starts in background the balancing of the pool `mountpoint`: files are
+moved with rsync from the fullest branch to the emptiest, like
+mergerfs.balance does, until the fill levels are within `spread` percent
+points or `max_bytes` were moved.
+
+Hard linked files, files modified in the last five minutes, SnapRAID content
+files, and files that already exist with the same path on the destination
+are left in place. The `minfreespace` of the pool is respected.
+
+For SnapRAID a moved file is removed from one disk and added to another: run
+a `sync` after balancing. The request is refused while a SnapRAID task is
+running.
+
+---- 7.7.10 /snapraid/v1/storage/duplicates ----
+POST starts in background the search of files present with the same path in
+more than one branch of the pool `mountpoint`. The first 500 are listed in
+the `result` of the job, with size and modification time of every copy.
+
+---- 7.7.11 /snapraid/v1/storage/job ----
+GET returns the state of the last background operation: kind, target,
+progress counters, and when finished its outcome and results.
+
+---- 7.7.12 /snapraid/v1/storage/job_stop ----
+POST asks the running balance or duplicates search to stop at the first safe
+point. A format cannot be interrupted.
+
+---- 7.7.13 /snapraid/v1/storage/browse ----
+GET lists the directory `path` of the pool `pool`, both passed in the query
+string, telling for every entry in which branches it is present, and whether
+a file exists in more than one.
 
 
 8 MULTIPLE ARRAYS IN LINUX SYSTEMD

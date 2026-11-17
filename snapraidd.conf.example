@@ -205,6 +205,30 @@ net_allowed_origin = self
 # It requires a manual edit and a configuration reload (SIGHUP) to apply.
 net_config_full_access = 0
 
+# The net_storage_admin option controls whether the storage of the machine
+# can be changed from the REST API and the Storage page of the dashboard.
+#
+# When enabled (1), a client can:
+#   - partition and format whole disks that are not in use
+#   - mount and unmount filesystems, and edit their /etc/fstab entries
+#   - create and change mergerfs pools
+#   - replace the SnapRAID configuration file (the previous one is kept as .bak)
+#   - start the rebuild of a replaced disk while the array is DEGRADED
+#
+#   - balance a mergerfs pool moving files between its disks
+#
+# These are root level, potentially destructive operations. For this reason
+# the option alone is not enough when the daemon is reachable from the
+# network: the changes are accepted only if the daemon listens exclusively
+# on the loopback interface (the default net_port), or net_auth_credential
+# is set, or net_acl is set. Otherwise they are refused.
+#
+# When disabled (0), the Storage page is read-only.
+#
+# This option is not accessible from the REST API.
+# It requires a manual edit and a configuration reload (SIGHUP) to apply.
+net_storage_admin = 0
+
 # The net_web_root specifies the local path where the web dashboard assets are
 # located.
 #
