@@ -37,6 +37,7 @@ COMMANDER_DIST = \
 	favicon.ico \
 	css/style.css \
 	js/api.js \
+	js/storage.js \
 	js/app.js \
 	js/init.js \
 	js/ui.js \
@@ -224,6 +225,7 @@ EXTRA_DIST = \
 	commander/js/init.js \
 	commander/js/ui.js \
 	commander/js/api.js \
+	commander/js/storage.js \
 	commander/js/app.js \
 	commander/js/utils.js \
 	brutale/index.html \
@@ -238,6 +240,7 @@ EXTRA_DIST = \
 	brutale/js/init.js \
 	brutale/js/ui.js \
 	brutale/js/api.js \
+	brutale/js/storage.js \
 	brutale/js/app.js \
 	brutale/js/utils.js \
 	brutale/css/fonts/BebasNeue-Regular.woff2 \

@@ -2,6 +2,7 @@
 // Copyright (C) 2025 Andrea Mazzoleni
 
 import { API } from './api.js';
+import { loadStorage, initStorage } from './storage.js';
 import { Icons, showToast, showConfirm, showConfirmDown, showConfirmDownThreshold, showModal, formatElapsedTime, formatDiskSize, formatSeconds, formatAttr } from './utils.js';
 import { renderDashboard, renderDisks, renderTasks, renderDifferences, renderRecovery, renderSettings, renderTempSparkline, renderScrubHistory, renderHealthBanner, escHtml } from './ui.js';
 
@@ -105,6 +106,8 @@ const app = {
             }
             tooltip.classList.remove('active');
         });
+
+        initStorage();
 
         // Navigation
         window.addEventListener('hashchange', app.handleRoute);
@@ -352,6 +355,7 @@ const app = {
             case '#/tasks': return 'Tasks';
             case '#/diff': return 'Differences';
             case '#/recovery': return 'Recovery';
+            case '#/storage': return 'Storage';
             case '#/settings': return 'Settings';
             default: return 'Page Not Found';
         }
@@ -436,6 +440,19 @@ const app = {
                     app.updatePageTitle('Recovery');
                     actions.innerHTML = '';
                     await app.loadRecovery();
+                    break;
+                case '#/storage':
+                    app.updatePageTitle('Storage');
+                    actions.innerHTML = `
+                        <button class="btn btn-secondary" data-tooltip="Read again disks, mounts and configuration" data-st="reload">Reload</button>
+                        <button class="btn btn-primary" data-tooltip="Prepare disks, pool and SnapRAID configuration step by step" data-st="wizard">Guided setup</button>
+                    `;
+                    try {
+                        await loadStorage(view);
+                        app.setConnection(true);
+                    } catch (e) {
+                        throw e;
+                    }
                     break;
                 case '#/settings':
                     app.updatePageTitle('Settings');
