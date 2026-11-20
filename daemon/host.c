@@ -1043,15 +1043,52 @@ static void* copy_thread(void* arg)
 	return 0;
 }
 
+static int data_area(const char* path)
+{
+	return strncmp(path, "/mnt/", 5) == 0 || strncmp(path, "/srv/", 5) == 0 || strncmp(path, "/media/", 7) == 0;
+}
+
+/**
+ * The folder holding a path, with every link resolved, must still be in the data area:
+ * a link inside a pool pointing to /etc does not make /etc reachable.
+ * The last component is not resolved: a link is renamed or deleted as a link.
+ */
+static int real_inside(const char* path)
+{
+	char parent[PATH_MAX];
+	char real[PATH_MAX];
+
+	sncpy(parent, sizeof(parent), path);
+	char* slash = strrchr(parent, '/');
+	if (!slash)
+		return 0;
+	if (slash == parent)
+		slash[1] = 0;
+	else
+		*slash = 0;
+
+	priv_enter();
+	char* r = realpath(parent, real);
+	priv_leave();
+	if (!r)
+		return errno == ENOENT; /* a folder to be created: its string was checked */
+
+	return data_area(real) && !system_path(real);
+}
+
 /** A tree that can be read or written by the jobs: a mount of a disk or a pool, or a folder inside one. */
 static int valid_tree(const char* path, char* msg, size_t msg_size)
 {
 	if (!valid_user_path(path))
 		return hfail(msg, msg_size, 400, "Invalid folder '%s'", path);
+	if (path[strlen(path) - 1] == '/')
+		return hfail(msg, msg_size, 400, "Invalid folder '%s': no final slash", path);
 	if (system_path(path) || path_inside(path, "/etc") || path_inside(path, "/boot"))
 		return hfail(msg, msg_size, 400, "%s is a system folder", path);
-	if (strncmp(path, "/mnt/", 5) != 0 && strncmp(path, "/srv/", 5) != 0 && strncmp(path, "/media/", 7) != 0)
+	if (!data_area(path))
 		return hfail(msg, msg_size, 400, "Only folders under /mnt, /srv and /media are handled");
+	if (!real_inside(path))
+		return hfail(msg, msg_size, 400, "%s goes through a link leading out of /mnt, /srv and /media", path);
 	return 0;
 }
 
@@ -3043,8 +3080,11 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 			options_from_args(args, SHARE_OPTIONS, line, sizeof(line));
 			const char* path = host_arg(args, "path");
 			struct stat st;
+			char real[PATH_MAX];
 			if (!path || stat(path, &st) != 0 || !S_ISDIR(st.st_mode))
 				return hfail(msg, msg_size, 404, "The folder %s does not exist", path ? path : "");
+			if (realpath(path, real) == 0 || !data_area(real) || system_path(real))
+				return hfail(msg, msg_size, 400, "The folder %s is not under /mnt, /srv or /media once its links are followed", path);
 		} else {
 			line[0] = 0;
 		}
@@ -3322,6 +3362,22 @@ int host_selftest(void)
 	HCHECK(valid_tree("/mnt/a/../../etc", msg, sizeof(msg)) != 0);
 	HCHECK(valid_tree("/mnt/a/..", msg, sizeof(msg)) != 0);
 	HCHECK(valid_tree("/mnt/a/$(x)", msg, sizeof(msg)) != 0);
+	HCHECK(valid_tree("/mnt/storage/Photos/", msg, sizeof(msg)) != 0);
+	{
+		/* a link inside the data area pointing out of it */
+		char dir[] = "/tmp/hosttestXXXXXX";
+		if (mkdtemp(dir)) {
+			char link[PATH_MAX];
+			snprintf(link, sizeof(link), "%s/out", dir);
+			HCHECK(symlink("/etc", link) == 0);
+			HCHECK(real_inside("/etc/passwd") == 0);
+			snprintf(link, sizeof(link), "%s/out/passwd", dir);
+			HCHECK(real_inside(link) == 0);
+			snprintf(link, sizeof(link), "%s/out", dir);
+			unlink(link);
+			rmdir(dir);
+		}
+	}
 
 	/* redaction */
 	ss_t out;
