@@ -60,6 +60,15 @@ export const HostAPI = {
     keepDelete: (name) => hostCall('/keep_delete', 'POST', { name }),
     keepRun: (name) => hostCall('/keep_run', 'POST', { name }),
     wol: () => hostCall('/wol', 'POST', {}),
+    runs: (array, limit = 60) => hostCall(`/runs?limit=${limit}${array ? `&array=${encodeURIComponent(array)}` : ''}`),
+    upsDetect: () => hostCall('/ups_detect'),
+    alerts: () => hostCall('/alerts'),
+    alertsSave: (channels) => hostCall('/alerts_save', 'POST', { channels }),
+    usbMount: (device) => hostCall('/usb_mount', 'POST', { device }),
+    usbEject: (device) => hostCall('/usb_eject', 'POST', { device }),
+    remoteSave: (r) => hostCall('/remote_save', 'POST', r),
+    remoteDelete: (name) => hostCall('/remote_delete', 'POST', { name }),
+    remoteTest: (name) => hostCall('/remote_test', 'POST', { name }),
     restore: (path, text) => hostCall('/restore', 'POST', { path, text })
 };
 
@@ -208,7 +217,7 @@ const healNow = async () => {
 const followJob = async (title, opts = {}) => {
     const dlg = dialog({ title, large: false, body: '<div class="loading-spinner"></div>', buttons: [{ label: 'Stop', cls: 'btn-danger', onClick: () => StorageAPI.jobStop().catch(e => showToast(e.message, 'error')) }] });
     const draw = (j) => {
-        const pct = (j.kind === 'wipe' || j.kind === 'surface') && S.cache.wipeSize ? Math.min(100, Math.round((j.bytes || 0) * 100 / S.cache.wipeSize)) : null;
+        const pct = (j.kind === 'wipe' || j.kind === 'surface' || j.kind === 'burnin') && S.cache.wipeSize ? Math.min(100, Math.round((j.bytes || 0) * 100 / (S.cache.wipeSize * (j.kind === 'burnin' ? 2 : 1)))) : null;
         dlg.setBody(`
             <div class="sp-job">
                 <div class="font-bold">${esc(j.running ? 'Working…' : j.success ? 'Done' : 'Not finished')}</div>
@@ -785,6 +794,7 @@ const diskEntries = (model, daemonDisks, others = []) => {
             node: pd.path, name: hit ? `${hit.array ? `${hit.array}: ` : ''}${hit.disk.name}` : pd.name, role: hit ? hit.role : pd.state, array: hit?.array || '',
             model: pd.model || hit?.dev?.model || '', serial: pd.serial || hit?.dev?.serial || '', size: pd.size,
             transport: (pd.transport || hit?.dev?.interface || '').toUpperCase(), rotational: pd.rotational, removable: pd.removable,
+            fs: hit ? [] : (pd.filesystems || []),
             health: hit ? hit.disk.health : null, dev: hit?.dev || null, disk: hit?.disk || null,
             mount: hit?.role === 'data' && !hit.array ? (model.data.find(x => x.name === hit.disk.name)?.mount?.target || null) : (pd.filesystems.find(f => f.mount)?.mount?.target || null)
         });
@@ -899,7 +909,7 @@ const loadDrives = async () => {
                         ${io && io.read_kb.length >= 3 && max > 1 ? `<div class="sp-io" data-tooltip="Read and written in the last hours, every 5 minutes"><span class="text-xs text-muted">read</span>${bar(io.read_kb, max, 'sp-spark-read')}<span class="text-xs text-muted">write</span>${bar(io.write_kb, max, 'sp-spark-write')}</div>` : ''}
                         <div class="sp-disk-actions">
                             ${e.dev && !e.array ? `<button class="btn btn-sm btn-secondary" data-action="smart-details" data-node="${escAttr(e.node)}">Health details</button>` : ''}
-                            ${e.dev || ['blank', 'mounted', 'unmounted'].includes(e.role) ? `<button class="btn btn-sm btn-secondary" data-sp="disk-test" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}">Test…</button>` : ''}
+                            ${e.dev || ['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) ? `<button class="btn btn-sm btn-secondary" data-sp="disk-test" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}">Test…</button>` : ''}
                             ${(e.role === 'data' || e.role === 'parity') && !e.array ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="replace" data-st-data="${escAttr(JSON.stringify({ kind: e.role, name: e.name }))}">Replace…</button>` : ''}
                             ${['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) && !(e.mount && isCache(e.mount)) ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="" data-st-tab="array">Use it…</button>` : ''}
                             ${e.mount && e.role !== 'parity' ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-busy" data-path="${escAttr(e.mount)}" data-tooltip="The programs with files open on it">What uses it?</button>` : ''}
@@ -907,6 +917,8 @@ const loadDrives = async () => {
                             ${e.role === 'data' && !e.array && e.mount ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-copy" data-path="${escAttr(e.mount)}" data-dir="1" data-tooltip="Copy everything on it to another disk">Copy its files…</button>` : ''}
                             ${e.mount && !e.array && poolOf(e.mount)?.branches.length > 1 && !isCache(e.mount) ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-empty" data-path="${escAttr(e.mount)}" data-name="${escAttr(e.name)}" data-pool="${escAttr(poolOf(e.mount).mountpoint)}" data-tooltip="Move its files to the other disks of the pool, for example before taking it out">Empty it…</button>` : ''}
                             ${e.role === 'parity' && !e.array ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="storage" data-st-action="parity-move" data-st-data="${escAttr(JSON.stringify({ name: e.disk?.name || '' }))}" data-tooltip="Copy the protection to a larger disk, to allow larger disks for files">Move to a larger disk…</button>` : ''}
+                            ${usbOpen(e) ? `<button class="btn btn-sm btn-secondary" data-sp="usb-mount" data-node="${escAttr(usbOpen(e))}" data-name="${escAttr(e.name)}" data-tooltip="Make its files reachable until you eject it. Nothing is changed on the disk.">Open</button>` : ''}
+                            ${usbEject(e, (m) => !!poolOf(m) || isCache(m)) ? `<button class="btn btn-sm btn-secondary" data-sp="usb-eject" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}" data-tooltip="Finish writing, release it and turn it off, so it can be unplugged safely">Eject</button>` : ''}
                             ${['blank', 'unmounted', 'unformatted', 'other'].includes(e.role) && !e.dev ? `<button class="btn btn-sm btn-danger sp-adv-only" data-sp="disk-wipe" data-node="${escAttr(e.node)}" data-size="${e.size || 0}">Erase…</button>` : ''}
                         </div>
                     </div>`;
@@ -967,21 +979,75 @@ const loadDrives = async () => {
     }
 };
 
+/** A disk that comes and goes: USB, or one the system says can be removed. Never one of an array or of a pool. */
+const isPlugged = (e) => !e.dev && !e.array && !e.missing && (e.transport === 'USB' || e.removable) && !['system', 'data', 'parity', 'foreign'].includes(e.role);
+
+/** The filesystem of a plugged disk that can be opened, if it's not open yet. */
+const usbOpen = (e) => {
+    if (!isPlugged(e) || e.mount) return '';
+    const f = (e.fs || []).find(x => !x.mount && !x.system && x.fstype && x.fstype !== 'swap');
+    return f ? f.path : '';
+};
+
+/** A plugged disk that can be ejected. inPool tells if a mount is a branch of a pool. */
+const usbEject = (e, inPool) => isPlugged(e) && (e.mount || (e.fs || []).some(f => f.mount)) && !(e.fs || []).some(f => f.mount && inPool(f.mount.target));
+
+const usbMount = async (node, name) => {
+    const r = await act(() => HostAPI.usbMount(node));
+    if (!r) return;
+    dialog({
+        title: `${name} is open`, large: false,
+        body: `
+            <p class="text-sm">Its files are in the folder <span class="font-mono">${esc(r.target)}</span> of the server, until you press <b>Eject</b> or the server restarts.</p>
+            <div class="st-effects st-effects-safe mt-4"><div class="st-effects-title">What does not change</div><ul>
+                <li>Nothing is written on the disk by opening it, and it is not added to your arrays or to your pool.</li>
+                <li>It is not opened by itself at the next start: plug it in and press Open again.</li></ul></div>
+            <p class="text-sm mt-4">To keep a copy of its files on the server, use <b>Copy its files</b>. To copy to it every time it is plugged in, make a backup to it in Backups.</p>`,
+        buttons: [
+            { label: 'Close', onClick: (x) => { x.close(); refresh(); } },
+            { label: 'Copy its files…', cls: 'btn-primary', onClick: (x) => { x.close(); fileCopy(r.target, true); } }
+        ]
+    });
+};
+
+const usbEjectNow = async (node, name) => {
+    const sure = await confirmDo({
+        title: `Eject ${name}`,
+        intro: 'Everything still being written is finished first.',
+        effects: ['The disk is released and, where it can be, turned off: then you can unplug it.', 'Shares and backups that use it stop working until it is plugged in again.'],
+        safe: ['Nothing on the disk is deleted.', 'If a program still has a file open on it, nothing happens and you are told.'],
+        label: 'Eject'
+    });
+    if (!sure) return;
+    const r = await act(() => HostAPI.usbEject(node));
+    if (r) { showToast(r.note || 'It can be unplugged now', 'success'); refresh(); }
+};
+
 const baySave = async (doc) => {
     const r = await act(() => HostAPI.settings({ 'doc.bays': JSON.stringify(doc) }));
     if (r) refresh();
 };
 
 const diskTest = (node, name) => {
-    const canSmart = !!(S.cache.drives || []).find(x => x.node === node)?.dev;
+    const e = (S.cache.drives || []).find(x => x.node === node) || {};
+    const canSmart = !!e.dev;
+    // writing is only for a disk with nothing to lose: new, or in no use
+    const canWrite = !e.dev && !e.mount && ['blank', 'unmounted', 'unformatted'].includes(e.role);
+    const size = Number(e.size) || 0;
+    const first = canSmart ? 'short' : canWrite && e.role === 'blank' ? 'write' : 'surface';
+    const choice = (value, html, cls = '') => `<label class="sp-choice ${cls}"><input type="radio" name="sp-tk" value="${value}" ${value === first ? 'checked' : ''}><span>${html}</span></label>`;
     dialog({
         title: `Test ${name}`, large: false,
         body: advScope('disk-test', `
-            <p class="text-sm">${canSmart ? 'The disk tests itself while it keeps working. The result shows here when it\'s done.' : 'This disk is in no array, so its self-tests are not followed here. The server can read it whole instead.'}</p>
+            <p class="text-sm">${canSmart ? 'The disk tests itself while it keeps working. The result shows here when it\'s done.' : canWrite ? 'This disk holds nothing you use. Before trusting it with files, the server can try every block of it.' : 'This disk is in no array, so its self-tests are not followed here. The server can read it whole instead.'}</p>
             <div class="sp-choices mt-4">
-                <label class="sp-choice ${canSmart ? '' : 'hidden'}"><input type="radio" name="sp-tk" value="short" ${canSmart ? 'checked' : ''}><span><b>Short</b> — a few minutes. Finds most problems.</span></label>
-                <label class="sp-choice ${canSmart ? '' : 'hidden'}"><input type="radio" name="sp-tk" value="long"><span><b>Long</b> — reads the whole disk, hours for big disks. Finds the rest.</span></label>
-                <label class="sp-choice ${canSmart ? 'sp-adv-only' : ''}"><input type="radio" name="sp-tk" value="surface" ${canSmart ? '' : 'checked'}><span><b>Read every block</b> — the server itself reads the disk from the first to the last block and counts what cannot be read. For a new disk before you trust it, or one whose self-test is not available. Nothing is written. You can follow and stop it here.</span></label>
+                ${canSmart ? choice('short', '<b>Short</b> — a few minutes. Finds most problems.') : ''}
+                ${canSmart ? choice('long', '<b>Long</b> — reads the whole disk, hours for big disks. Finds the rest.') : ''}
+                ${canWrite ? choice('write', `<b>Write and read back every block</b> — the surest test of a new disk: the server writes a pattern on all of it, then reads it back and compares. About ${esc(P.humanSpan(size * 2 / 150e6))}. <b>Everything on the disk is erased.</b>`) : ''}
+                ${choice('surface', '<b>Read every block</b> — the server reads the disk from the first to the last block and counts what cannot be read. Nothing is written. You can follow and stop it here.', canSmart ? 'sp-adv-only' : '')}
+            </div>
+            <div id="sp-tk-confirm" class="${first === 'write' ? '' : 'hidden'} mt-4">
+                ${field('Type the name of the disk to confirm', `<input class="form-control font-mono" id="sp-tk-name" placeholder="${escAttr(node)}">`, 'Only for the test that writes: what is on the disk now is lost.')}
             </div>
             ${canSmart ? `<div class="mt-4">${advSwitch('disk-test', 'More tests')}</div>` : ''}`),
         buttons: [
@@ -989,10 +1055,12 @@ const diskTest = (node, name) => {
             {
                 label: 'Start the test', cls: 'btn-primary', onClick: async (x) => {
                     const kind = x.body.querySelector('input[name="sp-tk"]:checked').value;
+                    if (kind === 'write' && val('sp-tk-name').trim() !== node) return showToast(`Type ${node} to confirm`, 'warning');
                     x.close();
-                    if (kind === 'surface') {
-                        S.cache.wipeSize = Number((S.cache.drives || []).find(d => d.node === node)?.size) || 0;
-                        if (await act(() => HostAPI.surface(node))) followJob(`Reading every block of ${name}`);
+                    if (kind === 'surface' || kind === 'write') {
+                        S.cache.wipeSize = size;
+                        const ok = kind === 'write' ? await act(() => HostAPI.wipe(node, 'test')) : await act(() => HostAPI.surface(node));
+                        if (ok) followJob(kind === 'write' ? `Writing and reading back ${name}` : `Reading every block of ${name}`);
                         return;
                     }
                     if (await act(() => HostAPI.smartTest(node, kind), `${kind === 'short' ? 'Short' : 'Long'} test started on ${name}`)) setTimeout(refresh, 1500);
@@ -1000,6 +1068,9 @@ const diskTest = (node, name) => {
             }
         ]
     });
+    document.querySelectorAll('input[name="sp-tk"]').forEach(r => r.addEventListener('change', () => {
+        document.getElementById('sp-tk-confirm')?.classList.toggle('hidden', document.querySelector('input[name="sp-tk"]:checked')?.value !== 'write');
+    }));
 };
 
 const diskPower = (id) => {
@@ -1247,14 +1318,17 @@ const loadProtection = async () => {
     const tempLimit = P.confTempLimit(conf);
     const k = d.storage?.model?.parity?.length || 0;
     const ratio = Number(d.host?.settings?.sync_ratio) || 0;
+    const onChanges = Number(d.host?.settings?.sync_changes) || 0;
+    const onChangesMin = Number(d.host?.settings?.sync_changes_minutes) || 60;
+    const rec = await HostAPI.runs(API.array(), 40).catch(() => null);
     S.cache.protConf = conf;
     S.cache.protTemp = tempLimit;
     const pct = Number(c.scrub_percentage) || 0;
     const runsPerWeek = form.mode === 'daily' ? 7 : form.mode === 'days' ? form.days.length : 7;
     const fullEvery = pct > 0 && runsPerWeek ? Math.ceil(100 / pct / runsPerWeek * 7) : 0;
 
-    const runs = (d.tasks?.history || []).filter(t => (t.command === 'sync' || t.command === 'scrub') && t.status !== 'canceled').slice(0, 24);
-    const maxDur = Math.max(1, ...runs.map(P.taskSeconds));
+    const recRuns = (rec?.runs || []).slice(0, 24);
+    const recMax = Math.max(1, ...recRuns.map(r => r.seconds || 0));
 
     header(button('Protect now', 'go', { act: 'protect' }, 'btn-primary'));
 
@@ -1301,6 +1375,13 @@ const loadProtection = async () => {
                 <div class="sp-form-row ${form.mode === 'custom' ? '' : 'hidden'}" id="sp-pr-custom">
                     ${field('Times', `<input class="form-control" id="sp-pr-text" value="${escAttr(form.text)}">`, 'Like “02:00, Sun 05:00”: every day at 2, and on Sundays at 5 too.')}
                 </div>
+                <div class="sp-adv-only">
+                    <div class="sp-form-row">
+                        ${toggle('sp-pr-chg', onChanges > 0, 'Also update as soon as at least', 'The server looks for changes now and then. When there are enough, it updates the protection without waiting for the time above. The safety check below applies as always. Every look wakes the disks up: with disks that sleep, look rarely.')}
+                        <input class="form-control sp-num" type="number" min="1" max="1000000" id="sp-pr-chg-v" value="${onChanges || 500}"> <span>files were added, changed or deleted, looking every</span>
+                        <select class="form-control sp-w-auto" id="sp-pr-chg-m">${[15, 30, 60, 120, 240, 480].concat([15, 30, 60, 120, 240, 480].includes(onChangesMin) ? [] : [onChangesMin]).map(m => `<option value="${m}" ${m === onChangesMin ? 'selected' : ''}>${esc(P.humanSpan(m * 60))}</option>`).join('')}</select>
+                    </div>
+                </div>
                 <div class="sp-form-row">
                     ${toggle('sp-pr-stop', !!stopAt, 'Stop by a set time', 'If it’s still working then, it stops and continues the next time. Nothing is lost.')}
                     <input class="form-control sp-w-auto" type="time" id="sp-pr-stop-time" value="${esc(stopAt || '07:00')}">
@@ -1338,16 +1419,16 @@ const loadProtection = async () => {
                 <div class="sp-form-foot">${button('Save', 'prot-save', {}, 'btn-primary')}<span class="sp-saved" id="sp-pr-saved"></span></div>
             </div>`), advSwitch('protection'))}
 
-        ${section('Past runs', 'Each bar is one run: the longer, the more there was to do.', runs.length ? `
+        ${section('Past runs', `Every update and every check, with the damage it found and what was repaired. ${esc(P.runsSummary(rec, nowIso))}`, recRuns.length ? `
             <div class="sp-runs">
-                ${runs.map(t => {
-                    const w = P.taskWords(t);
-                    const secs = P.taskSeconds(t);
-                    return `<div class="sp-run">
-                        <span class="sp-run-when">${esc(P.ago(t.finished_at || t.started_at, nowIso))}</span>
-                        <span class="sp-run-what">${esc(w.title)}</span>
-                        <span class="sp-run-bar"><span class="sp-run-fill sp-run-${t.command} ${w.ok ? '' : 'sp-run-bad'}" data-width="${Math.max(1, Math.round(secs * 100 / maxDur))}"></span></span>
-                        <span class="sp-run-dur">${esc(P.humanSpan(secs))}${t.speed_mbs ? ` · ${t.speed_mbs} MB/s` : ''}</span>
+                ${recRuns.map(r => {
+                    const w = P.runWords(r);
+                    return `<div class="sp-run sp-run-rec">
+                        <span class="sp-run-when">${esc(P.ago(r.finished_at, nowIso))}</span>
+                        <span class="sp-run-what"><span class="sp-dot sp-dot-${w.level}"></span>${esc(w.title)}</span>
+                        <span class="sp-run-bar"><span class="sp-run-fill sp-run-${r.command} ${w.level === 'ok' ? '' : 'sp-run-bad'}" data-width="${Math.max(1, Math.round((r.seconds || 0) * 100 / recMax))}"></span></span>
+                        <span class="sp-run-dur">${esc(P.humanSpan(r.seconds || 0))}</span>
+                        <span class="sp-run-detail ${w.level === 'bad' ? 'text-red' : ''}">${esc(w.detail)}</span>
                     </div>`;
                 }).join('')}
             </div>` : empty('No run yet.'), '<a class="sp-link" href="#/tasks">Every detail</a>')}
@@ -1393,7 +1474,9 @@ const protSave = async () => {
         await API.updateConfig(patch);
         await HostAPI.settings({
             maintenance_stop_at: checked('sp-pr-stop') ? (val('sp-pr-stop-time') || '07:00') : '',
-            sync_ratio: checked('sp-pr-ratio') ? String(Math.max(1, Number(val('sp-pr-ratio-v')) || 2)) : '0'
+            sync_ratio: checked('sp-pr-ratio') ? String(Math.max(1, Number(val('sp-pr-ratio-v')) || 2)) : '0',
+            sync_changes: checked('sp-pr-chg') ? String(Math.max(1, Number(val('sp-pr-chg-v')) || 500)) : '',
+            sync_changes_minutes: checked('sp-pr-chg') ? val('sp-pr-chg-m') : ''
         });
 
         // the temperature limit is an option of SnapRAID itself
@@ -1579,6 +1662,9 @@ const loadBackups = async () => {
     const backups = host.backups || [];
     S.cache.backupInv = d.inv;
     S.cache.backupModel = d.storage?.model;
+    const remotes = host.remotes || [];
+    S.cache.remotes = remotes;
+    S.cache.hostTools = host.tools || {};
 
     header(button('Make a backup', 'backup-edit', {}, 'btn-primary'));
 
@@ -1591,7 +1677,7 @@ const loadBackups = async () => {
                     const lastOk = b.last_status === 0 || b.last_status === 207;
                     return `
                     <div class="sp-card">
-                        <div class="sp-card-head">${icon('backup')}<div><b>${esc(b.name)}</b><div class="text-xs text-muted"><span class="font-mono">${esc(b.source)}</span> → ${esc(where)}</div></div>
+                        <div class="sp-card-head">${icon('backup')}<div><b>${esc(b.name)}</b><div class="text-xs text-muted"><span class="font-mono">${esc(sourceWords(b.source, remotes))}</span> → ${esc(where)}</div></div>
                             ${b.dest_uuid ? `<span class="sp-pill sp-pill-${b.plugged ? 'ok' : 'tip'}">${b.plugged ? 'disk connected' : 'disk away'}</span>` : ''}</div>
                         <ul class="sp-card-facts">
                             <li>${[b.when ? P.describeSchedule(b.when) : '', b.plug ? 'when its disk is plugged in' : ''].filter(Boolean).join(', and ') || 'only when you press Run now'}</li>
@@ -1606,12 +1692,133 @@ const loadBackups = async () => {
                     </div>`;
                 }).join('')}
             </div>` : empty('No backup yet. Plug in a USB disk, then make a backup of your photos and documents.', button('Make a backup', 'backup-edit', {}, 'btn-primary')))}
+
+        ${section('Other computers', 'Folders shared by the other computers of the house — a PC, a Mac, an old NAS — that a backup can copy here. They are only read, never changed.', remotes.length ? `
+            <div class="sp-cards">
+                ${remotes.map(r => `
+                    <div class="sp-card">
+                        <div class="sp-card-head">${icon('share')}<div><b>${esc(r.name)}</b><div class="text-xs text-muted font-mono">${esc(remoteWhere(r))}</div></div>
+                            <span class="sp-pill sp-pill-tip">${r.kind === 'nfs' ? 'Linux (NFS)' : 'Windows, Mac, NAS'}</span></div>
+                        <ul class="sp-card-facts">
+                            <li>${r.user ? `As the user <b>${esc(r.user)}</b>, with its password kept on the server for the administrator only` : r.kind === 'nfs' ? 'Read as this machine is allowed by the other one' : 'As a guest, without a password'}</li>
+                            <li>${(backups.filter(b => (b.source || '').startsWith(r.target)).map(b => esc(b.name)).join(', ') || 'No backup copies it yet')}</li>
+                        </ul>
+                        <div class="sp-card-actions">
+                            ${button('Try it', 'remote-test', { name: r.name })}
+                            ${button('Change', 'remote-edit', { name: r.name })}
+                            ${button('Remove', 'remote-delete', { name: r.name }, 'btn-danger')}
+                        </div>
+                    </div>`).join('')}
+            </div>` : empty('None yet. Add one to copy its folders onto this server.'), button('Add a computer…', 'remote-edit', {}))}
     `);
 };
 
-const backupEdit = async (name) => {
+const remoteWhere = (r) => r.kind === 'nfs' ? `${r.host}:${r.share}` : `\\\\${r.host}\\${r.share}`;
+
+/** A source of a backup as people know it: the folder of another computer by its name. */
+const sourceWords = (src, remotes) => {
+    const r = (remotes || []).find(x => src === x.target || (src || '').startsWith(`${x.target}/`));
+    return r ? `${r.name}: ${remoteWhere(r)}${src.slice(r.target.length)}` : src;
+};
+
+const remoteEdit = (name) => {
+    const r = (S.cache.remotes || []).find(x => x.name === name) || { kind: 'smb' };
+    const tools = S.cache.hostTools || {};
+    const missing = (kind) => kind === 'nfs' ? (tools['mount.nfs'] ? '' : 'This machine needs the package <span class="font-mono">nfs-common</span> (<span class="font-mono">nfs-utils</span> on Fedora) to read NFS folders.')
+        : (tools['mount.cifs'] ? '' : 'This machine needs the package <span class="font-mono">cifs-utils</span> to read Windows and Mac folders.');
+    const dlg = dialog({
+        title: name ? `Change ${name}` : 'Add another computer', large: false,
+        body: advScope('remote', `
+            <div class="sp-choices">
+                <label class="sp-choice"><input type="radio" name="sp-rm-kind" value="smb" ${r.kind !== 'nfs' ? 'checked' : ''}><span><b>Windows, Mac or a NAS</b> — a shared folder you open from the network.</span></label>
+                <label class="sp-choice"><input type="radio" name="sp-rm-kind" value="nfs" ${r.kind === 'nfs' ? 'checked' : ''}><span><b>Linux (NFS)</b> — a folder exported by another Linux machine.</span></label>
+            </div>
+            <div class="sp-field-help text-amber" id="sp-rm-missing"></div>
+            ${field('Its name or address', `<input class="form-control font-mono" id="sp-rm-host" value="${escAttr(r.host || '')}" placeholder="my-pc.local or 192.168.1.20">`)}
+            ${field('Shared folder', `<input class="form-control font-mono" id="sp-rm-share" value="${escAttr(r.share || '')}" placeholder="Photos">`, '<span id="sp-rm-share-help"></span>')}
+            <div id="sp-rm-login">
+                ${field('User', `<input class="form-control" id="sp-rm-user" value="${escAttr(r.user || '')}" autocomplete="off">`, 'The one you use to open the folder from another computer. Empty for a folder open to guests.')}
+                ${field('Password', `<input class="form-control" type="password" id="sp-rm-pass" autocomplete="new-password" placeholder="${r.password ? 'kept: type only to change it' : ''}">`, 'Kept on the server in a file only the administrator reads, never shown again.')}
+                <div class="sp-adv-only">
+                    ${field('Domain', `<input class="form-control" id="sp-rm-domain" value="${escAttr(r.domain || '')}">`, 'Only for computers of a company network.')}
+                    ${field('Protocol version', `<select class="form-control" id="sp-rm-vers">${['', '3.1.1', '3.0', '2.1', '1.0'].map(v => `<option value="${v}" ${(r.vers || '') === v ? 'selected' : ''}>${v ? `SMB ${v}` : 'choose by itself'}</option>`).join('')}</select>`, 'Change it only for an old NAS that refuses the connection. 1.0 is old and unsafe.')}
+                </div>
+            </div>
+            ${field('Called here', `<input class="form-control" id="sp-rm-name" value="${escAttr(name || '')}" ${name ? 'disabled' : ''} placeholder="nas">`, 'A short name for the lists: letters, digits, - and _.')}
+            <div class="sp-adv-only sp-adv-note">It is reached read-only, only for the time of a backup, then released.</div>
+            <div class="mt-4">${advSwitch('remote')}</div>`),
+        buttons: [
+            { label: 'Cancel', onClick: (x) => x.close() },
+            {
+                label: 'Save and try it', cls: 'btn-primary', onClick: async (x) => {
+                    const kind = x.body.querySelector('input[name="sp-rm-kind"]:checked').value;
+                    const host = val('sp-rm-host').trim().replace(/^\\\\|^smb:\/\/|\/+$/g, '');
+                    const body = { name: name || val('sp-rm-name').trim(), kind, host, share: val('sp-rm-share').trim().replace(/^[\\/]+/, kind === 'nfs' ? '/' : '') };
+                    if (!body.name) body.name = P.shareNameOf(body.share || host || 'computer');
+                    if (!host || !body.share) return showToast('Fill in the name of the computer and of the folder', 'warning');
+                    if (kind === 'smb') {
+                        if (val('sp-rm-user').trim()) body.user = val('sp-rm-user').trim();
+                        if (val('sp-rm-pass')) body.password = val('sp-rm-pass');
+                        if (val('sp-rm-domain').trim()) body.domain = val('sp-rm-domain').trim();
+                        if (val('sp-rm-vers')) body.vers = val('sp-rm-vers');
+                    }
+                    try {
+                        await HostAPI.remoteSave(body);
+                        x.close();
+                        await remoteTry(body.name);
+                    } catch (e) { showToast(e.message, 'error'); }
+                }
+            }
+        ]
+    });
+    const sync = () => {
+        const kind = dlg.body.querySelector('input[name="sp-rm-kind"]:checked').value;
+        dlg.body.querySelector('#sp-rm-login').classList.toggle('hidden', kind === 'nfs');
+        dlg.body.querySelector('#sp-rm-missing').innerHTML = missing(kind);
+        dlg.body.querySelector('#sp-rm-share-help').textContent = kind === 'nfs' ? 'The exported path, like /srv/data.' : 'Its name as the other computers see it, like Photos or Users/anna/Pictures.';
+    };
+    dlg.body.querySelectorAll('input[name="sp-rm-kind"]').forEach(el => el.addEventListener('change', sync));
+    sync();
+};
+
+/** Read the folder once and tell what was found. */
+const remoteTry = async (name) => {
+    const dlg = dialog({ title: `Trying ${name}`, large: false, body: '<div class="loading-spinner"></div>', buttons: [] });
+    try {
+        const r = await HostAPI.remoteTest(name);
+        dlg.setBody(`
+            <p class="text-sm text-emerald">It works: ${P.plural(r.entries || 0, 'thing', 'things')} inside.</p>
+            ${(r.folders || []).length ? `<ul class="text-sm mt-2">${r.folders.slice(0, 12).map(f => `<li class="font-mono">${esc(f)}</li>`).join('')}</ul>${r.folders.length > 12 ? `<p class="text-xs text-muted">And ${r.folders.length - 12} more folders.</p>` : ''}` : ''}
+            <p class="text-sm mt-4">Next, make a backup that copies it, or one of its folders, onto this server.</p>`);
+        dlg.setButtons([
+            { label: 'Close', onClick: (d) => { d.close(); refresh(); } },
+            { label: 'Make a backup of it', cls: 'btn-primary', onClick: (d) => { d.close(); backupEdit('', { remote: name }); } }
+        ]);
+    } catch (e) {
+        dlg.setBody(`<p class="text-sm text-red">${esc(e.message)}</p><p class="text-sm mt-4">The settings are saved: change them and try again.</p>`);
+        dlg.setButtons([
+            { label: 'Close', onClick: (d) => { d.close(); refresh(); } },
+            { label: 'Change', cls: 'btn-primary', onClick: (d) => { d.close(); refresh(); setTimeout(() => remoteEdit(name), 300); } }
+        ]);
+    }
+};
+
+const remoteRemove = async (name) => {
+    const sure = await confirmDo({
+        title: `Remove ${name}`,
+        effects: ['It is not offered any more as a source of backups, and its password is deleted from this server.'],
+        safe: ['Nothing changes on the other computer.', 'The copies already made here stay.'],
+        label: 'Remove', danger: true
+    });
+    if (sure && await act(() => HostAPI.remoteDelete(name), `${name} removed`)) refresh();
+};
+
+const backupEdit = async (name, opts = {}) => {
     const host = await HostAPI.status().catch(() => ({ backups: [] }));
-    const b = (host.backups || []).find(x => x.name === name) || { plug: true, mirror: false, enabled: true };
+    const remotes = host.remotes || [];
+    const b = (host.backups || []).find(x => x.name === name) || { plug: !opts.remote, mirror: false, enabled: true };
+    const rOf = (src) => remotes.find(x => src === x.target || (src || '').startsWith(`${x.target}/`));
+    const fromRemote = opts.remote ? remotes.find(x => x.name === opts.remote) : rOf(b.source);
     const targets = backupTargets(S.cache.backupInv, S.cache.backupModel);
     const pools = (S.cache.backupInv?.pools || []).map(p => p.mountpoint);
     let folders = [];
@@ -1622,10 +1829,21 @@ const backupEdit = async (name) => {
     dialog({
         title: name ? `Change the backup ${name}` : 'Make a backup', large: true,
         body: `
+            ${remotes.length ? `<div class="sp-choices mb-4">
+                <label class="sp-choice"><input type="radio" name="sp-bk-mode" value="here" ${fromRemote ? '' : 'checked'}><span><b>Folders of this server</b>, to a disk you can take away</span></label>
+                <label class="sp-choice"><input type="radio" name="sp-bk-mode" value="remote" ${fromRemote ? 'checked' : ''}><span><b>A folder of another computer</b>, to this server</span></label>
+            </div>` : ''}
+            <div id="sp-bk-remote" class="${fromRemote ? '' : 'hidden'}">
+                ${field('From the computer', `<select class="form-control" id="sp-bk-rm">${remotes.map(r => `<option value="${escAttr(r.name)}" ${fromRemote?.name === r.name ? 'selected' : ''}>${esc(r.name)} — ${esc(remoteWhere(r))}</option>`).join('')}</select>`)}
+                ${field('Only the folder', `<input class="form-control font-mono" id="sp-bk-rsub" value="${escAttr(fromRemote && b.source ? b.source.slice(fromRemote.target.length).replace(/^\//, '') : '')}" placeholder="everything">`, 'Empty to copy the whole shared folder. Use Try it on the computer to see its folders.')}
+                ${field('Into the folder of this server', `<input class="form-control font-mono" id="sp-bk-rdest" list="sp-bk-folders" value="${escAttr(fromRemote && b.dest_path ? b.dest_path : `${pools[0] || '/mnt/storage'}/Backups/${fromRemote?.name || remotes[0]?.name || 'computer'}`)}">`, 'On the disks of your arrays the copy is protected like your other files.')}
+            </div>
+            <div id="sp-bk-here" class="${fromRemote ? 'hidden' : ''}">
             ${field('What to copy', `<input class="form-control font-mono" id="sp-bk-src" list="sp-bk-folders" value="${escAttr(b.source || folders[0] || '')}"><datalist id="sp-bk-folders">${folders.map(f => `<option value="${escAttr(f)}">`).join('')}</datalist>`, 'A folder. Everything inside it is copied.')}
             ${field('To which disk', targets.length ? `<select class="form-control" id="sp-bk-dest">${targets.map(t => `<option value="${escAttr(t.uuid)}" ${t.uuid === b.dest_uuid ? 'selected' : ''}>${esc(t.label || t.device)} — ${esc(t.fstype)}${t.mount ? `, at ${t.mount}, ${P.bytes(t.free)} free` : ', not mounted'}</option>`).join('')}</select>`
                 : '<div class="text-sm text-amber">No disk outside your arrays was found. Plug in a USB disk with a filesystem, then reload.</div>', 'Disks of the arrays are not offered: a backup on the same disks would fail together with them.')}
             ${field('Into the folder', `<input class="form-control" id="sp-bk-dir" value="${escAttr(b.dest_dir || `Backups/${(b.source || folders[0] || 'files').split('/').pop()}`)}">`)}
+            </div>
             <div class="sp-field-label mt-4">When</div>
             ${toggle('sp-bk-plug', b.plug !== false, 'As soon as the disk is plugged in', 'When it ends, the disk is released and can be unplugged.')}
             <div class="sp-form-row mt-2">${toggle('sp-bk-sched', !!plan, 'On a schedule')}
@@ -1641,13 +1859,24 @@ const backupEdit = async (name) => {
                 label: 'Save', cls: 'btn-primary', onClick: async (x) => {
                     const day3 = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
                     const day = Number(val('sp-bk-day'));
+                    const remote = x.body.querySelector('input[name="sp-bk-mode"]:checked')?.value === 'remote';
                     const body = {
                         name: name || val('sp-bk-name').trim(), source: val('sp-bk-src').trim().replace(/\/+$/, ''),
                         dest_uuid: val('sp-bk-dest'), dest_dir: val('sp-bk-dir').trim().replace(/^\/+|\/+$/g, ''),
                         plug: checked('sp-bk-plug'), mirror: checked('sp-bk-mirror'), enabled: true,
                         when: checked('sp-bk-sched') ? `${day >= 0 ? `${day3[day]} ` : ''}${val('sp-bk-time') || '05:00'}` : ''
                     };
-                    if (!body.dest_uuid) return showToast('Choose a disk', 'warning');
+                    if (remote) {
+                        const r = remotes.find(y => y.name === val('sp-bk-rm'));
+                        const sub = val('sp-bk-rsub').trim().replace(/^\/+|\/+$/g, '');
+                        body.source = `${r.target}${sub ? `/${sub}` : ''}`;
+                        body.dest_path = val('sp-bk-rdest').trim().replace(/\/+$/, '');
+                        body.plug = false;
+                        delete body.dest_uuid;
+                        delete body.dest_dir;
+                        if (!name && !document.getElementById('sp-bk-name').dataset.touched) body.name = P.shareNameOf(`${r.name}-${sub.split('/').pop() || 'all'}`);
+                        if (!body.dest_path) return showToast('Choose the folder of this server', 'warning');
+                    } else if (!body.dest_uuid) return showToast('Choose a disk', 'warning');
                     if (!body.when) delete body.when;
                     try {
                         await HostAPI.backupSave(body);
@@ -1660,6 +1889,17 @@ const backupEdit = async (name) => {
             }
         ]
     });
+    const modeSync = () => {
+        const remote = document.querySelector('input[name="sp-bk-mode"]:checked')?.value === 'remote';
+        document.getElementById('sp-bk-remote')?.classList.toggle('hidden', !remote);
+        document.getElementById('sp-bk-here')?.classList.toggle('hidden', remote);
+        // a computer that may be off is copied on a schedule, not at the plug of a disk
+        if (remote && !name) document.getElementById('sp-bk-sched').checked = true;
+        document.getElementById('sp-bk-plug')?.closest('.sp-toggle')?.classList.toggle('hidden', remote);
+    };
+    document.querySelectorAll('input[name="sp-bk-mode"]').forEach(el => el.addEventListener('change', modeSync));
+    document.getElementById('sp-bk-name')?.addEventListener('input', (e) => { e.target.dataset.touched = '1'; });
+    if (fromRemote) modeSync();
 };
 
 /* ------------------------------------------------------------------ */
@@ -1669,22 +1909,32 @@ const backupEdit = async (name) => {
 const loadAlerts = async () => {
     const d = await loadCommon('config');
     const c = d.config || {};
-    const cur = P.notifyParse(c.notify_result);
     const level = c.notify_result_level || 'warning';
     const browser = (() => { try { return localStorage.getItem('sp-browser-alerts') === '1'; } catch (e) { return false; } })();
     const full = c.config_full_access;
+
+    // where the messages go now: one channel, more channels through the script, or a command of the person
+    let list = [];
+    if (P.isAlertScript(c.notify_result)) {
+        const r = await HostAPI.alerts().catch(() => ({ channels: [] }));
+        list = (r.channels || []).map(P.alertForm).filter(Boolean);
+    } else if (c.notify_result) {
+        list = [P.notifyParse(c.notify_result)];
+    }
+    S.cache.alertList = list;
+    S.cache.alertScript = P.isAlertScript(c.notify_result);
 
     header(button('Send a test', 'alert-test'));
 
     draw(`
         ${!full ? `<div class="restricted-banner"><div class="restricted-banner-title">Read-only</div>Alerts run a command on this machine, so they can be changed from here only with net_config_full_access = 1 in snapraidd.conf.</div>` : ''}
-        ${section('Where to tell you', 'When something goes wrong — a failing disk, damaged files, a backup that did not run — the server sends a message here.', `
-            <div class="sp-choices">
-                ${Object.entries(P.CHANNELS).map(([k, ch]) => `<label class="sp-choice"><input type="radio" name="sp-al-ch" value="${k}" ${cur.channel === k ? 'checked' : ''}><span><b>${esc(ch.label)}</b></span></label>`).join('')}
-                <label class="sp-choice"><input type="radio" name="sp-al-ch" value="" ${!cur.channel ? 'checked' : ''}><span><b>Nowhere</b> — only on this page</span></label>
-                ${cur.channel === 'custom' ? `<label class="sp-choice"><input type="radio" name="sp-al-ch" value="custom" checked><span><b>Custom command</b> <span class="font-mono text-xs">${esc(cur.fields.command)}</span></span></label>` : ''}
-            </div>
-            <div id="sp-al-fields" class="mt-4"></div>
+        ${section('Where to tell you', 'When something goes wrong — a failing disk, damaged files, a backup that did not run — the server sends a message to every place in this list.', `
+            <div id="sp-al-list"></div>
+            ${full ? `<div class="sp-form-row mt-4">
+                <select class="form-control sp-w-auto" id="sp-al-add">${Object.entries(P.CHANNELS).map(([k, ch]) => `<option value="${k}">${esc(ch.label)}</option>`).join('')}</select>
+                ${button('Add', 'alert-add')}
+                <span class="sp-field-help">A second place is a good idea: a phone and an email, so a message is not missed.</span>
+            </div>` : ''}
             <div class="sp-form-row mt-4">
                 <span class="sp-field-label">Send</span>
                 <select class="form-control sp-w-auto" id="sp-al-level">
@@ -1699,16 +1949,7 @@ const loadAlerts = async () => {
             ${toggle('sp-al-browser', browser, 'Show a pop-up when the health changes')}`)}
     `);
 
-    const drawFields = () => {
-        const ch = document.querySelector('input[name="sp-al-ch"]:checked')?.value;
-        const box = document.getElementById('sp-al-fields');
-        const def = P.CHANNELS[ch];
-        box.innerHTML = def ? def.fields.map(([k, label, ph]) => field(label, `<input class="form-control" id="sp-al-f-${k}" placeholder="${escAttr(ph)}" value="${escAttr(cur.channel === ch ? cur.fields[k] || '' : '')}">`)).join('')
-            + (ch === 'ntfy' ? '<div class="sp-field-help">Install the ntfy app on your phone and subscribe to the same topic. Pick a topic hard to guess: anyone who knows it reads the messages.</div>' : '')
-            + (ch === 'email' ? '<div class="sp-field-help">Needs a working “mail” command on this machine.</div>' : '') : '';
-    };
-    document.querySelectorAll('input[name="sp-al-ch"]').forEach(r => r.addEventListener('change', drawFields));
-    drawFields();
+    alertDraw();
     document.getElementById('sp-al-browser')?.addEventListener('change', async (e) => {
         try { localStorage.setItem('sp-browser-alerts', e.target.checked ? '1' : '0'); } catch (ignore) { /* no storage */ }
         if (e.target.checked && 'Notification' in window && Notification.permission !== 'granted') {
@@ -1718,20 +1959,63 @@ const loadAlerts = async () => {
     });
 };
 
+/** The fields typed so far, kept when a place is added or removed. */
+const alertRead = () => (S.cache.alertList || []).map((x, i) => {
+    const def = P.CHANNELS[x.channel];
+    if (!def) return x;
+    const fields = {};
+    for (const [k] of def.fields) fields[k] = document.getElementById(`sp-al-f-${i}-${k}`)?.value.trim() ?? (x.fields[k] || '');
+    return { channel: x.channel, fields };
+});
+
+const alertDraw = () => {
+    const box = document.getElementById('sp-al-list');
+    if (!box) return;
+    const list = S.cache.alertList || [];
+    box.innerHTML = list.length ? list.map((x, i) => {
+        const def = P.CHANNELS[x.channel];
+        return `<div class="sp-al-item">
+            <div class="sp-al-item-head"><b>${esc(def ? def.label : 'Custom command')}</b>${button('Remove', 'alert-del', { i }, 'btn-secondary btn-sm')}</div>
+            ${def ? def.fields.map(([k, label, ph]) => field(label, `<input class="form-control" id="sp-al-f-${i}-${k}" placeholder="${escAttr(ph)}" value="${escAttr(x.fields[k] || '')}">`)).join('')
+                + (x.channel === 'ntfy' ? '<div class="sp-field-help">Install the ntfy app on your phone and subscribe to the same topic. Pick a topic hard to guess: anyone who knows it reads the messages.</div>' : '')
+                + (x.channel === 'email' ? '<div class="sp-field-help">Needs a working “mail” command on this machine.</div>' : '')
+                : `<div class="font-mono text-xs">${esc(x.fields.command)}</div><div class="sp-field-help">Written by hand in snapraidd.conf. It cannot go together with other places: adding one replaces it.</div>`}
+        </div>`;
+    }).join('') : empty('Nowhere yet: problems show only on these pages. Add a place below.');
+};
+
+const alertAdd = () => {
+    const list = alertRead().filter(x => P.CHANNELS[x.channel]);
+    list.push({ channel: val('sp-al-add'), fields: {} });
+    S.cache.alertList = list;
+    alertDraw();
+};
+
+const alertDel = (i) => {
+    const list = alertRead();
+    list.splice(Number(i), 1);
+    S.cache.alertList = list;
+    alertDraw();
+};
+
 const alertSave = async () => {
-    const ch = document.querySelector('input[name="sp-al-ch"]:checked')?.value || '';
+    const list = alertRead();
+    const known = list.filter(x => P.CHANNELS[x.channel]);
+    if (known.some(x => !P.alertLine(x.channel, x.fields))) return showToast('Fill in every field of every place', 'warning');
     let cmd = '';
-    if (ch === 'custom') cmd = P.notifyParse((await API.getConfig()).notify_result).fields.command;
-    else if (ch) {
-        const f = {};
-        for (const [k] of P.CHANNELS[ch].fields) f[k] = val(`sp-al-f-${k}`).trim();
-        if (Object.values(f).some(v => !v)) return showToast('Fill in every field', 'warning');
-        cmd = P.notifyCommand(ch, f);
-    }
     try {
+        if (known.length >= 2) {
+            cmd = (await HostAPI.alertsSave(known.map(x => P.alertLine(x.channel, x.fields)).join('\n'))).command;
+        } else {
+            if (known.length === 1) cmd = P.notifyCommand(known[0].channel, known[0].fields);
+            else if (list.length === 1) cmd = list[0].fields.command;
+            // the secrets of the places removed do not stay on the disk
+            if (S.cache.alertScript) await HostAPI.alertsSave('');
+        }
         await API.updateConfig({ notify_result: cmd, notify_result_level: val('sp-al-level') });
         const back = await API.getConfig();
-        savedNote('sp-al-saved', back.notify_result ? `Saved and checked. Send a test to see it arrive.` : 'Saved: no messages are sent.');
+        S.cache.alertScript = P.isAlertScript(back.notify_result);
+        savedNote('sp-al-saved', back.notify_result ? `Saved and checked. ${P.alertSummary(known.length ? known : list)} Send a test to see it arrive.` : 'Saved: no messages are sent.');
     } catch (e) { showToast(e.message, 'error'); }
 };
 
@@ -1748,6 +2032,7 @@ const loadSystem = async () => {
     const phys = (net.interfaces || []).filter(i => i.physical);
     const spin = String(c.spindown_idle_minutes || '0').split(',').map(x => Number(x.trim()) || 0);
     const idle = host.idle || {};
+    const ups = await HostAPI.upsDetect().catch(() => ({ found: [] }));
 
     header('');
 
@@ -1788,6 +2073,8 @@ const loadSystem = async () => {
                 <div class="sp-form-foot">${button('Save', 'system-save', {}, 'btn-primary')}<span class="sp-saved" id="sp-sy-saved"></span></div>
             </div>`), advSwitch('system'))}
 
+        ${section('Power cut', `A battery (UPS) keeps the server on during a short power cut. Connected with its cable, it also tells the server when the power is gone: then the heavy work waits, and the server turns itself off cleanly before the battery is empty.`, upsBody(host, ups, s), advSwitch('ups'))}
+
         ${section('Your settings', 'Keep a copy of every setting of this page and of the arrays. With it, a new system disk is set up again in minutes.', `
             <div class="sp-form-row">
                 ${button('Download the settings', 'settings-download', {}, 'btn-primary')}
@@ -1808,6 +2095,71 @@ const loadSystem = async () => {
     `);
 
     document.getElementById('sp-sy-restore')?.addEventListener('change', (e) => { if (e.target.files[0]) settingsRestore(e.target.files[0]); e.target.value = ''; });
+    document.getElementById('sp-ups-id')?.addEventListener('change', (e) => document.getElementById('sp-ups-other-row')?.classList.toggle('hidden', e.target.value !== 'other'));
+};
+
+/** The part of the System page about the UPS. */
+const upsBody = (host, det, s) => {
+    const cur = s.ups || '';
+    const found = det.found || [];
+    const tools = det.upsc || det.apcaccess;
+    const w = P.upsWords(host.ups);
+    const ids = [...new Set([...found, ...(cur ? [cur] : [])])];
+    if (!tools && !cur) return empty('To watch a UPS, connect it to the server with its USB cable and install its program: <span class="font-mono">nut</span> for most brands, or <span class="font-mono">apcupsd</span> for APC. Then come back here.');
+    const percent = Number(s.ups_percent) || 20;
+    const minutes = Number(s.ups_minutes) || 5;
+    return advScope('ups', `
+        <div class="sp-form">
+            <div class="sp-form-row">
+                <span class="sp-field-label">Watch</span>
+                <select class="form-control sp-w-auto" id="sp-ups-id">
+                    <option value="">no UPS</option>
+                    ${ids.map(id => `<option value="${escAttr(id)}" ${id === cur ? 'selected' : ''}>${esc(P.upsName(id))}${found.includes(id) ? '' : ' (not found now)'}</option>`).join('')}
+                    <option value="other" class="sp-adv-only">another one, on this or another machine…</option>
+                </select>
+                ${cur ? `<span class="sp-pill sp-pill-${w.level}">${esc(w.text)}</span>` : ''}
+            </div>
+            ${!found.length ? '<div class="sp-field-help">No UPS answers now. Check its USB cable, and that its program (nut or apcupsd) is set up and running.</div>' : ''}
+            <div class="sp-form-row hidden" id="sp-ups-other-row">
+                ${field('Name as NUT knows it', `<input class="form-control font-mono" id="sp-ups-other" placeholder="myups@192.168.1.10">`, 'For a UPS connected to another machine running NUT: its name, @, and the address of that machine.')}
+            </div>
+            <div class="sp-form-row mt-2">${toggle('sp-ups-off', s.ups_shutdown !== '0', 'Turn the server off before the battery is empty', 'Files being written are finished and the disks stop cleanly. Turn it on again when the power is back, or let the BIOS do it.')}</div>
+            <div class="sp-adv-only">
+                <div class="sp-form-row mt-2">
+                    <span class="sp-field-label">Turn off when the charge is below</span>
+                    <input class="form-control sp-num" type="number" min="5" max="95" id="sp-ups-pct" value="${percent}"> <span>% or less than</span>
+                    <input class="form-control sp-num" type="number" min="1" max="120" id="sp-ups-min" value="${minutes}"> <span>minutes are left</span>
+                </div>
+                <div class="sp-field-help">Whichever comes first, and always when the UPS itself says the battery is low. Leave enough time for the server to stop: a minute or two for most.</div>
+            </div>
+            <div class="st-effects st-effects-safe mt-4"><div class="st-effects-title">During a power cut</div><ul>
+                <li>An update of the protection or a check for damage that is running stops, and goes on from there at the next run.</li>
+                <li>Your files stay reachable as long as the battery lasts.</li></ul></div>
+            <div class="sp-form-foot">${button('Save', 'ups-save', {}, 'btn-primary')}<span class="sp-saved" id="sp-ups-saved"></span></div>
+        </div>`);
+};
+
+const upsSave = async () => {
+    let id = val('sp-ups-id');
+    if (id === 'other') {
+        const other = val('sp-ups-other').trim();
+        if (!other) return showToast('Type the name of the UPS', 'warning');
+        id = `nut:${other.replace(/^nut:/, '')}`;
+    }
+    try {
+        await HostAPI.settings(id ? {
+            ups: id, ups_shutdown: checked('sp-ups-off') ? '1' : '0',
+            ups_percent: String(Math.min(95, Math.max(5, Number(val('sp-ups-pct')) || 20))),
+            ups_minutes: String(Math.min(120, Math.max(1, Number(val('sp-ups-min')) || 5)))
+        } : { ups: '', ups_shutdown: '', ups_percent: '', ups_minutes: '' });
+        // the daemon looks at the UPS right after the save
+        await new Promise(r => setTimeout(r, 1500));
+        const back = await HostAPI.status();
+        const w = P.upsWords(back.ups);
+        if (!id) savedNote('sp-ups-saved', 'Saved: no UPS is watched.');
+        else if (w.level === 'bad') showToast(`Saved, but: ${w.text}`, 'warning');
+        else savedNote('sp-ups-saved', `Saved and checked: ${w.text}.`);
+    } catch (e) { showToast(e.message, 'error'); }
 };
 
 const systemSave = async () => {
@@ -1881,7 +2233,11 @@ const GUIDES = [
     ['I want to use bigger disks', 'The protection disk must be at least as big as the biggest disk for files. So the first bigger disk you buy becomes the protection disk: on Disks, turn on Advanced and use “Move to a larger disk…” on the protection disk. The old one is then free for files.', 'drives'],
     ['I want to take a disk out', 'On Disks, turn on Advanced and use “Empty it…”: its files move to the other disks, at the same place in your folders. When it is empty, one more click takes it out of the array. Nothing on the disk is erased.', 'drives'],
     ['I want a folder to stay on one disk', 'For example your photos on a single disk, so only that disk wakes up when you look at them. On My files, turn on Advanced and use “Disks…” on the folder: choose the disk and turn on “Keep it there from now on”. New files that land elsewhere are brought back every night. Shares have the same button.', 'files'],
-    ['I want messages on my phone', 'On Alerts, pick “Phone notification (ntfy)”, choose a secret topic, and subscribe to it in the ntfy app.', 'alerts']
+    ['I want messages on my phone', 'On Alerts, add “Phone notification (ntfy)”, choose a secret topic, and subscribe to it in the ntfy app. Add an email too, so a message is not missed.', 'alerts'],
+    ['I bought a new disk', 'Before trusting it with files, test it: on Disks, use “Test…” on the new disk and choose “Write and read back every block”. It takes hours for a big disk, and erases it. A disk that passes it is ready: use “Use it…”.', 'drives'],
+    ['I plugged in a USB disk', 'On Disks, press “Open” on it: its files are reachable on the server until you press “Eject”. Always eject before unplugging. To copy to it every time it is plugged in, make a backup to it.', 'drives'],
+    ['I want a copy of my PC or of my old NAS here', 'On Backups, under “Other computers”, add it with the name of its shared folder, and the user and password you use to open it. Then make a backup of it: its files are copied here, on a schedule, and protected like your own.', 'backups'],
+    ['The power goes out sometimes', 'A battery (UPS) connected to the server with its cable lets it finish its work and turn off cleanly. Install its program (nut, or apcupsd for APC), then choose it on System, under “Power cut”.', 'system']
 ];
 
 const loadHelp = async () => {
@@ -2022,6 +2378,12 @@ export const initSimple = () => {
                 break;
             }
             case 'disk-wipe': diskWipe(ds.node, ds.size); break;
+            case 'usb-mount': usbMount(ds.node, ds.name); break;
+            case 'ups-save': upsSave(); break;
+            case 'remote-edit': remoteEdit(ds.name); break;
+            case 'remote-test': remoteTry(ds.name); break;
+            case 'remote-delete': remoteRemove(ds.name); break;
+            case 'usb-eject': usbEjectNow(ds.node, ds.name); break;
             case 'disk-busy': diskBusy(ds.path); break;
             case 'test-all': {
                 const ok = await confirmDo({ title: 'Test all the disks', intro: 'Every disk of the arrays runs its short self-test, a few minutes. The results show on this page.', safe: ['The disks keep working normally.'], label: 'Start' });
@@ -2063,6 +2425,8 @@ export const initSimple = () => {
                     && await act(() => HostAPI.backupDelete(ds.name), 'Deleted')) refresh();
                 break;
             case 'alert-save': alertSave(); break;
+            case 'alert-add': alertAdd(); break;
+            case 'alert-del': alertDel(ds.i); break;
             case 'alert-test': {
                 const level = val('sp-al-level');
                 const words = level === 'info' ? 'A report is on its way: it should arrive in a moment.'

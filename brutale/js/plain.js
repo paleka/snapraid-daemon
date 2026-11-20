@@ -49,6 +49,8 @@ export const bytes = (n) => {
 
 /** Short explanations of the words of the trade, shown on hover. */
 export const GLOSSARY = {
+    ups: 'A battery that keeps the server on during a power cut, long enough to finish and turn off cleanly. UPS stands for uninterruptible power supply.',
+    eject: 'Releasing a disk so it can be unplugged without losing what was still being written.',
     parity: 'Extra information kept on the protection disks. With it, the files of a failed disk can be rebuilt.',
     sync: 'Updating the protection, so the newest files can be rebuilt too. SnapRAID protects a snapshot: what changed after the last update is not protected yet.',
     scrub: 'Reading a part of the data and comparing it with what was saved, to find damage before it is too late.',
@@ -559,3 +561,106 @@ export const bayPlace = (doc, diskId, bay) => {
 };
 
 export const __test = { shq };
+
+/* ------------------------------------------------------------------ */
+/* alerts on more channels at once                                     */
+/* ------------------------------------------------------------------ */
+
+/** The address of an ntfy topic, as typed: a name, a host/name or a full address. */
+export const ntfyUrl = (topic) => {
+    const t = String(topic || '').trim();
+    return /^https?:\/\//.test(t) ? t : t.includes('/') ? `https://${t}` : `https://ntfy.sh/${t}`;
+};
+
+/** A channel of the form as a line of the daemon: "kind=ntfy<TAB>url=https://…". */
+export const alertLine = (channel, f) => {
+    const v = (x) => String(x || '').trim();
+    switch (channel) {
+        case 'ntfy': return v(f.topic) ? `kind=ntfy\turl=${ntfyUrl(f.topic)}` : '';
+        case 'discord': return v(f.url) ? `kind=discord\turl=${v(f.url)}` : '';
+        case 'webhook': return v(f.url) ? `kind=webhook\turl=${v(f.url)}` : '';
+        case 'telegram': return v(f.token) && v(f.chat) ? `kind=telegram\ttoken=${v(f.token)}\tchat=${v(f.chat).replace(/[^0-9-]/g, '')}` : '';
+        case 'email': return v(f.to) ? `kind=email\tto=${v(f.to)}` : '';
+        default: return '';
+    }
+};
+
+/** A channel the daemon gives back ({ kind, url, token, chat, to }) as the form shows it. */
+export const alertForm = (c) => {
+    switch (c?.kind) {
+        case 'ntfy': return { channel: 'ntfy', fields: { topic: String(c.url || '').replace(/^https:\/\/ntfy\.sh\//, '') } };
+        case 'discord': case 'webhook': return { channel: c.kind, fields: { url: c.url || '' } };
+        case 'telegram': return { channel: 'telegram', fields: { token: c.token || '', chat: c.chat || '' } };
+        case 'email': return { channel: 'email', fields: { to: c.to || '' } };
+        default: return null;
+    }
+};
+
+/** The command of the reports is the script of the daemon that sends to more channels. */
+export const isAlertScript = (cmd) => /\/snapraidd-alerts\.sh "%s" "%n" "%t"$/.test(String(cmd || ''));
+
+/** What the Alerts page says about where the messages go. */
+export const alertSummary = (list) => {
+    const names = (list || []).map(x => {
+        const def = CHANNELS[x.channel];
+        if (!def) return 'a custom command';
+        const f = x.fields || {};
+        return x.channel === 'email' ? `email to ${f.to}` : x.channel === 'ntfy' ? `ntfy topic ${String(f.topic || '').split('/').pop()}` : def.label.replace(/ \(.*\)$/, '');
+    });
+    if (!names.length) return 'Messages go nowhere: problems show only on these pages.';
+    if (names.length === 1) return `Messages go to ${names[0]}.`;
+    return `Messages go to ${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}, all of them every time.`;
+};
+
+/* ------------------------------------------------------------------ */
+/* record of the runs                                                  */
+/* ------------------------------------------------------------------ */
+
+const RUN_TITLES = { sync: 'Protection updated', scrub: 'Checked for damage', fix: 'Repair', check: 'Full check' };
+
+/** One run of the record in words: { title, detail, level: ok | warn | bad, problems } */
+export const runWords = (r) => {
+    const found = (r.errors_io || 0) + (r.errors_data || 0);
+    const title = RUN_TITLES[r.command] || r.command;
+    const bits = [];
+    if (r.command === 'sync' && (r.added || r.removed || r.updated)) bits.push(`${[r.added ? `${r.added} added` : '', r.updated ? `${r.updated} changed` : '', r.removed ? `${r.removed} deleted` : ''].filter(Boolean).join(', ')}`);
+    if (r.errors_data) bits.push(`${plural(r.errors_data, 'block with silent damage', 'blocks with silent damage')}`);
+    if (r.errors_io) bits.push(`${plural(r.errors_io, 'read error', 'read errors')} of a disk`);
+    if (r.recovered) bits.push(`${plural(r.recovered, 'error', 'errors')} repaired`);
+    if (r.unrecoverable) bits.push(`${plural(r.unrecoverable, 'error', 'errors')} that could not be repaired`);
+    if (r.result === 'stopped') return { title: `${title}: stopped`, detail: ['Stopped before the end, the next run goes on from there.', ...bits].join(' '), level: 'warn', problems: found };
+    if (r.unrecoverable) return { title, detail: bits.join(', '), level: 'bad', problems: found };
+    // a repair finds what it repairs: that is its success
+    if (r.command === 'fix' && r.result !== 'error') return { title, detail: bits.length ? bits.join(', ') : 'Nothing needed a repair.', level: 'ok', problems: 0 };
+    if (found) return { title: `${title}: problems found`, detail: `${bits.join(', ')}.${r.command === 'fix' ? '' : ' Use Repair on the Home page.'}`, level: 'bad', problems: found };
+    if (r.result === 'error') return { title: `${title}: did not finish`, detail: bits.length ? bits.join(', ') : 'See every detail for the reason.', level: 'bad', problems: 0 };
+    return { title, detail: bits.length ? bits.join(', ') : r.command === 'sync' ? 'Nothing had changed.' : 'No problem found.', level: 'ok', problems: 0 };
+};
+
+/** The sum of the record, in one sentence. */
+export const runsSummary = (rec, nowIso) => {
+    if (!rec?.total) return 'No run recorded yet.';
+    const since = rec.since ? ` in ${humanSpan(secondsSince(rec.since, nowIso))}` : '';
+    const head = `${plural(rec.total, 'run', 'runs')}${since}`;
+    if (!rec.errors_found && !rec.errors_fixed && !rec.errors_lost) return `${head}, no damage found.`;
+    return `${head}: ${plural(rec.errors_found, 'error', 'errors')} found, ${rec.errors_fixed} repaired${rec.errors_lost ? `, ${rec.errors_lost} that could not be repaired` : ''}.`;
+};
+
+/* ------------------------------------------------------------------ */
+/* battery backup (UPS)                                                */
+/* ------------------------------------------------------------------ */
+
+/** The state of the UPS in words: { level, text } */
+export const upsWords = (u) => {
+    if (!u || !u.configured || u.state === 'off') return { level: 'tip', text: 'Not watched' };
+    const left = [u.charge >= 0 ? `${u.charge}%` : '', u.runtime_seconds >= 0 ? `about ${humanSpan(u.runtime_seconds)} left` : ''].filter(Boolean).join(', ');
+    switch (u.state) {
+        case 'online': return { level: 'ok', text: `On the mains${left ? ` · battery ${left}` : ''}` };
+        case 'battery': return { level: 'warn', text: `Power cut: on battery${left ? `, ${left}` : ''}` };
+        case 'low': return { level: 'bad', text: `Battery low${left ? `: ${left}` : ''}` };
+        default: return { level: 'bad', text: u.error || 'The UPS does not answer' };
+    }
+};
+
+/** The name of a UPS for people: "labups" for nut:labups, "APC (apcupsd)" for apc. */
+export const upsName = (id) => id === 'apc' ? 'APC (apcupsd)' : String(id || '').replace(/^nut:/, '');

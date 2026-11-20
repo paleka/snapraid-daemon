@@ -317,3 +317,50 @@ test('folders kept on chosen disks: name and words', () => {
     assert.match(P.keepWords({ disks: '/mnt/d1', when: '', enabled: true }), /use Tidy now/);
     assert.match(P.keepWords({ disks: '/mnt/d1', when: '04:00', enabled: false }), /use Tidy now/);
 });
+
+test('alerts on more channels: lines for the daemon and back', () => {
+    assert.equal(P.alertLine('ntfy', { topic: 'my-topic' }), 'kind=ntfy\turl=https://ntfy.sh/my-topic');
+    assert.equal(P.alertLine('ntfy', { topic: 'ntfy.home.lan/alerts' }), 'kind=ntfy\turl=https://ntfy.home.lan/alerts');
+    assert.equal(P.alertLine('telegram', { token: ' 123:abc ', chat: '-100 200' }), 'kind=telegram\ttoken=123:abc\tchat=-100200');
+    assert.equal(P.alertLine('telegram', { token: '123:abc', chat: '' }), '');
+    assert.equal(P.alertLine('email', { to: 'me@example.com' }), 'kind=email\tto=me@example.com');
+    assert.equal(P.alertLine('pigeon', { url: 'x' }), '');
+    for (const [ch, f] of [['ntfy', { topic: 'my-topic' }], ['discord', { url: 'https://discord.com/api/webhooks/1/a' }], ['telegram', { token: '1:a', chat: '5' }], ['email', { to: 'a@b' }], ['webhook', { url: 'https://x.example/h' }]]) {
+        const line = P.alertLine(ch, f);
+        const back = Object.fromEntries(line.split('\t').map(x => x.split('=')));
+        assert.deepEqual(P.alertForm(back), { channel: ch, fields: f });
+    }
+    assert.equal(P.alertForm({ kind: 'other' }), null);
+    assert.ok(P.isAlertScript('/etc/snapraidd-alerts.sh "%s" "%n" "%t"'));
+    assert.ok(!P.isAlertScript('curl https://x/snapraidd-alerts.sh'));
+    assert.match(P.alertSummary([]), /nowhere/);
+    assert.equal(P.alertSummary([{ channel: 'email', fields: { to: 'a@b' } }]), 'Messages go to email to a@b.');
+    assert.match(P.alertSummary([{ channel: 'email', fields: { to: 'a@b' } }, { channel: 'ntfy', fields: { topic: 'x' } }, { channel: 'telegram', fields: {} }]), /^Messages go to email to a@b, ntfy topic x and Telegram, all of them every time\.$/);
+});
+
+test('record of the runs in words', () => {
+    assert.deepEqual(P.runWords({ command: 'sync', result: 'ok', added: 3, removed: 1 }), { title: 'Protection updated', detail: '3 added, 1 deleted', level: 'ok', problems: 0 });
+    assert.equal(P.runWords({ command: 'sync', result: 'ok' }).detail, 'Nothing had changed.');
+    const bad = P.runWords({ command: 'scrub', result: 'error', errors_data: 2 });
+    assert.equal(bad.level, 'bad');
+    assert.equal(bad.problems, 2);
+    assert.match(bad.detail, /2 blocks with silent damage.*Repair/);
+    assert.equal(P.runWords({ command: 'fix', result: 'ok', recovered: 1 }).detail, '1 error repaired');
+    assert.deepEqual(P.runWords({ command: 'fix', result: 'ok', errors_data: 1, recovered: 1 }), { title: 'Repair', detail: '1 block with silent damage, 1 error repaired', level: 'ok', problems: 0 });
+    assert.equal(P.runWords({ command: 'fix', result: 'ok', recovered: 1, unrecoverable: 2 }).level, 'bad');
+    assert.equal(P.runWords({ command: 'scrub', result: 'stopped' }).level, 'warn');
+    assert.match(P.runWords({ command: 'sync', result: 'error' }).title, /did not finish/);
+    assert.equal(P.runsSummary(null), 'No run recorded yet.');
+    assert.equal(P.runsSummary({ total: 4, since: '2026-11-01T00:00:00', errors_found: 0 }, '2026-11-11T00:00:00'), '4 runs in 10 days, no damage found.');
+    assert.equal(P.runsSummary({ total: 1, errors_found: 3, errors_fixed: 2, errors_lost: 1 }), '1 run: 3 errors found, 2 repaired, 1 that could not be repaired.');
+});
+
+test('battery backup in words', () => {
+    assert.equal(P.upsWords(null).text, 'Not watched');
+    assert.deepEqual(P.upsWords({ configured: true, state: 'online', charge: 100, runtime_seconds: 2400 }), { level: 'ok', text: 'On the mains · battery 100%, about 40 minutes left' });
+    assert.equal(P.upsWords({ configured: true, state: 'battery', charge: 80, runtime_seconds: -1 }).text, 'Power cut: on battery, 80%');
+    assert.equal(P.upsWords({ configured: true, state: 'low', charge: 9, runtime_seconds: 60 }).level, 'bad');
+    assert.equal(P.upsWords({ configured: true, state: 'unknown', error: 'The UPS does not answer' }).text, 'The UPS does not answer');
+    assert.equal(P.upsName('nut:labups@nas'), 'labups@nas');
+    assert.equal(P.upsName('apc'), 'APC (apcupsd)');
+});

@@ -359,3 +359,18 @@ a.sp-file-name { font-weight: 600; }
 .sp-tour-dots { display: flex; gap: 0.4rem; justify-content: center; margin-top: 1rem; }
 .sp-tour-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--sp-tip-bg); border: 1px solid var(--sp-tip); }
 .sp-tour-dot.on { background: var(--sp-busy); border-color: var(--sp-busy); }
+
+/* record of the runs */
+.sp-run-rec { grid-template-columns: 8rem 14rem 1fr 6rem; }
+.sp-run-detail { grid-column: 2 / -1; font-size: 0.8rem; color: var(--text-secondary); margin-top: -0.2rem; margin-bottom: 0.3rem; }
+.sp-dot { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 50%; margin-right: 0.45rem; vertical-align: middle; background: var(--sp-ok); }
+.sp-dot-warn { background: var(--sp-warn, #d97706); }
+.sp-dot-bad { background: var(--sp-bad); }
+@media (max-width: 700px) {
+    .sp-run-rec { grid-template-columns: 1fr 1fr; }
+    .sp-run-detail { grid-column: 1 / -1; }
+}
+
+/* places of the alerts */
+.sp-al-item { border: 1px solid var(--border-color, rgba(128, 128, 128, 0.25)); border-radius: 0.6rem; padding: 0.75rem 1rem; margin-bottom: 0.6rem; }
+.sp-al-item-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem; }
