@@ -507,7 +507,10 @@ const restoreDeleted = async (inPath) => {
                     x.close();
                     const all = picked.length === removed.length;
                     const filters = all && prefix ? [filterOf(prefix.slice(0, -1), true)] : all ? [] : picked.map(p => filterOf(p.path, false));
-                    await act(() => API.undelete({ filters }), `Bringing back ${P.plural(picked.length, 'file', 'files')}: see the progress on Home`);
+                    if (await act(() => API.undelete({ filters }), `Bringing back ${P.plural(picked.length, 'file', 'files')}: see the progress on Home`)) {
+                        // look again at the changes once done, so the pages tell what is left
+                        API.schedule([{ command: 'diff' }]).catch(() => { /* the next maintenance does it */ });
+                    }
                 }
             }
         ]);

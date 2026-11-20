@@ -160,7 +160,8 @@ const PLAIN_ERRORS = [
     [/--force-empty/, 'A data disk looks empty: it may not be mounted. Nothing was changed.'],
     [/The preceding sync operation failed/, 'Skipped, because the update of the protection before it did not finish.'],
     [/Insufficient parity space|Failed to allocate all the required parity space/, 'The protection disk is full: a data disk holds more than it can protect.'],
-    [/are now missing or have been rewritten/, 'A data disk looks empty: it may not be mounted. Nothing was changed.']
+    [/are now missing or have been rewritten/, 'A data disk looks empty: it may not be mounted. Nothing was changed.'],
+    [/Unrecoverable errors detected/, 'Some files could not be rebuilt: they had changed after the last update of the protection, which keeps only the state of that moment.']
 ];
 
 export const plainError = (text) => {
@@ -187,6 +188,8 @@ export const taskWords = (task) => {
         const known = errs.map(plainError).find((t, i) => t !== errs[i]);
         const err = known || errs.pop();
         detail = err ? (known ? err : `It did not finish: ${err}`) : 'It did not finish. The details are in Tasks.';
+        if (errs.some(t => /Too many files were (removed|updated)/.test(t)))
+            return { title: 'Protection update paused', detail, ok: false };
         if (errs.some(t => /There are soft errors/.test(t)) && !errs.some(t => /data errors|unrecoverable/i.test(t)) && known)
             return { title: `${taskTitle(task)}: changes found`, detail, ok: true };
     } else if (task.command === 'scrub') detail = 'No damage found.';
@@ -247,6 +250,10 @@ export const homeStatus = (d) => {
         return { level: 'busy', title: `${taskTitle({ command: d.active.command }, true)}…`, text: d.active.progress != null ? `${d.active.progress}% done${d.active.eta_seconds ? `, about ${humanSpan(d.active.eta_seconds)} left` : ''}. You can keep using your files.` : 'You can keep using your files.', action: null };
 
     const blocked = blockedSync(d.tasks);
+    // the files may be back since: then only the update is missing
+    const latest = blocked ? (blocked.what === 'removed' ? array.diff_removed : array.diff_updated) : null;
+    if (blocked && latest != null && latest < blocked.limit)
+        return { level: 'warn', title: 'Update the protection now', text: `The last update stopped because ${plural(blocked.count, `file was ${blocked.what === 'removed' ? 'deleted' : 'changed'}`, `files were ${blocked.what === 'removed' ? 'deleted' : 'changed'}`)}. Now there are ${latest}: below the safety limit of ${blocked.limit}.`, action: { label: 'Protect now', act: 'protect' } };
     if (blocked)
         return { level: 'warn', title: 'The protection waits for your OK', text: `${plural(blocked.count, `file was ${blocked.what === 'removed' ? 'deleted' : 'changed'}`, `files were ${blocked.what === 'removed' ? 'deleted' : 'changed'}`)} since the last update, more than the safety limit of ${blocked.limit}. If it was on purpose, say so; if not, you can still get them back.`, action: { label: 'Look at it', act: 'protection' } };
 

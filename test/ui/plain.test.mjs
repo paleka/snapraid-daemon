@@ -232,3 +232,12 @@ test('bay map', () => {
     assert.deepEqual(moved.slots, { b: 1, c: 0 });
     assert.deepEqual(P.bayPlace(moved, 'c', null).slots, { b: 1 });
 });
+
+test('home: the deleted files are back, only the update is missing', () => {
+    const tasks = { history: [{ command: 'sync', status: 'terminated', exit_code: 2, finished_at: '2026-11-19T02:30:00', messages: [{ level: 'fatal', text: 'Too many files were removed (61, limit is 50). Sync aborted.' }] }] };
+    const s = P.homeStatus(base({ tasks, array: { ...base().array, diff_removed: 3 } }));
+    assert.equal(s.title, 'Update the protection now');
+    assert.equal(s.action.act, 'protect');
+    assert.equal(P.taskWords(tasks.history[0]).title, 'Protection update paused');
+    assert.match(P.taskWords({ command: 'fix', status: 'terminated', exit_code: 1, messages: [{ level: 'fatal', text: 'DANGER! Unrecoverable errors detected!' }] }).detail, /could not be rebuilt/);
+});
