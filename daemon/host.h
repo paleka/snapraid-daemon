@@ -69,6 +69,9 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
  */
 int host_get_is_private(const char* what);
 
+/** Told by the move of files at its end, with the tag given at its start. */
+void host_move_done(const char* tag, int status, const char* message);
+
 int host_selftest(void);
 
 #endif

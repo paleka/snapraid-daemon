@@ -11,6 +11,8 @@
 #include "arrays.h"
 #include "memory.h"
 #include "storage_int.h"
+#include "host.h"
+#include "scheduler.h"
 
 /****************************************************************************/
 /* storage */
@@ -178,7 +180,13 @@ struct storage_job {
 	char b[64];
 	char c[64];
 	char d[64];
+	char e[PATH_MAX];
+	char f[PATH_MAX];
+	char tag[64]; /**< Who asked for the job, told back at its end */
 	int flag;
+	unsigned age; /**< move: only files not changed for these minutes */
+	uint64_t skipped; /**< move: files left where they were */
+	struct snapraid_state* state; /**< parity move: the array */
 	uint64_t max_bytes;
 	unsigned spread;
 	/* arrays whose data disks are being changed by the job */
@@ -352,6 +360,7 @@ void storage_job_json(ss_t* s, int level)
 		ss_jsonf(s, level, "\"bytes\": %" PRIu64 ",\n", job.bytes);
 		ss_jsonf(s, level, "\"found\": %" PRIu64 ",\n", job.found);
 		ss_jsonf(s, level, "\"found_bytes\": %" PRIu64 ",\n", job.found_bytes);
+		ss_jsonf(s, level, "\"skipped\": %" PRIu64 ",\n", job.skipped);
 		ss_jsonf(s, level, "\"elapsed_seconds\": %" PRIu64 ",\n", (uint64_t)((job.running ? time(0) : job.finished) - job.started));
 		if (!job.running) {
 			ss_json_bool(s, level, "success", job.status == 0);
@@ -2519,7 +2528,7 @@ int walk_skip(const char* name, int top)
  * Visit the regular files of a tree. The callback gets the path relative to the root,
  * starting with /, and stops the visit returning not zero.
  */
-int walk_tree(const char* root, const char* rel, unsigned depth, walk_func* func, void* arg)
+static int walk_tree_ex(const char* root, const char* rel, unsigned depth, walk_func* func, void* arg, int links)
 {
 	char path[PATH_MAX];
 	int ret = 0;
@@ -2547,13 +2556,18 @@ int walk_tree(const char* root, const char* rel, unsigned depth, walk_func* func
 		if (lstat(path, &st) != 0)
 			continue;
 		if (S_ISDIR(st.st_mode))
-			ret = walk_tree(root, sub, depth + 1, func, arg);
-		else if (S_ISREG(st.st_mode))
+			ret = walk_tree_ex(root, sub, depth + 1, func, arg, links);
+		else if (S_ISREG(st.st_mode) || (links && S_ISLNK(st.st_mode)))
 			ret = func(sub, &st, arg);
 	}
 	closedir(d);
 
 	return ret;
+}
+
+int walk_tree(const char* root, const char* rel, unsigned depth, walk_func* func, void* arg)
+{
+	return walk_tree_ex(root, rel, depth, func, arg, 0);
 }
 
 /****************************************************************************/
@@ -2794,6 +2808,646 @@ int storage_balance_start(const char* mountpoint, uint64_t max_bytes, unsigned s
 	state_unlock();
 
 	return job_launch(balance_thread, msg, msg_size);
+}
+
+/****************************************************************************/
+/* move of files among the disks of a pool */
+
+/**
+ * The mover of a fast disk, the emptying of a disk and the move of a folder
+ * to a chosen disk are the same job: files leave some branches of a pool
+ * for other ones, keeping their path, so that who uses the pool sees nothing.
+ */
+#define MOVE_AGE_MIN 5 /**< Minutes a file must be left alone before it's moved */
+
+struct move_run {
+	struct pool_branch* branches;
+	unsigned count;
+	int is_source[BRANCH_MAX];
+	int is_dest[BRANCH_MAX];
+	unsigned src; /**< Branch being emptied */
+	uint64_t minfree;
+	time_t newest; /**< Files changed after this time are left */
+	int quiet_young; /**< The files too young are not reported */
+	unsigned errors;
+};
+
+static void move_skip(struct move_run* run, const char* rel, const char* why)
+{
+	(void)run;
+	pthread_mutex_lock(&job_mutex);
+	++job.skipped;
+	pthread_mutex_unlock(&job_mutex);
+	job_result_line(rel, why);
+}
+
+static int move_one(const char* rel, const struct stat* st, void* arg)
+{
+	struct move_run* run = arg;
+	char path[PATH_MAX];
+	struct stat other;
+	int dst = -1;
+
+	if (job_stopping() || run->errors >= 5)
+		return 1;
+
+	if (st->st_mtime > run->newest) {
+		/* the mover takes it the next time; who empties a disk has to know it's still there */
+		if (!run->quiet_young)
+			move_skip(run, rel, "changed in the last minutes: it may still be in use, try again later");
+		return 0;
+	}
+
+	/* two names of the same file would become two files */
+	if (S_ISREG(st->st_mode) && st->st_nlink != 1) {
+		move_skip(run, rel, "hard link");
+		return 0;
+	}
+
+	uint64_t size = S_ISREG(st->st_mode) ? (uint64_t)st->st_blocks * 512 : 0;
+	for (unsigned i = 0; i < run->count; ++i) {
+		if (!run->is_dest[i])
+			continue;
+
+		/* never over a file with the same name: which one is the good one is not ours to say */
+		snprintf(path, sizeof(path), "%s%s", run->branches[i].path, rel);
+		if (lstat(path, &other) == 0) {
+			move_skip(run, rel, "a file with this name is already on another disk");
+			return 0;
+		}
+		if (run->branches[i].free < size + run->minfree)
+			continue;
+		if (dst < 0 || run->branches[i].free > run->branches[dst].free)
+			dst = i;
+	}
+	if (dst < 0) {
+		move_skip(run, rel, "no room on the other disks");
+		return 0;
+	}
+
+	char from[PATH_MAX * 2];
+	char to[PATH_MAX + 2];
+	snprintf(from, sizeof(from), "%s/.%s", run->branches[run->src].path, rel);
+	snprintf(to, sizeof(to), "%s/", run->branches[dst].path);
+	job_current(rel);
+
+	const char* args[] = { "-aHAXWE", "--numeric-ids", "--preallocate", "--relative", "--remove-source-files", from, to, 0 };
+	ss_t out;
+	ss_init(&out, 256);
+	int ret = tool_run("rsync", args, 0, &out, 24 * 3600);
+	ss_done(&out);
+	if (ret != 0) {
+		++run->errors;
+		log_msg(LVL_WARNING, "storage: failed to move %s, rsync exit code %d", from, ret);
+		move_skip(run, rel, "the copy failed, see the daemon log");
+		return 0;
+	}
+
+	run->branches[dst].free = run->branches[dst].free > size ? run->branches[dst].free - size : 0;
+	job_progress(1, S_ISREG(st->st_mode) ? (uint64_t)st->st_size : 0);
+
+	return 0;
+}
+
+static void* move_thread(void* arg)
+{
+	struct pool_branch branches[BRANCH_MAX];
+	struct move_run run;
+	char msg[MSG_MAX] = "";
+	char value[64];
+	char list[PATH_MAX];
+	char claims[JOB_CLAIMS_MAX][ARRAY_NAME_MAX];
+	unsigned claims_count;
+
+	(void)arg;
+
+	memset(&run, 0, sizeof(run));
+	run.branches = branches;
+
+	priv_enter();
+
+	if (pool_branches(job.target, branches, &run.count, msg, sizeof(msg)) != 0) {
+		priv_leave();
+		job_finish(400, msg);
+		return 0;
+	}
+	pool_branches_space(branches, run.count);
+
+	if (pool_get(job.target, "minfreespace", value, sizeof(value)) != 0 || stru64(&run.minfree, value) != 0)
+		run.minfree = 0;
+	run.newest = time(0) - (time_t)job.age * 60;
+	run.quiet_young = strcmp(job.kind, "mover") == 0;
+
+	/* sources as told, destinations the one told or every other writable branch */
+	sncpy(list, sizeof(list), job.a);
+	char* save = 0;
+	for (char* tok = strtok_r(list, ":", &save); tok; tok = strtok_r(0, ":", &save)) {
+		for (unsigned i = 0; i < run.count; ++i) {
+			if (strcmp(branches[i].path, tok) == 0)
+				run.is_source[i] = 1;
+		}
+	}
+	for (unsigned i = 0; i < run.count; ++i) {
+		if (run.is_source[i])
+			continue;
+		if (job.f[0] ? strcmp(branches[i].path, job.f) == 0 : branches[i].writable)
+			run.is_dest[i] = 1;
+	}
+
+	for (unsigned i = 0; i < run.count; ++i) {
+		if (!run.is_source[i])
+			continue;
+		run.src = i;
+		walk_tree_ex(branches[i].path, job.e, 0, move_one, &run, 1);
+
+		/* the folders left empty go away, the one asked for stays */
+		char top[PATH_MAX * 2];
+		sncpy(top, sizeof(top), branches[i].path);
+		sncat(top, sizeof(top), job.e);
+		const char* args[] = { top, "-mindepth", "1", "-depth", "-type", "d", "-empty", "-not", "-name", "lost+found", "-delete", 0 };
+		if (!job_stopping()) {
+			tool_run("find", args, 0, 0, 3600);
+			/* a folder moved to another disk leaves nothing behind, if nothing is left in it */
+			if (job.e[0])
+				rmdir(top);
+		}
+	}
+
+	priv_leave();
+
+	pthread_mutex_lock(&job_mutex);
+	uint64_t files = job.files;
+	uint64_t skipped = job.skipped;
+	int sync_after = job.flag;
+	char tag[64];
+	sncpy(tag, sizeof(tag), job.tag);
+	claims_count = job.claims_count;
+	memcpy(claims, job.claims, sizeof(claims));
+	pthread_mutex_unlock(&job_mutex);
+
+	int status = 0;
+	if (run.errors >= 5) {
+		status = 500;
+		snprintf(msg, sizeof(msg), "Stopped after repeated errors moving files, see the daemon log. %" PRIu64 " files were moved.", files);
+	} else if (job_stopping()) {
+		status = 499;
+		snprintf(msg, sizeof(msg), "Stopped on request after %" PRIu64 " files. Every file is whole, either where it was or where it was going.", files);
+	} else if (skipped) {
+		snprintf(msg, sizeof(msg), "%" PRIu64 " files moved, %" PRIu64 " left where they were", files, skipped);
+	} else {
+		snprintf(msg, sizeof(msg), "%" PRIu64 " files moved", files);
+	}
+
+	host_move_done(tag, status, msg);
+	job_finish(status, msg);
+
+	/* the moved files are new for the arrays getting them: protect them now */
+	if (sync_after && files > 0 && status == 0) {
+		for (unsigned k = 0; k < claims_count; ++k) {
+			struct snapraid_state* found = 0;
+			state_lock();
+			for (tommy_node* i = tommy_list_head(&host_ptr()->state_list); i; i = i->next) {
+				struct snapraid_state* st = i->data;
+				if (strcmp(st->name, claims[k]) == 0)
+					found = st;
+			}
+			state_unlock();
+			if (found) {
+				char m[MSG_MAX];
+				int st_code;
+				schedule_maintenance(found, 0, 1, m, sizeof(m), &st_code);
+			}
+		}
+	}
+
+	return 0;
+}
+
+/** The arrays whose data disks are among these branches. */
+static unsigned branches_claims(const struct pool_branch* branches, unsigned count, char claims[JOB_CLAIMS_MAX][ARRAY_NAME_MAX])
+{
+	struct layout layout;
+	unsigned claims_count = 0;
+
+	layout_load(&layout, 0);
+	for (unsigned i = 0; i < count; ++i) {
+		int partial;
+		const struct layout_entry* use = layout_find_dir(&layout, branches[i].path, &partial);
+		if (use == 0 || use->role != LAYOUT_DATA)
+			continue;
+		int known = 0;
+		for (unsigned j = 0; j < claims_count; ++j) {
+			if (strcmp(claims[j], use->array) == 0)
+				known = 1;
+		}
+		if (!known && claims_count < JOB_CLAIMS_MAX)
+			sncpy(claims[claims_count++], ARRAY_NAME_MAX, use->array);
+	}
+	layout_done(&layout);
+
+	return claims_count;
+}
+
+int storage_move_start(const char* kind, const char* mountpoint, const char* from, const char* rel, const char* to, unsigned age_minutes, int sync_after, const char* tag, char* msg, size_t msg_size)
+{
+	struct pool_branch branches[BRANCH_MAX];
+	unsigned count;
+	char list[PATH_MAX];
+
+	if (!tool_exists("rsync"))
+		return fail(msg, msg_size, 501, "rsync is not installed. Install the 'rsync' package and try again.");
+	if (strcmp(kind, "mover") != 0 && strcmp(kind, "empty") != 0 && strcmp(kind, "move") != 0)
+		return fail(msg, msg_size, 400, "Unknown kind of move");
+	if (rel[0] != 0 && (!valid_browse_path(rel) || rel[strlen(rel) - 1] == '/'))
+		return fail(msg, msg_size, 400, "Invalid folder");
+	if (strlen(from) >= sizeof(list) || from[0] != '/')
+		return fail(msg, msg_size, 400, "Missing the disk to move the files from");
+
+	priv_enter();
+	int ret = pool_branches(mountpoint, branches, &count, msg, msg_size);
+	priv_leave();
+	if (ret != 0)
+		return ret;
+
+	/* every source and the destination are branches of this pool */
+	unsigned sources = 0;
+	sncpy(list, sizeof(list), from);
+	char* save = 0;
+	for (char* tok = strtok_r(list, ":", &save); tok; tok = strtok_r(0, ":", &save)) {
+		int found = 0;
+		for (unsigned i = 0; i < count; ++i) {
+			if (strcmp(branches[i].path, tok) == 0)
+				found = 1;
+		}
+		if (!found)
+			return fail(msg, msg_size, 400, "%s is not a disk of the pool %s", tok, mountpoint);
+		if (to[0] && strcmp(tok, to) == 0)
+			return fail(msg, msg_size, 400, "The files are already on %s", to);
+		++sources;
+	}
+	unsigned dests = 0;
+	for (unsigned i = 0; i < count; ++i) {
+		char key[PATH_MAX + 4];
+		char all[PATH_MAX + 4];
+		sncpy(key, sizeof(key), ":");
+		sncat(key, sizeof(key), branches[i].path);
+		sncat(key, sizeof(key), ":");
+		sncpy(all, sizeof(all), ":");
+		sncat(all, sizeof(all), from);
+		sncat(all, sizeof(all), ":");
+		if (strstr(all, key) != 0)
+			continue;
+		if (to[0] ? strcmp(branches[i].path, to) == 0 : branches[i].writable)
+			++dests;
+	}
+	if (sources == 0 || dests == 0)
+		return fail(msg, msg_size, 400, to[0] ? "%s is not a disk of the pool" : "The pool has no other disk to take the files%s", to[0] ? to : "");
+
+	if (rel[0]) {
+		struct stat st;
+		char path[PATH_MAX * 2];
+		char real[PATH_MAX];
+		char base[PATH_MAX];
+		int found = 0;
+		int escapes = 0;
+		sncpy(list, sizeof(list), from);
+		save = 0;
+		for (char* tok = strtok_r(list, ":", &save); tok; tok = strtok_r(0, ":", &save)) {
+			snprintf(path, sizeof(path), "%s%s", tok, rel);
+			priv_enter();
+			if (lstat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+				found = 1;
+				/*
+				 * A link in the way must not lead out of the disk: the files
+				 * would be copied over themselves and then removed.
+				 */
+				if (realpath(path, real) == 0 || realpath(tok, base) == 0 || !path_inside(real, base) || strcmp(real, base) == 0)
+					escapes = 1;
+			}
+			priv_leave();
+		}
+		if (!found)
+			return fail(msg, msg_size, 404, "The folder %s is not on that disk", rel);
+		if (escapes)
+			return fail(msg, msg_size, 400, "The folder %s goes through a link leading out of its disk", rel);
+	}
+
+	/* like the balance: never under a sync, a scrub or a recovery of the same disks */
+	char claims[JOB_CLAIMS_MAX][ARRAY_NAME_MAX];
+	unsigned claims_count = branches_claims(branches, count, claims);
+
+	state_lock();
+	for (unsigned i = 0; i < claims_count; ++i) {
+		const char* busy = array_heavy_command_locked(claims[i]);
+		if (busy != 0) {
+			ret = fail(msg, msg_size, 409, "The array '%s' is running a %s on the disks of this pool. Wait for it to finish, then move the files.", claims[i], busy);
+			state_unlock();
+			return ret;
+		}
+	}
+
+	ret = job_begin(kind, mountpoint, msg, msg_size);
+	if (ret != 0) {
+		state_unlock();
+		return ret;
+	}
+
+	sncpy(job.a, sizeof(job.a), from);
+	sncpy(job.e, sizeof(job.e), rel);
+	sncpy(job.f, sizeof(job.f), to);
+	sncpy(job.tag, sizeof(job.tag), tag ? tag : "");
+	/* a file written in the last minutes may still be open: it's never taken */
+	job.age = age_minutes < MOVE_AGE_MIN ? MOVE_AGE_MIN : age_minutes;
+	job.flag = sync_after;
+	memcpy(job.claims, claims, sizeof(claims));
+	job.claims_count = claims_count;
+	state_unlock();
+
+	return job_launch(move_thread, msg, msg_size);
+}
+
+/****************************************************************************/
+/* move of a parity file to another disk */
+
+#define PARITY_CHUNK (8 * 1024 * 1024)
+
+/**
+ * Find the file of a parity level in the text of a SnapRAID configuration.
+ * \param key "parity", "2-parity", ...
+ * \return 0 if found and made of one file, 1 if split in more files, -1 if missing.
+ */
+static int conf_parity_file(const char* text, const char* key, char* file, size_t file_size, size_t* begin, size_t* end)
+{
+	size_t kl = strlen(key);
+	const char* line = text;
+
+	while (*line) {
+		const char* eol = strchr(line, '\n');
+		if (!eol)
+			eol = line + strlen(line);
+		const char* p = line;
+		while (*p == ' ' || *p == '\t')
+			++p;
+		if (strncmp(p, key, kl) == 0 && (p[kl] == ' ' || p[kl] == '\t')) {
+			p += kl;
+			while (*p == ' ' || *p == '\t')
+				++p;
+			const char* stop = eol;
+			while (stop > p && (stop[-1] == ' ' || stop[-1] == '\t' || stop[-1] == '\r'))
+				--stop;
+			if (stop == p || (size_t)(stop - p) >= file_size)
+				return -1;
+			memcpy(file, p, stop - p);
+			file[stop - p] = 0;
+			*begin = p - text;
+			*end = stop - text;
+			return strchr(file, ',') != 0;
+		}
+		line = *eol ? eol + 1 : eol;
+	}
+
+	return -1;
+}
+
+/** Copy or compare two files, a chunk at a time. \return 0 on success, 1 if stopped, 2 if different, -1 on error. */
+static int parity_pass(const char* src, const char* dst, int compare, char* msg, size_t msg_size)
+{
+	int ret = -1;
+	int in = -1;
+	int out = -1;
+	unsigned char* a = malloc_nofail(PARITY_CHUNK);
+	unsigned char* b = compare ? malloc_nofail(PARITY_CHUNK) : 0;
+
+	priv_enter();
+	in = open(src, O_RDONLY | O_CLOEXEC);
+	if (in >= 0)
+		out = compare ? open(dst, O_RDONLY | O_CLOEXEC) : open(dst, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+	priv_leave();
+	if (in < 0 || out < 0) {
+		snprintf(msg, msg_size, "Cannot open %.200s: %s", in < 0 ? src : dst, strerror(errno));
+		goto bail;
+	}
+#ifdef POSIX_FADV_SEQUENTIAL
+	posix_fadvise(in, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+
+	uint64_t offset = 0;
+	while (1) {
+		if (job_stopping()) {
+			ret = 1;
+			goto bail;
+		}
+		ssize_t n = read(in, a, PARITY_CHUNK);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0) {
+			snprintf(msg, msg_size, "Read error on %.200s at byte %" PRIu64 ": %s", src, offset, strerror(errno));
+			goto bail;
+		}
+		if (n == 0)
+			break;
+		if (compare) {
+			ssize_t got = 0;
+			while (got < n) {
+				ssize_t m = read(out, b + got, n - got);
+				if (m < 0 && errno == EINTR)
+					continue;
+				if (m <= 0)
+					break;
+				got += m;
+			}
+			if (got != n || memcmp(a, b, n) != 0) {
+				snprintf(msg, msg_size, "The copy is different from the original around byte %" PRIu64, offset);
+				ret = 2;
+				goto bail;
+			}
+		} else {
+			ssize_t put = 0;
+			while (put < n) {
+				ssize_t m = write(out, a + put, n - put);
+				if (m < 0 && errno == EINTR)
+					continue;
+				if (m <= 0) {
+					snprintf(msg, msg_size, "Write error on %.200s at byte %" PRIu64 ": %s", dst, offset + put, strerror(errno));
+					goto bail;
+				}
+				put += m;
+			}
+		}
+		offset += n;
+		job_progress(0, n);
+	}
+
+	if (!compare && fsync(out) != 0) {
+		snprintf(msg, msg_size, "Cannot flush %.200s: %s", dst, strerror(errno));
+		goto bail;
+	}
+	ret = 0;
+
+bail:
+	if (in >= 0)
+		close(in);
+	if (out >= 0)
+		close(out);
+	free(a);
+	free(b);
+	return ret;
+}
+
+static void* parity_move_thread(void* arg)
+{
+	char msg[MSG_MAX] = "";
+	char note[MSG_MAX];
+	const char* src = job.a;
+	const char* dst = job.e;
+
+	(void)arg;
+
+	job_current("copying the parity");
+	int ret = parity_pass(src, dst, 0, msg, sizeof(msg));
+	if (ret == 0) {
+		/* nothing is trusted until it's read back from the new disk */
+		job_current("checking the copy");
+		ret = parity_pass(src, dst, 1, msg, sizeof(msg));
+	}
+
+	if (ret != 0) {
+		/* the array still uses the old file: the half copy is of no use */
+		priv_enter();
+		unlink(dst);
+		priv_leave();
+		if (ret == 1)
+			snprintf(msg, sizeof(msg), "Stopped on request. Nothing changed: the array still uses %.150s", src);
+		sncpy(note, sizeof(note), msg);
+		if (ret != 1)
+			snprintf(msg, sizeof(msg), "%.180s. Nothing changed: the array still uses the old parity.", note);
+		job_finish(ret == 1 ? 499 : 500, msg);
+		return 0;
+	}
+
+	/* the copy is good: from now on the array uses it. The array is claimed, no sync ran in between. */
+	char path[PATH_MAX];
+	char file[PATH_MAX];
+	size_t begin;
+	size_t end;
+	ss_t text;
+	ss_t fresh;
+	ss_init(&text, 4096);
+	ss_init(&fresh, 4096);
+	engine_conf_path(job.state, path, sizeof(path));
+	priv_enter();
+	int rd = file_read(path, &text);
+	priv_leave();
+	ss_write(&text, "", 1);
+	if (rd != 0 || conf_parity_file(ss_ptr(&text), job.b, file, sizeof(file), &begin, &end) != 0 || strcmp(file, src) != 0) {
+		priv_enter();
+		unlink(dst);
+		priv_leave();
+		snprintf(msg, sizeof(msg), "The configuration changed during the copy. Nothing changed: the array still uses the old parity.");
+		ret = 500;
+	} else {
+		ss_write(&fresh, ss_ptr(&text), begin);
+		ss_write(&fresh, dst, strlen(dst));
+		ss_write(&fresh, ss_ptr(&text) + end, strlen(ss_ptr(&text) + end));
+		ss_write(&fresh, "", 1);
+		ret = storage_engine_conf_write(job.state, ss_ptr(&fresh), note, sizeof(note));
+		if (ret != 0) {
+			priv_enter();
+			unlink(dst);
+			priv_leave();
+			snprintf(msg, sizeof(msg), "%.180s. Nothing changed: the array still uses the old parity.", note);
+		} else {
+			snprintf(msg, sizeof(msg), "The parity was copied to %.100s and checked byte by byte. The array now uses it; the old file was not touched.", dst);
+		}
+	}
+	ss_done(&text);
+	ss_done(&fresh);
+
+	job_finish(ret, msg);
+
+	return 0;
+}
+
+int storage_parity_move_start(struct snapraid_state* state, const char* key, const char* target_dir, char* msg, size_t msg_size)
+{
+	char path[PATH_MAX];
+	char file[PATH_MAX];
+	char dst[PATH_MAX];
+	size_t begin;
+	size_t end;
+	struct mount_entry entry;
+	struct stat st;
+	struct statvfs vfs;
+	ss_t text;
+
+	if (strcmp(key, "parity") != 0 && !(key[0] >= '2' && key[0] <= '6' && strcmp(key + 1, "-parity") == 0))
+		return fail(msg, msg_size, 400, "Unknown parity level");
+	if (!valid_path(target_dir) || system_path(target_dir))
+		return fail(msg, msg_size, 400, "Invalid folder for the parity");
+
+	ss_init(&text, 4096);
+	engine_conf_path(state, path, sizeof(path));
+	priv_enter();
+	int rd = file_read(path, &text);
+	priv_leave();
+	ss_write(&text, "", 1);
+	int found = rd == 0 ? conf_parity_file(ss_ptr(&text), key, file, sizeof(file), &begin, &end) : -1;
+	ss_done(&text);
+	if (found < 0)
+		return fail(msg, msg_size, 404, "The array has no %s", key);
+	if (found > 0)
+		return fail(msg, msg_size, 409, "This parity is split in more files: move it mounting the new disk in place of the old one and running Recover");
+
+	const char* base = strrchr(file, '/');
+	if (!base || snprintf(dst, sizeof(dst), "%s%s", target_dir, base) >= (int)sizeof(dst))
+		return fail(msg, msg_size, 400, "Invalid parity file");
+
+	priv_enter();
+	int have_src = stat(file, &st) == 0 && S_ISREG(st.st_mode);
+	struct stat dst_st;
+	int have_dst = lstat(dst, &dst_st) == 0;
+	int have_fs = statvfs(target_dir, &vfs) == 0;
+	priv_leave();
+	if (!have_src)
+		return fail(msg, msg_size, 404, "The parity file %s is not there: is its disk mounted?", file);
+	if (mount_find(target_dir, &entry) != 0 || is_mergerfs(entry.fstype))
+		return fail(msg, msg_size, 400, "%s is not the mount point of a disk", target_dir);
+	if (have_dst)
+		return fail(msg, msg_size, 409, "%s already exists", dst);
+	if (!have_fs || (uint64_t)vfs.f_bavail * vfs.f_frsize < (uint64_t)st.st_size)
+		return fail(msg, msg_size, 409, "The new disk is too small for the parity file");
+
+	/* a parity next to data files is a parity that cannot grow */
+	struct layout layout;
+	int partial;
+	layout_load(&layout, 0);
+	const struct layout_entry* use = layout_find_dir(&layout, target_dir, &partial);
+	int taken = use != 0;
+	layout_done(&layout);
+	if (taken)
+		return fail(msg, msg_size, 409, "%s is already used by an array", target_dir);
+
+	state_lock();
+	const char* busy = array_heavy_command_locked(state->name);
+	if (busy != 0) {
+		int ret = fail(msg, msg_size, 409, "The array is running a %s. Wait for it to finish, then move the parity.", busy);
+		state_unlock();
+		return ret;
+	}
+	int ret = job_begin("parity_move", target_dir, msg, msg_size);
+	if (ret != 0) {
+		state_unlock();
+		return ret;
+	}
+	sncpy(job.a, sizeof(job.a), file);
+	sncpy(job.b, sizeof(job.b), key);
+	sncpy(job.e, sizeof(job.e), dst);
+	job.state = state;
+	sncpy(job.claims[0], ARRAY_NAME_MAX, state->name);
+	job.claims_count = 1;
+	state_unlock();
+
+	return job_launch(parity_move_thread, msg, msg_size);
 }
 
 /****************************************************************************/
@@ -3393,8 +4047,35 @@ static int test_layout(void)
 	return 0;
 }
 
+static int test_parity_conf(void)
+{
+	const char* text = "# parity /old/place\nparity /mnt/p1/snapraid.parity  \r\n2-parity /mnt/a/s.2-parity,/mnt/b/s.2-parity\ndata d1 /mnt/d1\nparity_like /x\n";
+	char file[PATH_MAX];
+	size_t begin;
+	size_t end;
+
+	/* one file, with the spaces and the carriage return left out */
+	CHECK(conf_parity_file(text, "parity", file, sizeof(file), &begin, &end) == 0);
+	CHECK(strcmp(file, "/mnt/p1/snapraid.parity") == 0);
+	CHECK(strncmp(text + begin, "/mnt/p1/snapraid.parity", end - begin) == 0 && end - begin == strlen(file));
+
+	/* a split parity is told apart, a missing level and a comment are not found */
+	CHECK(conf_parity_file(text, "2-parity", file, sizeof(file), &begin, &end) == 1);
+	CHECK(conf_parity_file(text, "3-parity", file, sizeof(file), &begin, &end) == -1);
+	CHECK(conf_parity_file("# parity /x\n", "parity", file, sizeof(file), &begin, &end) == -1);
+	CHECK(conf_parity_file("parity\n", "parity", file, sizeof(file), &begin, &end) == -1);
+
+	/* the last line without newline */
+	CHECK(conf_parity_file("data d1 /a\nparity /p/f", "parity", file, sizeof(file), &begin, &end) == 0);
+	CHECK(strcmp(file, "/p/f") == 0);
+
+	return 0;
+}
+
 int storage_selftest(void)
 {
+	if (test_parity_conf() != 0)
+		return -1;
 	if (test_layout() != 0)
 		return -1;
 	if (test_validation() != 0)
@@ -3513,6 +4194,27 @@ int storage_balance_start(const char* mountpoint, uint64_t max_bytes, unsigned s
 	(void)mountpoint;
 	(void)max_bytes;
 	(void)spread;
+	return unsupported(msg, msg_size);
+}
+
+int storage_move_start(const char* kind, const char* mountpoint, const char* from, const char* rel, const char* to, unsigned age_minutes, int sync_after, const char* tag, char* msg, size_t msg_size)
+{
+	(void)kind;
+	(void)mountpoint;
+	(void)from;
+	(void)rel;
+	(void)to;
+	(void)age_minutes;
+	(void)sync_after;
+	(void)tag;
+	return unsupported(msg, msg_size);
+}
+
+int storage_parity_move_start(struct snapraid_state* state, const char* key, const char* target_dir, char* msg, size_t msg_size)
+{
+	(void)state;
+	(void)key;
+	(void)target_dir;
 	return unsupported(msg, msg_size);
 }
 

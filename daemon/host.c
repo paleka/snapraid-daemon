@@ -11,6 +11,7 @@
 #include "storage_int.h"
 #include "arrays.h"
 #include "runner.h"
+#include "scheduler.h"
 #include "memory.h"
 #include "host.h"
 
@@ -460,6 +461,10 @@ static const char* const BACKUP_OPTIONS[] = {
 	"source:p", "dest_uuid:U", "dest_dir:t", "dest_path:p", "when:s", "plug:b", "mirror:b", "enabled:b", 0
 };
 
+static const char* const CACHE_OPTIONS[] = {
+	"pool:p", "branch:p", "age_hours:i", "fill:i", "when:s", "sync:b", "enabled:b", "policy:n", 0
+};
+
 static const char* const POWER_OPTIONS[] = {
 	"apm:i", "aam:i", "wcache:b", 0
 };
@@ -530,6 +535,25 @@ static int setting_check(const char* key, const char* val, char* msg, size_t msg
 		char dpath[PATH_MAX];
 		if (opt_get(val, "dest_uuid", uuid, sizeof(uuid)) != 0 && opt_get(val, "dest_path", dpath, sizeof(dpath)) != 0)
 			return hfail(msg, msg_size, 400, "A backup needs a destination: a disk or a folder");
+		return 0;
+	}
+	if (strcmp(key, "sync_ratio") == 0) {
+		if (!valid_int(val, 0, 1000))
+			return hfail(msg, msg_size, 400, "sync_ratio is from 0 to 1000");
+		return 0;
+	}
+	if (strncmp(key, "cache.", 6) == 0) {
+		char path[PATH_MAX];
+		if (!valid_name(key + 6))
+			return hfail(msg, msg_size, 400, "A name has only letters, digits, - and _ (up to 32)");
+		int ret = valid_options_line(val, CACHE_OPTIONS, msg, msg_size);
+		if (ret != 0)
+			return ret;
+		if (opt_get(val, "pool", path, sizeof(path)) != 0 || opt_get(val, "branch", path, sizeof(path)) != 0)
+			return hfail(msg, msg_size, 400, "A fast disk needs its pool and its folder");
+		char fill[16];
+		if (opt_get(val, "fill", fill, sizeof(fill)) == 0 && !valid_int(fill, 0, 99))
+			return hfail(msg, msg_size, 400, "The fill level is from 0 to 99");
 		return 0;
 	}
 	if (strncmp(key, "power.", 6) == 0) {
@@ -998,8 +1022,8 @@ static void* copy_thread(void* arg)
 	const char* args[16];
 	unsigned n = 0;
 
-	/* the final slash copies the content of the folder, not the folder */
-	snprintf(src, sizeof(src), "%s/", hjob.a);
+	/* the final slash copies the content of the folder, not the folder; a file goes as it is */
+	snprintf(src, sizeof(src), "%s%s", hjob.a, strcmp(hjob.c, "file") == 0 ? "" : "/");
 	hjob.last_error[0] = 0;
 
 	args[n++] = "-aHAX";
@@ -1103,12 +1127,18 @@ static int copy_start(const char* kind, const char* source, const char* target, 
 		return ret;
 	if (path_inside(target, source) || path_inside(source, target))
 		return hfail(msg, msg_size, 400, "The source and the destination are one inside the other");
-	if (stat(source, &st) != 0 || !S_ISDIR(st.st_mode))
-		return hfail(msg, msg_size, 404, "The folder %s does not exist", source);
+	priv_enter();
+	int have = lstat(source, &st) == 0 && (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode));
+	priv_leave();
+	if (!have)
+		return hfail(msg, msg_size, 404, "%s does not exist", source);
+	if (S_ISREG(st.st_mode) && mirror)
+		return hfail(msg, msg_size, 400, "Only a folder can be mirrored");
 
 	ret = job_begin(kind, source, msg, msg_size);
 	if (ret != 0)
 		return ret;
+	sncpy(hjob.c, sizeof(hjob.c), S_ISREG(st.st_mode) ? "file" : "");
 	sncpy(hjob.a, sizeof(hjob.a), source);
 	sncpy(hjob.b, sizeof(hjob.b), target);
 	sncpy(hjob.backup_name, sizeof(hjob.backup_name), backup_name ? backup_name : "");
@@ -1165,6 +1195,201 @@ static int perms_start(const char* path, char* msg, size_t msg_size)
 	sncpy(hjob.a, sizeof(hjob.a), path);
 
 	return job_launch(perms_thread, msg, msg_size);
+}
+
+/****************************************************************************/
+/* jobs: where a folder is stored, reading test of a disk */
+
+struct usage_sum {
+	uint64_t bytes;
+	uint64_t files;
+};
+
+static int usage_add(const char* rel, const struct stat* st, void* arg)
+{
+	struct usage_sum* sum = arg;
+
+	(void)rel;
+	sum->bytes += (uint64_t)st->st_blocks * 512;
+	++sum->files;
+	job_progress(1, (uint64_t)st->st_blocks * 512);
+
+	return 0;
+}
+
+/** Size of a folder, and how much of it is on every disk of its pool. */
+static void* usage_thread(void* arg)
+{
+	(void)arg;
+	char msg[MSG_MAX];
+	char pool[PATH_MAX] = "";
+	struct mount_entry entry;
+	struct pool_branch* branches = malloc_nofail(sizeof(struct pool_branch) * BRANCH_MAX);
+	unsigned count = 0;
+	ss_t mounts;
+	int r;
+	uint64_t total = 0;
+	uint64_t files = 0;
+
+	/* the pool holding the folder, if any */
+	ss_init(&mounts, 4096);
+	file_read("/proc/self/mounts", &mounts);
+	ss_write(&mounts, "", 1);
+	const char* cursor = ss_ptr(&mounts);
+	while ((r = mount_next(&cursor, &entry, 0, 0)) >= 0) {
+		if (r == 1 && is_mergerfs(entry.fstype) && path_inside(hjob.a, entry.target) && strlen(entry.target) > strlen(pool))
+			sncpy(pool, sizeof(pool), entry.target);
+	}
+	ss_done(&mounts);
+
+	priv_enter();
+	if (pool[0] && pool_branches(pool, branches, &count, msg, sizeof(msg)) == 0) {
+		const char* sub = hjob.a + strlen(pool);
+		for (unsigned i = 0; i < count && !job_stopping(); ++i) {
+			char root[PATH_MAX * 2];
+			char value[64];
+			struct usage_sum sum = { 0, 0 };
+			snprintf(root, sizeof(root), "%s%s", branches[i].path, sub);
+			job_current(branches[i].path);
+			walk_tree(root, "", 0, usage_add, &sum);
+			if (sum.files == 0)
+				continue;
+			snprintf(value, sizeof(value), "%" PRIu64 " %" PRIu64, sum.bytes, sum.files);
+			job_result_line(branches[i].path, value);
+			total += sum.bytes;
+			files += sum.files;
+		}
+	} else {
+		char value[64];
+		struct usage_sum sum = { 0, 0 };
+		job_current(hjob.a);
+		walk_tree(hjob.a, "", 0, usage_add, &sum);
+		snprintf(value, sizeof(value), "%" PRIu64 " %" PRIu64, sum.bytes, sum.files);
+		job_result_line(hjob.a, value);
+		total = sum.bytes;
+		files = sum.files;
+	}
+	priv_leave();
+	free(branches);
+
+	if (job_stopping()) {
+		job_finish(499, "Stopped before every file was counted");
+	} else {
+		snprintf(msg, sizeof(msg), "%" PRIu64 " files, %" PRIu64 " bytes", files, total);
+		job_finish(0, msg);
+	}
+
+	return 0;
+}
+
+static int usage_start(const char* path, char* msg, size_t msg_size)
+{
+	struct stat st;
+	int ret = valid_tree(path, msg, msg_size);
+	if (ret != 0)
+		return ret;
+	/* not through a link: it could lead anywhere */
+	priv_enter();
+	int have = lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
+	priv_leave();
+	if (!have)
+		return hfail(msg, msg_size, 404, "The folder %s does not exist", path);
+
+	ret = job_begin("usage", path, msg, msg_size);
+	if (ret != 0)
+		return ret;
+	sncpy(hjob.a, sizeof(hjob.a), path);
+
+	return job_launch(usage_thread, msg, msg_size);
+}
+
+#define SURFACE_ERRORS_MAX 100
+
+/**
+ * Read a whole disk, from the first to the last block. Nothing is written:
+ * it's safe on a disk in use, and it tells if a new disk can be trusted.
+ */
+static void* surface_thread(void* arg)
+{
+	(void)arg;
+	char msg[MSG_MAX];
+	const char* device = hjob.a;
+
+	priv_enter();
+	int f = open(device, O_RDONLY | O_CLOEXEC);
+	priv_leave();
+	if (f < 0) {
+		snprintf(msg, sizeof(msg), "Cannot open %.100s: %.100s", device, strerror(errno));
+		job_finish(500, msg);
+		return 0;
+	}
+
+	uint64_t size = 0;
+	if (ioctl(f, BLKGETSIZE64, &size) != 0 || size == 0) {
+		close(f);
+		job_finish(500, "Cannot read the size of the disk");
+		return 0;
+	}
+
+	unsigned char* buf = malloc_nofail(WIPE_CHUNK);
+	uint64_t done = 0;
+	unsigned errors = 0;
+
+	job_current(device);
+	while (done < size && errors < SURFACE_ERRORS_MAX) {
+		if (job_stopping())
+			break;
+		size_t chunk = size - done < WIPE_CHUNK ? (size_t)(size - done) : WIPE_CHUNK;
+		ssize_t n = pread(f, buf, chunk, (off_t)done);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0) {
+			/* an area that cannot be read: note it and go on after it */
+			char where[64];
+			snprintf(where, sizeof(where), "%" PRIu64, done);
+			job_result_line(where, n < 0 ? strerror(errno) : "short read");
+			++errors;
+			n = chunk;
+		} else {
+			/* don't push the files in use out of the memory */
+			posix_fadvise(f, (off_t)done, n, POSIX_FADV_DONTNEED);
+		}
+		done += n;
+		job_progress(0, n);
+	}
+	close(f);
+	free(buf);
+
+	if (errors >= SURFACE_ERRORS_MAX) {
+		snprintf(msg, sizeof(msg), "Stopped after %u areas that cannot be read. This disk is failing: do not trust it with files.", errors);
+		job_finish(500, msg);
+	} else if (done < size) {
+		snprintf(msg, sizeof(msg), "Stopped after %" PRIu64 " of %" PRIu64 " bytes, with %u areas that cannot be read", done, size, errors);
+		job_finish(499, msg);
+	} else if (errors) {
+		snprintf(msg, sizeof(msg), "%u areas of %.100s cannot be read. This disk is failing: do not trust it with files.", errors, device);
+		job_finish(500, msg);
+	} else {
+		snprintf(msg, sizeof(msg), "Every block of %.100s was read without errors (%" PRIu64 " bytes)", device, size);
+		job_finish(0, msg);
+	}
+
+	return 0;
+}
+
+static int surface_start(const char* device, char* msg, size_t msg_size)
+{
+	char name[64];
+
+	if (!valid_disk_device(device, name, sizeof(name)))
+		return hfail(msg, msg_size, 400, "%s is not a whole disk", device);
+
+	int ret = job_begin("surface", device, msg, msg_size);
+	if (ret != 0)
+		return ret;
+	sncpy(hjob.a, sizeof(hjob.a), device);
+
+	return job_launch(surface_thread, msg, msg_size);
 }
 
 /****************************************************************************/
@@ -1777,6 +2002,313 @@ static void backups_tick(const struct tm* tm, int first)
 			backup_run(names[i], msg, sizeof(msg));
 		else if (due)
 			b->pending = 1;
+	}
+}
+
+/****************************************************************************/
+/* fast disks in front of a pool, and their mover */
+
+struct cache_seen {
+	char name[64];
+	int pending; /**< A run is due but the job slot was busy */
+	time_t last_fill_run; /**< Latest run started because the disk was filling up */
+};
+
+#define CACHES_MAX 16
+
+static struct cache_seen cache_seen[CACHES_MAX];
+static unsigned cache_seen_count;
+
+static struct cache_seen* cache_slot(const char* name)
+{
+	for (unsigned i = 0; i < cache_seen_count; ++i) {
+		if (strcmp(cache_seen[i].name, name) == 0)
+			return &cache_seen[i];
+	}
+	if (cache_seen_count == CACHES_MAX)
+		return 0;
+	struct cache_seen* c = &cache_seen[cache_seen_count++];
+	memset(c, 0, sizeof(*c));
+	sncpy(c->name, sizeof(c->name), name);
+	return c;
+}
+
+void host_move_done(const char* tag, int status, const char* message)
+{
+	char key[128];
+	char val[MSG_MAX + 64];
+
+	if (strncmp(tag, "cache.", 6) != 0)
+		return;
+
+	snprintf(key, sizeof(key), "last.%s", tag);
+	snprintf(val, sizeof(val), "%" PRIi64 "\t%d\t%s", (int64_t)time(0), status, message);
+
+	pthread_mutex_lock(&host_mutex);
+	kv_set_locked(key, val);
+	kv_save_locked();
+	pthread_mutex_unlock(&host_mutex);
+}
+
+#define CACHE_COUNT_MAX 2000 /**< Files of a fast disk counted for the status, not to walk a full disk at every request */
+
+struct cache_count {
+	unsigned files;
+	uint64_t bytes;
+};
+
+/** Count the files waiting on a fast disk, up to CACHE_COUNT_MAX. */
+static void cache_count_dir(const char* dir, unsigned depth, struct cache_count* count)
+{
+	if (depth > 32 || count->files >= CACHE_COUNT_MAX)
+		return;
+
+	DIR* d = opendir(dir);
+	if (!d)
+		return;
+
+	struct dirent* dd;
+	while (count->files < CACHE_COUNT_MAX && (dd = readdir(d)) != 0) {
+		char path[PATH_MAX];
+		struct stat st;
+
+		/* the same files the mover leaves */
+		if (walk_skip(dd->d_name, depth == 0))
+			continue;
+		if (snprintf(path, sizeof(path), "%s/%s", dir, dd->d_name) >= (int)sizeof(path))
+			continue;
+		if (lstat(path, &st) != 0)
+			continue;
+		if (S_ISDIR(st.st_mode)) {
+			cache_count_dir(path, depth + 1, count);
+		} else {
+			++count->files;
+			count->bytes += (uint64_t)st.st_blocks * 512;
+		}
+	}
+	closedir(d);
+}
+
+/** How full a filesystem is, in percent. -1 if not known. */
+static int fill_percent(const char* path)
+{
+	struct statvfs vfs;
+
+	if (statvfs(path, &vfs) != 0 || vfs.f_blocks == 0)
+		return -1;
+
+	return (int)(100 - (uint64_t)vfs.f_bavail * 100 / vfs.f_blocks);
+}
+
+/**
+ * Move the files of a fast disk to the other disks of its pool.
+ * \param all Also the files newer than the age set, because the disk is filling up or it was asked now.
+ */
+static int cache_run(const char* name, int all, char* msg, size_t msg_size)
+{
+	char key[128];
+	char line[2048];
+	char pool[PATH_MAX];
+	char branch[PATH_MAX];
+	char age[16];
+
+	snprintf(key, sizeof(key), "cache.%s", name);
+	kv_get(key, "", line, sizeof(line));
+	if (line[0] == 0)
+		return hfail(msg, msg_size, 404, "There is no fast disk named %s", name);
+
+	opt_get(line, "pool", pool, sizeof(pool));
+	opt_get(line, "branch", branch, sizeof(branch));
+	unsigned minutes = 5; /* a file being written is never taken */
+	if (!all && opt_get(line, "age_hours", age, sizeof(age)) == 0 && atoi(age) > 0)
+		minutes = atoi(age) * 60;
+
+	int ret = storage_move_start("mover", pool, branch, "", "", minutes, opt_bool(line, "sync", 1), key, msg, msg_size);
+
+	struct cache_seen* c = cache_slot(name);
+	if (c)
+		c->pending = ret == 409;
+
+	return ret;
+}
+
+/** Once a minute: the movers on a schedule, and the ones of a fast disk filling up. */
+static void caches_tick(const struct tm* tm)
+{
+	char names[CACHES_MAX][64];
+	char lines[CACHES_MAX][1024];
+	unsigned n = 0;
+
+	pthread_mutex_lock(&host_mutex);
+	for (unsigned i = 0; i < kv_count && n < CACHES_MAX; ++i) {
+		if (strncmp(kv_list[i].key, "cache.", 6) != 0)
+			continue;
+		sncpy(names[n], sizeof(names[n]), kv_list[i].key + 6);
+		sncpy(lines[n], sizeof(lines[n]), kv_list[i].val);
+		++n;
+	}
+	pthread_mutex_unlock(&host_mutex);
+
+	for (unsigned i = 0; i < n; ++i) {
+		char when[256];
+		char fill[16];
+		char branch[PATH_MAX];
+		char msg[MSG_MAX];
+		struct cache_seen* c = cache_slot(names[i]);
+		if (!c || !opt_bool(lines[i], "enabled", 1))
+			continue;
+
+		int due = c->pending;
+		int all = 0;
+		if (opt_get(lines[i], "when", when, sizeof(when)) == 0 && when[0] && sched_match(when, tm))
+			due = 1;
+
+		/* a fast disk that fills up sends the new files to the slow ones: empty it before */
+		time_t now = time(0);
+		if (opt_get(lines[i], "fill", fill, sizeof(fill)) == 0 && atoi(fill) > 0
+			&& opt_get(lines[i], "branch", branch, sizeof(branch)) == 0
+			&& fill_percent(branch) >= atoi(fill) && now - c->last_fill_run >= 30 * 60) {
+			due = 1;
+			all = 1;
+		}
+
+		if (!due)
+			continue;
+		if (job_is_running()) {
+			c->pending = 1;
+			continue;
+		}
+		if (all) {
+			c->last_fill_run = now;
+			log_msg(LVL_INFO, "host: the fast disk %s is %d%% full, moving its files now", names[i], fill_percent(branch));
+		}
+		cache_run(names[i], all, msg, sizeof(msg));
+	}
+}
+
+/** Check a fast disk before it's saved: a branch of the pool that no array protects. */
+static int cache_check(const char* pool, const char* branch, char* msg, size_t msg_size)
+{
+	struct pool_branch* branches = malloc_nofail(sizeof(struct pool_branch) * BRANCH_MAX);
+	unsigned count = 0;
+	int ret;
+
+	priv_enter();
+	ret = pool_branches(pool, branches, &count, msg, msg_size);
+	priv_leave();
+	if (ret == 0) {
+		int found = 0;
+		for (unsigned i = 0; i < count; ++i) {
+			if (strcmp(branches[i].path, branch) == 0)
+				found = 1;
+		}
+		if (!found)
+			ret = hfail(msg, msg_size, 400, "%s is not a disk of the pool %s", branch, pool);
+		else if (count < 2)
+			ret = hfail(msg, msg_size, 400, "The pool %s has no other disk to move the files to", pool);
+	}
+	free(branches);
+	if (ret != 0)
+		return ret;
+
+	struct host_disk* disks = malloc_nofail(sizeof(struct host_disk) * HOST_DISKS_MAX);
+	unsigned n = host_disks(disks, HOST_DISKS_MAX);
+	for (unsigned i = 0; i < n && ret == 0; ++i) {
+		if (disks[i].mount[0] && (path_inside(branch, disks[i].mount) || path_inside(disks[i].mount, branch)))
+			ret = hfail(msg, msg_size, 409, "%s is the disk %s of the array %s: its files are already where they have to be", branch, disks[i].name, disks[i].array);
+	}
+	free(disks);
+
+	return ret;
+}
+
+/****************************************************************************/
+/* a sync stopped by the limit of deleted files, when a lot more were added */
+
+#define RATIO_SEEN_MAX 64
+
+/**
+ * A big tidy up deletes many files and adds many more. With the setting
+ * 'sync_ratio', a maintenance sync stopped only by the limit of the deleted
+ * files is run again without the limit, when the files added are at least
+ * that many times the deleted ones.
+ */
+static void ratio_tick(void)
+{
+	static struct {
+		struct snapraid_state* state;
+		int number;
+	} seen[RATIO_SEEN_MAX];
+	static unsigned seen_count;
+	struct snapraid_state* go[RATIO_SEEN_MAX];
+	int64_t go_added[RATIO_SEEN_MAX];
+	int64_t go_removed[RATIO_SEEN_MAX];
+	unsigned n = 0;
+
+	int ratio = kv_int("sync_ratio", 0);
+	if (ratio <= 0)
+		return;
+
+	state_lock();
+	for (tommy_node* i = tommy_list_head(&host_ptr()->state_list); i && n < RATIO_SEEN_MAX; i = i->next) {
+		struct snapraid_state* state = i->data;
+		struct snapraid_task* task = 0;
+
+		/* only once the whole maintenance is over */
+		if ((state->runner.latest && state->runner.latest->running) || !tommy_list_empty(&state->runner.waiting_list))
+			continue;
+
+		/* its sync is followed by other tasks: take the newest one of the history */
+		for (tommy_node* j = tommy_list_head(&state->runner.history_list); j; j = j->next) {
+			struct snapraid_task* t = j->data;
+			if (t->cmd == CMD_SYNC && (task == 0 || t->number > task->number))
+				task = t;
+		}
+		if (!task || task->high_cmd != CMD_MAINTENANCE || task->state != PROCESS_STATE_TERM || task->exit_code == 0)
+			continue;
+
+		/* every task is looked at once */
+		unsigned k;
+		for (k = 0; k < seen_count; ++k) {
+			if (seen[k].state == state)
+				break;
+		}
+		if (k == seen_count) {
+			if (seen_count == RATIO_SEEN_MAX)
+				continue;
+			seen[seen_count++].state = state;
+			seen[k].number = -1;
+		}
+		if (seen[k].number == task->number)
+			continue;
+		seen[k].number = task->number;
+
+		int by_removes = 0;
+		int by_updates = 0;
+		for (tommy_node* j = tommy_list_head(&task->message_list); j; j = j->next) {
+			struct snapraid_message* m = j->data;
+			if (strstr(m->msg, "Too many files were removed") != 0)
+				by_removes = 1;
+			if (strstr(m->msg, "Too many files were updated") != 0)
+				by_updates = 1;
+		}
+		if (!by_removes || by_updates)
+			continue;
+		if (task->diff_removed <= 0 || task->diff_added < task->diff_removed * ratio)
+			continue;
+
+		go[n] = state;
+		go_added[n] = task->diff_added;
+		go_removed[n] = task->diff_removed;
+		++n;
+	}
+	state_unlock();
+
+	for (unsigned k = 0; k < n; ++k) {
+		char msg[MSG_MAX];
+		int status;
+		log_msg(LVL_WARNING, "host: the sync of the array %s stopped for %" PRIi64 " deleted files, but %" PRIi64 " were added, at least %d times as many: running it again without the limit", go[k]->name, go_removed[k], go_added[k], ratio);
+		schedule_maintenance(go[k], 1, 0, msg, sizeof(msg), &status);
 	}
 }
 
@@ -2883,6 +3415,48 @@ static void status_json(ss_t* s, int level)
 	}
 	ss_json_array_close(s, &level);
 
+	ss_json_array_open(s, &level, "caches");
+	for (unsigned i = 0; i < kv_count; ++i) {
+		if (strncmp(kv_list[i].key, "cache.", 6) != 0)
+			continue;
+		const char* name = kv_list[i].key + 6;
+		char key[128];
+		char branch[PATH_MAX];
+		ss_json_open(s, &level);
+		ss_json_str(s, level, "name", name);
+		options_json(s, level, kv_list[i].val, CACHE_OPTIONS);
+		snprintf(key, sizeof(key), "last.cache.%s", name);
+		const char* last = kv_get_locked(key, "");
+		if (last[0]) {
+			char buf[MSG_MAX + 64];
+			sncpy(buf, sizeof(buf), last);
+			char* t1 = strchr(buf, '\t');
+			char* t2 = t1 ? strchr(t1 + 1, '\t') : 0;
+			if (t1 && t2) {
+				*t1 = *t2 = 0;
+				ss_json_i64(s, level, "last_time", strtoll(buf, 0, 10));
+				ss_json_int(s, level, "last_status", atoi(t1 + 1));
+				ss_json_str(s, level, "last_message", t2 + 1);
+			}
+		}
+		if (opt_get(kv_list[i].val, "branch", branch, sizeof(branch)) == 0 && statvfs(branch, &vfs) == 0) {
+			ss_json_u64(s, level, "total_bytes", (uint64_t)vfs.f_blocks * vfs.f_frsize);
+			ss_json_u64(s, level, "free_bytes", (uint64_t)vfs.f_bavail * vfs.f_frsize);
+			ss_json_u64(s, level, "used_bytes", (uint64_t)(vfs.f_blocks - vfs.f_bfree) * vfs.f_frsize);
+
+			/* what waits on it, and is not protected yet */
+			struct cache_count count = { 0, 0 };
+			priv_enter();
+			cache_count_dir(branch, 0, &count);
+			priv_leave();
+			ss_json_uint(s, level, "waiting_files", count.files);
+			ss_json_u64(s, level, "waiting_bytes", count.bytes);
+			ss_json_bool(s, level, "waiting_more", count.files >= CACHE_COUNT_MAX);
+		}
+		ss_json_close(s, &level);
+	}
+	ss_json_array_close(s, &level);
+
 	ss_json_array_open(s, &level, "power");
 	for (unsigned i = 0; i < kv_count; ++i) {
 		if (strncmp(kv_list[i].key, "power.", 6) != 0)
@@ -3058,7 +3632,7 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 		/* simple settings and documents of the UI; shares, backups and power have their own requests */
 		for (unsigned i = 0; i < args->count; ++i) {
 			const char* k = args->key[i];
-			if (strncmp(k, "share.", 6) == 0 || strncmp(k, "backup.", 7) == 0 || strncmp(k, "power.", 6) == 0 || strncmp(k, "last.", 5) == 0)
+			if (strncmp(k, "share.", 6) == 0 || strncmp(k, "backup.", 7) == 0 || strncmp(k, "power.", 6) == 0 || strncmp(k, "cache.", 6) == 0 || strncmp(k, "last.", 5) == 0)
 				return hfail(msg, msg_size, 400, "Use the request of its own for %s", k);
 			ret = setting_check(k, args->val[i], msg, msg_size);
 			if (ret != 0)
@@ -3136,6 +3710,39 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 	if (strcmp(action, "backup_run") == 0)
 		return backup_run(need(args, "name"), msg, msg_size);
 
+	if (strcmp(action, "cache_save") == 0 || strcmp(action, "cache_delete") == 0) {
+		const char* name = need(args, "name");
+		if (!valid_name(name))
+			return hfail(msg, msg_size, 400, "A name has only letters, digits, - and _ (up to 32)");
+		snprintf(key, sizeof(key), "cache.%s", name);
+		if (strcmp(action, "cache_save") == 0) {
+			options_from_args(args, CACHE_OPTIONS, line, sizeof(line));
+			ret = setting_check(key, line, msg, msg_size);
+			if (ret != 0)
+				return ret;
+			ret = cache_check(need(args, "pool"), need(args, "branch"), msg, msg_size);
+			if (ret != 0)
+				return ret;
+		} else {
+			line[0] = 0;
+		}
+		ret = setting_store(key, line, msg, msg_size);
+		if (ret == 0 && line[0] == 0) {
+			snprintf(key, sizeof(key), "last.cache.%s", name);
+			pthread_mutex_lock(&host_mutex);
+			kv_set_locked(key, "");
+			kv_save_locked();
+			pthread_mutex_unlock(&host_mutex);
+		}
+		return ret;
+	}
+	if (strcmp(action, "cache_run") == 0)
+		return cache_run(need(args, "name"), 1, msg, msg_size);
+	if (strcmp(action, "usage") == 0)
+		return usage_start(need(args, "path"), msg, msg_size);
+	if (strcmp(action, "surface") == 0)
+		return surface_start(need(args, "device"), msg, msg_size);
+
 	if (strcmp(action, "power_save") == 0) {
 		const char* disk = need(args, "disk");
 		snprintf(key, sizeof(key), "power.%s", disk);
@@ -3210,6 +3817,8 @@ static void* host_thread(void* arg)
 			window_tick(&tm);
 			smart_tick(&tm);
 			backups_tick(&tm, first);
+			caches_tick(&tm);
+			ratio_tick();
 			idle_tick(&tm);
 			first = 0;
 		}
@@ -3425,6 +4034,13 @@ void host_start(void)
 
 void host_done(void)
 {
+}
+
+void host_move_done(const char* tag, int status, const char* message)
+{
+	(void)tag;
+	(void)status;
+	(void)message;
 }
 
 int host_get_is_private(const char* what)

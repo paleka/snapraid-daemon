@@ -3094,6 +3094,8 @@ static int handler_host(struct mg_connection* conn, void* cbdata)
  * POST /snapraid/v1/storage/recover
  * POST /snapraid/v1/storage/balance
  * POST /snapraid/v1/storage/duplicates
+ * POST /snapraid/v1/storage/move
+ * POST /snapraid/v1/storage/parity_move
  * POST /snapraid/v1/storage/job_stop
  */
 static int handler_storage_action(struct mg_connection* conn, void* cbdata)
@@ -3228,6 +3230,35 @@ static int handler_storage_action(struct mg_connection* conn, void* cbdata)
 		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
 		if (status == 0)
 			status = storage_duplicates_start(a, msg, sizeof(msg));
+	} else if (strcmp(action, "move") == 0) {
+		char* e = malloc_nofail(size * 3);
+		char* f = e + size;
+		char* g = f + size;
+		int sync_after = 0;
+		e[0] = f[0] = g[0] = 0;
+		struct json_field fields[] = {
+			{ "mountpoint", FIELD_STRING, a, size, 0, 0 },
+			{ "from", FIELD_STRING, b, size, 0, 0 },
+			{ "path", FIELD_STRING, c, size, 0, 0 },
+			{ "to", FIELD_STRING, d, size, 0, 0 },
+			{ "kind", FIELD_STRING, e, size, 0, 0 },
+			{ "age_minutes", FIELD_STRING, f, size, 0, 0 },
+			{ "sync", FIELD_BOOL, 0, 0, &sync_after, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_move_start(e[0] ? e : "move", a, b, c, d, (unsigned)strtoul(f, 0, 10), sync_after, "", msg, sizeof(msg));
+		free(e);
+	} else if (strcmp(action, "parity_move") == 0) {
+		struct json_field fields[] = {
+			{ "parity", FIELD_STRING, a, size, 0, 0 },
+			{ "target", FIELD_STRING, b, size, 0, 0 },
+			{ 0, 0, 0, 0, 0, 0 }
+		};
+		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
+		if (status == 0)
+			status = storage_parity_move_start(state, a, b, msg, sizeof(msg));
 	} else if (strcmp(action, "job_stop") == 0) {
 		struct json_field fields[] = {
 			{ 0, 0, 0, 0, 0, 0 }
@@ -4447,6 +4478,8 @@ int rest_init(struct snapraid_state* state, int net_enabled, const char* net_por
 		{ "v1/storage/recover", handler_storage_action },
 		{ "v1/storage/balance", handler_storage_action },
 		{ "v1/storage/duplicates", handler_storage_action },
+		{ "v1/storage/move", handler_storage_action },
+		{ "v1/storage/parity_move", handler_storage_action },
 		{ "v1/storage/job_stop", handler_storage_action },
 		{ "v1/storage/job", handler_storage },
 		{ "v1/storage/browse", handler_storage },
