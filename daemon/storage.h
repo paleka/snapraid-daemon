@@ -93,7 +93,7 @@ int storage_duplicates_start(const char* mountpoint, char* msg, size_t msg_size)
  * \param kind "mover" (a fast disk emptied to the array), "empty" (a disk emptied), "move" (a folder to a chosen disk).
  * \param from Branches to take the files from, separated by ':'.
  * \param rel Folder inside the pool, starting with /, or empty for everything.
- * \param to Branch getting the files, or empty for the emptiest of the others.
+ * \param to Branches getting the files, separated by ':', or empty for the emptiest of the others.
  * \param age_minutes Only files not changed for this long.
  * \param sync_after Run the maintenance of the arrays getting the files.
  * \param tag Name given back to host_move_done() at the end.
@@ -104,9 +104,10 @@ int storage_move_start(const char* kind, const char* mountpoint, const char* fro
  * Copy the file of a parity level to another disk, check the copy and
  * make the array use it. The old file is left as it is.
  * \param key "parity", "2-parity", ...
+ * \param part 0 for a parity of one file, from 1 for the files of a split parity.
  * \param target_dir Mount point of the new disk.
  */
-int storage_parity_move_start(struct snapraid_state* state, const char* key, const char* target_dir, char* msg, size_t msg_size);
+int storage_parity_move_start(struct snapraid_state* state, const char* key, unsigned part, const char* target_dir, char* msg, size_t msg_size);
 
 /**
  * List a directory of a pool telling in which branches every entry is.

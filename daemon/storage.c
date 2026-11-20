@@ -2820,6 +2820,24 @@ int storage_balance_start(const char* mountpoint, uint64_t max_bytes, unsigned s
  */
 #define MOVE_AGE_MIN 5 /**< Minutes a file must be left alone before it's moved */
 
+/** If a path is in a list of paths separated by ':'. */
+static int list_has(const char* list, const char* path)
+{
+	size_t len = strlen(path);
+
+	while (*list) {
+		const char* end = strchr(list, ':');
+		size_t l = end ? (size_t)(end - list) : strlen(list);
+		if (l == len && memcmp(list, path, len) == 0)
+			return 1;
+		list += l;
+		if (*list == ':')
+			++list;
+	}
+
+	return 0;
+}
+
 struct move_run {
 	struct pool_branch* branches;
 	unsigned count;
@@ -2829,6 +2847,8 @@ struct move_run {
 	uint64_t minfree;
 	time_t newest; /**< Files changed after this time are left */
 	int quiet_young; /**< The files too young are not reported */
+	int mover; /**< The job of a fast disk: its folders that stay are left */
+	int use_rules; /**< The folders kept on chosen disks go to their disks */
 	unsigned errors;
 };
 
@@ -2851,6 +2871,10 @@ static int move_one(const char* rel, const struct stat* st, void* arg)
 	if (job_stopping() || run->errors >= 5)
 		return 1;
 
+	/* a folder set to stay on the fast disk */
+	if (run->mover && host_move_stays(job.tag, rel))
+		return 0;
+
 	if (st->st_mtime > run->newest) {
 		/* the mover takes it the next time; who empties a disk has to know it's still there */
 		if (!run->quiet_young)
@@ -2864,9 +2888,25 @@ static int move_one(const char* rel, const struct stat* st, void* arg)
 		return 0;
 	}
 
+	/*
+	 * A folder kept on chosen disks takes its files there, if one of them
+	 * can get files now. If none can, as for the disk itself being emptied,
+	 * any other disk is better than staying.
+	 */
+	char keep[PATH_MAX];
+	int limited = 0;
+	if (run->use_rules && host_keep_disks(job.target, rel, keep, sizeof(keep))) {
+		for (unsigned i = 0; i < run->count; ++i) {
+			if (run->is_dest[i] && list_has(keep, run->branches[i].path))
+				limited = 1;
+		}
+	}
+
 	uint64_t size = S_ISREG(st->st_mode) ? (uint64_t)st->st_blocks * 512 : 0;
 	for (unsigned i = 0; i < run->count; ++i) {
 		if (!run->is_dest[i])
+			continue;
+		if (limited && !list_has(keep, run->branches[i].path))
 			continue;
 
 		/* never over a file with the same name: which one is the good one is not ours to say */
@@ -2881,7 +2921,7 @@ static int move_one(const char* rel, const struct stat* st, void* arg)
 			dst = i;
 	}
 	if (dst < 0) {
-		move_skip(run, rel, "no room on the other disks");
+		move_skip(run, rel, limited ? "no room on the disks chosen for its folder" : "no room on the other disks");
 		return 0;
 	}
 
@@ -2936,7 +2976,9 @@ static void* move_thread(void* arg)
 	if (pool_get(job.target, "minfreespace", value, sizeof(value)) != 0 || stru64(&run.minfree, value) != 0)
 		run.minfree = 0;
 	run.newest = time(0) - (time_t)job.age * 60;
-	run.quiet_young = strcmp(job.kind, "mover") == 0;
+	run.mover = strcmp(job.kind, "mover") == 0;
+	run.quiet_young = run.mover || strcmp(job.kind, "keep") == 0;
+	run.use_rules = job.f[0] == 0;
 
 	/* sources as told, destinations the one told or every other writable branch */
 	sncpy(list, sizeof(list), job.a);
@@ -2950,7 +2992,7 @@ static void* move_thread(void* arg)
 	for (unsigned i = 0; i < run.count; ++i) {
 		if (run.is_source[i])
 			continue;
-		if (job.f[0] ? strcmp(branches[i].path, job.f) == 0 : branches[i].writable)
+		if (job.f[0] ? list_has(job.f, branches[i].path) : branches[i].writable)
 			run.is_dest[i] = 1;
 	}
 
@@ -3056,7 +3098,7 @@ int storage_move_start(const char* kind, const char* mountpoint, const char* fro
 
 	if (!tool_exists("rsync"))
 		return fail(msg, msg_size, 501, "rsync is not installed. Install the 'rsync' package and try again.");
-	if (strcmp(kind, "mover") != 0 && strcmp(kind, "empty") != 0 && strcmp(kind, "move") != 0)
+	if (strcmp(kind, "mover") != 0 && strcmp(kind, "empty") != 0 && strcmp(kind, "move") != 0 && strcmp(kind, "keep") != 0)
 		return fail(msg, msg_size, 400, "Unknown kind of move");
 	if (rel[0] != 0 && (!valid_browse_path(rel) || rel[strlen(rel) - 1] == '/'))
 		return fail(msg, msg_size, 400, "Invalid folder");
@@ -3081,8 +3123,8 @@ int storage_move_start(const char* kind, const char* mountpoint, const char* fro
 		}
 		if (!found)
 			return fail(msg, msg_size, 400, "%s is not a disk of the pool %s", tok, mountpoint);
-		if (to[0] && strcmp(tok, to) == 0)
-			return fail(msg, msg_size, 400, "The files are already on %s", to);
+		if (to[0] && list_has(to, tok))
+			return fail(msg, msg_size, 400, "The files are already on %s", tok);
 		++sources;
 	}
 	unsigned dests = 0;
@@ -3097,7 +3139,7 @@ int storage_move_start(const char* kind, const char* mountpoint, const char* fro
 		sncat(all, sizeof(all), ":");
 		if (strstr(all, key) != 0)
 			continue;
-		if (to[0] ? strcmp(branches[i].path, to) == 0 : branches[i].writable)
+		if (to[0] ? list_has(to, branches[i].path) : branches[i].writable)
 			++dests;
 	}
 	if (sources == 0 || dests == 0)
@@ -3207,6 +3249,54 @@ static int conf_parity_file(const char* text, const char* key, char* file, size_
 	}
 
 	return -1;
+}
+
+/**
+ * Find one file of a parity level.
+ * \param part 0 for a parity made of one file; from 1 for the files of a split parity.
+ * \return 0 if found, 1 if part is 0 and the parity is split, -1 if missing.
+ */
+static int conf_parity_pick(const char* text, const char* key, unsigned part, char* file, size_t file_size, size_t* begin, size_t* end)
+{
+	char all[PATH_MAX * 4];
+	size_t b;
+	size_t e;
+
+	int ret = conf_parity_file(text, key, all, sizeof(all), &b, &e);
+	if (ret < 0 || (ret == 0 && part > 1))
+		return -1;
+	if (part == 0) {
+		if (ret == 0) {
+			if (strlen(all) >= file_size)
+				return -1;
+			sncpy(file, file_size, all);
+			*begin = b;
+			*end = e;
+		}
+		return ret;
+	}
+
+	const char* p = all;
+	for (unsigned n = 1; ; ++n) {
+		const char* comma = strchr(p, ',');
+		const char* stop = comma ? comma : p + strlen(p);
+		if (n == part) {
+			while (*p == ' ' || *p == '\t')
+				++p;
+			while (stop > p && (stop[-1] == ' ' || stop[-1] == '\t'))
+				--stop;
+			if (stop == p || (size_t)(stop - p) >= file_size)
+				return -1;
+			memcpy(file, p, stop - p);
+			file[stop - p] = 0;
+			*begin = b + (p - all);
+			*end = b + (stop - all);
+			return 0;
+		}
+		if (!comma)
+			return -1;
+		p = comma + 1;
+	}
 }
 
 /** Copy or compare two files, a chunk at a time. \return 0 on success, 1 if stopped, 2 if different, -1 on error. */
@@ -3339,7 +3429,7 @@ static void* parity_move_thread(void* arg)
 	int rd = file_read(path, &text);
 	priv_leave();
 	ss_write(&text, "", 1);
-	if (rd != 0 || conf_parity_file(ss_ptr(&text), job.b, file, sizeof(file), &begin, &end) != 0 || strcmp(file, src) != 0) {
+	if (rd != 0 || conf_parity_pick(ss_ptr(&text), job.b, job.age, file, sizeof(file), &begin, &end) != 0 || strcmp(file, src) != 0) {
 		priv_enter();
 		unlink(dst);
 		priv_leave();
@@ -3368,7 +3458,7 @@ static void* parity_move_thread(void* arg)
 	return 0;
 }
 
-int storage_parity_move_start(struct snapraid_state* state, const char* key, const char* target_dir, char* msg, size_t msg_size)
+int storage_parity_move_start(struct snapraid_state* state, const char* key, unsigned part, const char* target_dir, char* msg, size_t msg_size)
 {
 	char path[PATH_MAX];
 	char file[PATH_MAX];
@@ -3391,12 +3481,12 @@ int storage_parity_move_start(struct snapraid_state* state, const char* key, con
 	int rd = file_read(path, &text);
 	priv_leave();
 	ss_write(&text, "", 1);
-	int found = rd == 0 ? conf_parity_file(ss_ptr(&text), key, file, sizeof(file), &begin, &end) : -1;
+	int found = rd == 0 ? conf_parity_pick(ss_ptr(&text), key, part, file, sizeof(file), &begin, &end) : -1;
 	ss_done(&text);
 	if (found < 0)
-		return fail(msg, msg_size, 404, "The array has no %s", key);
+		return fail(msg, msg_size, 404, part ? "The array has no %s with that many files" : "The array has no %s", key);
 	if (found > 0)
-		return fail(msg, msg_size, 409, "This parity is split in more files: move it mounting the new disk in place of the old one and running Recover");
+		return fail(msg, msg_size, 409, "This parity is split in more files: tell which one to move");
 
 	const char* base = strrchr(file, '/');
 	if (!base || snprintf(dst, sizeof(dst), "%s%s", target_dir, base) >= (int)sizeof(dst))
@@ -3442,6 +3532,7 @@ int storage_parity_move_start(struct snapraid_state* state, const char* key, con
 	sncpy(job.a, sizeof(job.a), file);
 	sncpy(job.b, sizeof(job.b), key);
 	sncpy(job.e, sizeof(job.e), dst);
+	job.age = part;
 	job.state = state;
 	sncpy(job.claims[0], ARRAY_NAME_MAX, state->name);
 	job.claims_count = 1;
@@ -4065,6 +4156,17 @@ static int test_parity_conf(void)
 	CHECK(conf_parity_file("# parity /x\n", "parity", file, sizeof(file), &begin, &end) == -1);
 	CHECK(conf_parity_file("parity\n", "parity", file, sizeof(file), &begin, &end) == -1);
 
+	/* the files of a split parity, one by one */
+	CHECK(conf_parity_pick(text, "parity", 0, file, sizeof(file), &begin, &end) == 0 && strcmp(file, "/mnt/p1/snapraid.parity") == 0);
+	CHECK(conf_parity_pick(text, "parity", 1, file, sizeof(file), &begin, &end) == 0);
+	CHECK(conf_parity_pick(text, "parity", 2, file, sizeof(file), &begin, &end) == -1);
+	CHECK(conf_parity_pick(text, "2-parity", 0, file, sizeof(file), &begin, &end) == 1);
+	CHECK(conf_parity_pick(text, "2-parity", 2, file, sizeof(file), &begin, &end) == 0);
+	CHECK(strcmp(file, "/mnt/b/s.2-parity") == 0 && strncmp(text + begin, "/mnt/b/s.2-parity", end - begin) == 0 && end - begin == strlen(file));
+	CHECK(conf_parity_pick(text, "2-parity", 1, file, sizeof(file), &begin, &end) == 0 && strcmp(file, "/mnt/a/s.2-parity") == 0);
+	CHECK(conf_parity_pick(text, "2-parity", 3, file, sizeof(file), &begin, &end) == -1);
+	CHECK(list_has("/a:/b/c:/d", "/b/c") && list_has("/a", "/a") && !list_has("/a:/b/c", "/b") && !list_has("", "/a") && !list_has("/ab", "/a"));
+
 	/* the last line without newline */
 	CHECK(conf_parity_file("data d1 /a\nparity /p/f", "parity", file, sizeof(file), &begin, &end) == 0);
 	CHECK(strcmp(file, "/p/f") == 0);
@@ -4210,10 +4312,11 @@ int storage_move_start(const char* kind, const char* mountpoint, const char* fro
 	return unsupported(msg, msg_size);
 }
 
-int storage_parity_move_start(struct snapraid_state* state, const char* key, const char* target_dir, char* msg, size_t msg_size)
+int storage_parity_move_start(struct snapraid_state* state, const char* key, unsigned part, const char* target_dir, char* msg, size_t msg_size)
 {
 	(void)state;
 	(void)key;
+	(void)part;
 	(void)target_dir;
 	return unsupported(msg, msg_size);
 }

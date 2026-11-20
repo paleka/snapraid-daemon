@@ -72,6 +72,16 @@ int host_get_is_private(const char* what);
 /** Told by the move of files at its end, with the tag given at its start. */
 void host_move_done(const char* tag, int status, const char* message);
 
+/** If a file of a pool is in a folder set to stay on the fast disk of that tag. */
+int host_move_stays(const char* tag, const char* rel);
+
+/**
+ * The disks chosen for the folder of a file of a pool.
+ * \param disks Branches separated by ':'.
+ * \return 1 if the folder has chosen disks.
+ */
+int host_keep_disks(const char* pool, const char* rel, char* disks, size_t disks_size);
+
 int host_selftest(void);
 
 #endif

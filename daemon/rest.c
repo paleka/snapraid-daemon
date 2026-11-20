@@ -3251,14 +3251,16 @@ static int handler_storage_action(struct mg_connection* conn, void* cbdata)
 			status = storage_move_start(e[0] ? e : "move", a, b, c, d, (unsigned)strtoul(f, 0, 10), sync_after, "", msg, sizeof(msg));
 		free(e);
 	} else if (strcmp(action, "parity_move") == 0) {
+		c[0] = 0;
 		struct json_field fields[] = {
 			{ "parity", FIELD_STRING, a, size, 0, 0 },
 			{ "target", FIELD_STRING, b, size, 0, 0 },
+			{ "part", FIELD_STRING, c, size, 0, 0 },
 			{ 0, 0, 0, 0, 0, 0 }
 		};
 		status = json_fields(js, jl, fields, msg, sizeof(msg)) != 0 ? 400 : 0;
 		if (status == 0)
-			status = storage_parity_move_start(state, a, b, msg, sizeof(msg));
+			status = storage_parity_move_start(state, a, (unsigned)strtoul(c, 0, 10), b, msg, sizeof(msg));
 	} else if (strcmp(action, "job_stop") == 0) {
 		struct json_field fields[] = {
 			{ 0, 0, 0, 0, 0, 0 }

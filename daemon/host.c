@@ -372,6 +372,25 @@ static int valid_user_path(const char* path)
  * Space separated list of name=value options, checked against the allowed ones.
  * \param allowed list of "name:type" with type b (0/1), i (integer), n (name), U (UUID), p (path), s (schedule), u (users), h (hosts), t (text)
  */
+/** List of paths separated by ':', or nothing. */
+static int valid_path_list(const char* list)
+{
+	char buf[1024];
+	char* save = 0;
+
+	if (strlen(list) >= sizeof(buf))
+		return 0;
+	sncpy(buf, sizeof(buf), list);
+	if (list[0] == ':' || strstr(list, "::") != 0 || (list[0] && list[strlen(list) - 1] == ':'))
+		return 0;
+	for (char* tok = strtok_r(buf, ":", &save); tok; tok = strtok_r(0, ":", &save)) {
+		if (!valid_user_path(tok) || tok[strlen(tok) - 1] == '/')
+			return 0;
+	}
+
+	return 1;
+}
+
 static int valid_options_line(const char* line, const char* const* allowed, char* msg, size_t msg_size)
 {
 	char buf[2048];
@@ -405,6 +424,7 @@ static int valid_options_line(const char* line, const char* const* allowed, char
 		case 'n' : ok = val[0] == 0 || valid_name(val); break;
 		case 'U' : ok = valid_chars(val, "-", 64); break;
 		case 'p' : ok = valid_user_path(val); break;
+		case 'l' : ok = valid_path_list(val); break;
 		case 's' : ok = sched_valid(val); break;
 		case 'u' : ok = val[0] == 0 || valid_chars(val, "_-,", 512); break;
 		case 'h' : ok = val[0] == 0 || valid_chars(val, ".:/,*-", 512); break;
@@ -462,7 +482,11 @@ static const char* const BACKUP_OPTIONS[] = {
 };
 
 static const char* const CACHE_OPTIONS[] = {
-	"pool:p", "branch:p", "age_hours:i", "fill:i", "when:s", "sync:b", "enabled:b", "policy:n", 0
+	"pool:p", "branch:p", "age_hours:i", "fill:i", "when:s", "sync:b", "enabled:b", "policy:n", "stay:l", 0
+};
+
+static const char* const KEEP_OPTIONS[] = {
+	"pool:p", "path:p", "disks:l", "when:s", "enabled:b", 0
 };
 
 static const char* const POWER_OPTIONS[] = {
@@ -554,6 +578,18 @@ static int setting_check(const char* key, const char* val, char* msg, size_t msg
 		char fill[16];
 		if (opt_get(val, "fill", fill, sizeof(fill)) == 0 && !valid_int(fill, 0, 99))
 			return hfail(msg, msg_size, 400, "The fill level is from 0 to 99");
+		return 0;
+	}
+	if (strncmp(key, "keep.", 5) == 0) {
+		char v[PATH_MAX];
+		if (!valid_name(key + 5))
+			return hfail(msg, msg_size, 400, "A name has only letters, digits, - and _ (up to 32)");
+		int ret = valid_options_line(val, KEEP_OPTIONS, msg, msg_size);
+		if (ret != 0)
+			return ret;
+		if (opt_get(val, "pool", v, sizeof(v)) != 0 || opt_get(val, "path", v, sizeof(v)) != 0 || v[strlen(v) - 1] == '/'
+			|| opt_get(val, "disks", v, sizeof(v)) != 0 || v[0] == 0)
+			return hfail(msg, msg_size, 400, "A folder to keep needs its pool, its path inside the pool and the disks chosen for it");
 		return 0;
 	}
 	if (strncmp(key, "power.", 6) == 0) {
@@ -2038,7 +2074,7 @@ void host_move_done(const char* tag, int status, const char* message)
 	char key[128];
 	char val[MSG_MAX + 64];
 
-	if (strncmp(tag, "cache.", 6) != 0)
+	if (strncmp(tag, "cache.", 6) != 0 && strncmp(tag, "keep.", 5) != 0)
 		return;
 
 	snprintf(key, sizeof(key), "last.%s", tag);
@@ -2220,6 +2256,206 @@ static int cache_check(const char* pool, const char* branch, char* msg, size_t m
 	free(disks);
 
 	return ret;
+}
+
+/****************************************************************************/
+/* folders kept on chosen disks of a pool */
+
+/** If a path is a folder at or above a file: "/a/b" for "/a/b/c.txt". */
+static int folder_holds(const char* folder, const char* rel)
+{
+	size_t len = strlen(folder);
+
+	return strncmp(rel, folder, len) == 0 && rel[len] == '/';
+}
+
+int host_move_stays(const char* tag, const char* rel)
+{
+	char line[2048];
+	char stay[1024];
+	char* save = 0;
+
+	if (strncmp(tag, "cache.", 6) != 0)
+		return 0;
+	kv_get(tag, "", line, sizeof(line));
+	if (opt_get(line, "stay", stay, sizeof(stay)) != 0)
+		return 0;
+	for (char* tok = strtok_r(stay, ":", &save); tok; tok = strtok_r(0, ":", &save)) {
+		if (folder_holds(tok, rel))
+			return 1;
+	}
+
+	return 0;
+}
+
+int host_keep_disks(const char* pool, const char* rel, char* disks, size_t disks_size)
+{
+	size_t best = 0;
+
+	disks[0] = 0;
+
+	pthread_mutex_lock(&host_mutex);
+	for (unsigned i = 0; i < kv_count; ++i) {
+		char v[PATH_MAX];
+		if (strncmp(kv_list[i].key, "keep.", 5) != 0 || !opt_bool(kv_list[i].val, "enabled", 1))
+			continue;
+		if (opt_get(kv_list[i].val, "pool", v, sizeof(v)) != 0 || strcmp(v, pool) != 0)
+			continue;
+		/* the deepest folder decides */
+		if (opt_get(kv_list[i].val, "path", v, sizeof(v)) != 0 || !folder_holds(v, rel) || strlen(v) <= best)
+			continue;
+		best = strlen(v);
+		opt_get(kv_list[i].val, "disks", disks, disks_size);
+	}
+	pthread_mutex_unlock(&host_mutex);
+
+	return disks[0] != 0;
+}
+
+/**
+ * The disks of the pool, not chosen for the folder, that hold a part of it.
+ * \param from Their paths separated by ':'.
+ * \return How many they are, or -1 if the pool or one of the chosen disks is not there.
+ */
+static int keep_strays(const char* line, char* from, size_t from_size, char* msg, size_t msg_size)
+{
+	char pool[PATH_MAX];
+	char path[PATH_MAX];
+	char disks[1024];
+	char list[1024];
+	char* save = 0;
+	unsigned count = 0;
+	int strays = 0;
+	struct pool_branch* branches = malloc_nofail(sizeof(struct pool_branch) * BRANCH_MAX);
+
+	from[0] = 0;
+	opt_get(line, "pool", pool, sizeof(pool));
+	opt_get(line, "path", path, sizeof(path));
+	opt_get(line, "disks", disks, sizeof(disks));
+
+	priv_enter();
+	int ret = pool_branches(pool, branches, &count, msg, msg_size);
+	priv_leave();
+	if (ret != 0) {
+		free(branches);
+		return -1;
+	}
+
+	/* every chosen disk is still a writable disk of the pool */
+	sncpy(list, sizeof(list), disks);
+	for (char* tok = strtok_r(list, ":", &save); tok; tok = strtok_r(0, ":", &save)) {
+		int found = 0;
+		for (unsigned i = 0; i < count; ++i) {
+			if (strcmp(branches[i].path, tok) == 0 && branches[i].writable)
+				found = 1;
+		}
+		if (!found) {
+			hfail(msg, msg_size, 400, "%s is not a disk of the pool %s that can be written", tok, pool);
+			free(branches);
+			return -1;
+		}
+	}
+
+	char chosen[sizeof(disks) + 4];
+	snprintf(chosen, sizeof(chosen), ":%s:", disks);
+	for (unsigned i = 0; i < count; ++i) {
+		char dir[PATH_MAX * 2];
+		char key[PATH_MAX + 4];
+		struct stat st;
+		snprintf(key, sizeof(key), ":%s:", branches[i].path);
+		if (strstr(chosen, key) != 0)
+			continue;
+		snprintf(dir, sizeof(dir), "%s%s", branches[i].path, path);
+		priv_enter();
+		int have = lstat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+		priv_leave();
+		if (!have)
+			continue;
+		if (from[0])
+			sncat(from, from_size, ":");
+		sncat(from, from_size, branches[i].path);
+		++strays;
+	}
+	free(branches);
+
+	return strays;
+}
+
+/** Bring back to its disks what of a folder landed on the other ones. */
+static int keep_run(const char* name, char* msg, size_t msg_size)
+{
+	char key[128];
+	char line[2048];
+	char pool[PATH_MAX];
+	char path[PATH_MAX];
+	char disks[1024];
+	char from[PATH_MAX];
+
+	snprintf(key, sizeof(key), "keep.%s", name);
+	kv_get(key, "", line, sizeof(line));
+	if (line[0] == 0)
+		return hfail(msg, msg_size, 404, "There is no folder kept with the name %s", name);
+
+	int strays = keep_strays(line, from, sizeof(from), msg, msg_size);
+	if (strays < 0)
+		return 400;
+	if (strays == 0)
+		return hfail(msg, msg_size, 409, "Everything of this folder is already on its disks");
+
+	opt_get(line, "pool", pool, sizeof(pool));
+	opt_get(line, "path", path, sizeof(path));
+	opt_get(line, "disks", disks, sizeof(disks));
+
+	int ret = storage_move_start("keep", pool, from, path, disks, 0, 0, key, msg, msg_size);
+
+	char slot[64];
+	snprintf(slot, sizeof(slot), "k/%s", name);
+	struct cache_seen* c = cache_slot(slot);
+	if (c)
+		c->pending = ret == 409;
+
+	return ret;
+}
+
+/** Once a minute: the folders to bring back to their disks at this time. */
+static void keeps_tick(const struct tm* tm)
+{
+	char names[CACHES_MAX][40];
+	char lines[CACHES_MAX][1024];
+	unsigned n = 0;
+
+	pthread_mutex_lock(&host_mutex);
+	for (unsigned i = 0; i < kv_count && n < CACHES_MAX; ++i) {
+		if (strncmp(kv_list[i].key, "keep.", 5) != 0)
+			continue;
+		sncpy(names[n], sizeof(names[n]), kv_list[i].key + 5);
+		sncpy(lines[n], sizeof(lines[n]), kv_list[i].val);
+		++n;
+	}
+	pthread_mutex_unlock(&host_mutex);
+
+	for (unsigned i = 0; i < n; ++i) {
+		char when[256];
+		char slot[64];
+		char msg[MSG_MAX];
+		sncpy(slot, sizeof(slot), "k/");
+		sncat(slot, sizeof(slot), names[i]);
+		struct cache_seen* c = cache_slot(slot);
+		if (!c || !opt_bool(lines[i], "enabled", 1))
+			continue;
+
+		int due = c->pending;
+		if (opt_get(lines[i], "when", when, sizeof(when)) == 0 && when[0] && sched_match(when, tm))
+			due = 1;
+		if (!due)
+			continue;
+		if (job_is_running()) {
+			c->pending = 1;
+			continue;
+		}
+		c->pending = 0;
+		keep_run(names[i], msg, sizeof(msg));
+	}
 }
 
 /****************************************************************************/
@@ -3457,6 +3693,33 @@ static void status_json(ss_t* s, int level)
 	}
 	ss_json_array_close(s, &level);
 
+	ss_json_array_open(s, &level, "keeps");
+	for (unsigned i = 0; i < kv_count; ++i) {
+		if (strncmp(kv_list[i].key, "keep.", 5) != 0)
+			continue;
+		const char* name = kv_list[i].key + 5;
+		char key[128];
+		ss_json_open(s, &level);
+		ss_json_str(s, level, "name", name);
+		options_json(s, level, kv_list[i].val, KEEP_OPTIONS);
+		snprintf(key, sizeof(key), "last.keep.%s", name);
+		const char* last = kv_get_locked(key, "");
+		if (last[0]) {
+			char buf[MSG_MAX + 64];
+			sncpy(buf, sizeof(buf), last);
+			char* t1 = strchr(buf, '\t');
+			char* t2 = t1 ? strchr(t1 + 1, '\t') : 0;
+			if (t1 && t2) {
+				*t1 = *t2 = 0;
+				ss_json_i64(s, level, "last_time", strtoll(buf, 0, 10));
+				ss_json_int(s, level, "last_status", atoi(t1 + 1));
+				ss_json_str(s, level, "last_message", t2 + 1);
+			}
+		}
+		ss_json_close(s, &level);
+	}
+	ss_json_array_close(s, &level);
+
 	ss_json_array_open(s, &level, "power");
 	for (unsigned i = 0; i < kv_count; ++i) {
 		if (strncmp(kv_list[i].key, "power.", 6) != 0)
@@ -3632,7 +3895,7 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 		/* simple settings and documents of the UI; shares, backups and power have their own requests */
 		for (unsigned i = 0; i < args->count; ++i) {
 			const char* k = args->key[i];
-			if (strncmp(k, "share.", 6) == 0 || strncmp(k, "backup.", 7) == 0 || strncmp(k, "power.", 6) == 0 || strncmp(k, "cache.", 6) == 0 || strncmp(k, "last.", 5) == 0)
+			if (strncmp(k, "share.", 6) == 0 || strncmp(k, "backup.", 7) == 0 || strncmp(k, "power.", 6) == 0 || strncmp(k, "cache.", 6) == 0 || strncmp(k, "keep.", 5) == 0 || strncmp(k, "last.", 5) == 0)
 				return hfail(msg, msg_size, 400, "Use the request of its own for %s", k);
 			ret = setting_check(k, args->val[i], msg, msg_size);
 			if (ret != 0)
@@ -3736,6 +3999,34 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 		}
 		return ret;
 	}
+	if (strcmp(action, "keep_save") == 0 || strcmp(action, "keep_delete") == 0) {
+		const char* name = need(args, "name");
+		if (!valid_name(name))
+			return hfail(msg, msg_size, 400, "A name has only letters, digits, - and _ (up to 32)");
+		snprintf(key, sizeof(key), "keep.%s", name);
+		if (strcmp(action, "keep_save") == 0) {
+			char from[PATH_MAX];
+			options_from_args(args, KEEP_OPTIONS, line, sizeof(line));
+			ret = setting_check(key, line, msg, msg_size);
+			if (ret != 0)
+				return ret;
+			if (keep_strays(line, from, sizeof(from), msg, msg_size) < 0)
+				return 400;
+		} else {
+			line[0] = 0;
+		}
+		ret = setting_store(key, line, msg, msg_size);
+		if (ret == 0 && line[0] == 0) {
+			snprintf(key, sizeof(key), "last.keep.%s", name);
+			pthread_mutex_lock(&host_mutex);
+			kv_set_locked(key, "");
+			kv_save_locked();
+			pthread_mutex_unlock(&host_mutex);
+		}
+		return ret;
+	}
+	if (strcmp(action, "keep_run") == 0)
+		return keep_run(need(args, "name"), msg, msg_size);
 	if (strcmp(action, "cache_run") == 0)
 		return cache_run(need(args, "name"), 1, msg, msg_size);
 	if (strcmp(action, "usage") == 0)
@@ -3818,6 +4109,7 @@ static void* host_thread(void* arg)
 			smart_tick(&tm);
 			backups_tick(&tm, first);
 			caches_tick(&tm);
+			keeps_tick(&tm);
 			ratio_tick();
 			idle_tick(&tm);
 			first = 0;
@@ -4034,6 +4326,22 @@ void host_start(void)
 
 void host_done(void)
 {
+}
+
+int host_move_stays(const char* tag, const char* rel)
+{
+	(void)tag;
+	(void)rel;
+	return 0;
+}
+
+int host_keep_disks(const char* pool, const char* rel, char* disks, size_t disks_size)
+{
+	(void)pool;
+	(void)rel;
+	(void)disks;
+	(void)disks_size;
+	return 0;
 }
 
 void host_move_done(const char* tag, int status, const char* message)
