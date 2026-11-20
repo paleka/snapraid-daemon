@@ -37,6 +37,13 @@ page read-only, as in the original project:
 
     curl -fsSL https://raw.githubusercontent.com/paleka/snapraid-daemon/storage/installer.sh | sudo SNAPRAIDD_LOCAL=1 sh
 
+On a machine new to SnapRAID the installer also adds Samba and the NFS
+server, which the Sharing page works with. They start right away, but no
+folder is shared and no user can log in until a share and a user are added
+in the web UI. SNAPRAIDD_SHARES=0 leaves them out. On a machine with an array
+already in use, or when upgrading, they are not added unless asked with
+SNAPRAIDD_SHARES=1.
+
 An array already in use
 -----------------------
 

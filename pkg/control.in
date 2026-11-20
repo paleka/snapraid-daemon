@@ -5,10 +5,11 @@ Priority: optional
 Architecture: amd64
 Maintainer: Robert Paleka <paleka@users.noreply.github.com>
 Depends: zlib1g, libzstd1, snapraid (>= 15.0), systemd
-Recommends: mergerfs, parted, fdisk, util-linux, e2fsprogs, xfsprogs, btrfs-progs, rsync, smartmontools, curl
+Recommends: mergerfs, parted, fdisk, util-linux, e2fsprogs, xfsprogs, btrfs-progs, rsync, smartmontools, curl, hdparm, ethtool
 Conflicts: snapraid-daemon
 Replaces: snapraid-daemon
 Provides: snapraid-daemon
+Suggests: samba, nfs-kernel-server
 Description: SnapRAID Daemon with the Storage page (unofficial fork)
  This is an unofficial fork of SnapRAID Daemon by Andrea Mazzoleni. It adds a
  Storage page to the web UI, to set up and maintain a SnapRAID array, with or
