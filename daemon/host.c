@@ -2184,6 +2184,15 @@ static void idle_tick(const struct tm* tm)
 	kv_get("idle_action", "none", action, sizeof(action));
 	time_t now = time(0);
 
+	/*
+	 * Coming back from a suspend, or after a jump of the clock, the idle time
+	 * starts again: a machine just woken up is not sent back to sleep at once.
+	 */
+	static time_t last_tick;
+	if (last_tick != 0 && (now - last_tick > 5 * 60 || now < last_tick))
+		idle_since = now;
+	last_tick = now;
+
 	if (strcmp(action, "none") == 0) {
 		idle_since = now;
 		sncpy(idle_busy, sizeof(idle_busy), "off");
