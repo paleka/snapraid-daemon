@@ -61,6 +61,8 @@ export const HostAPI = {
     keepRun: (name) => hostCall('/keep_run', 'POST', { name }),
     wol: () => hostCall('/wol', 'POST', {}),
     runs: (array, limit = 60) => hostCall(`/runs?limit=${limit}${array ? `&array=${encodeURIComponent(array)}` : ''}`),
+    events: (limit = 20) => hostCall(`/events?limit=${limit}`),
+    space: (days = 90) => hostCall(`/space?days=${days}`),
     upsDetect: () => hostCall('/ups_detect'),
     alerts: () => hostCall('/alerts'),
     alertsSave: (channels) => hostCall('/alerts_save', 'POST', { channels }),
@@ -285,10 +287,37 @@ const loadCommon = async (what) => {
 const diskProblems = (disks) => [...(disks?.data_disks || []), ...(disks?.parity_disks || [])]
     .filter(d => ['prefail', 'failing', 'degraded'].includes(d.health) || (d.devices || []).some(v => ['warning', 'critical', 'danger'].includes(v.smart?.temperature_status) || (v.health && !['passed', 'pending', 'unknown'].includes(v.health)))).length;
 
+/** The disks of the other arrays, as the daemon of each one knows them: [[name, disks]] */
+const otherArrayDisks = async (model) => {
+    const names = (model?.inv?.arrays || []).map(a => a.name).filter(n => n !== API.array());
+    return Promise.all(names.map(n => fetch(`/snapraid/v1/arrays/${encodeURIComponent(n)}/disks`).then(r => r.ok ? r.json() : null).then(j => [n, j]).catch(() => [n, null])));
+};
+
+/** The head of a tile of Home: its title and where to go for the details. */
+const tileHead = (title, href = '', linkText = '') => `
+    <div class="sp-b-head"><h3>${esc(title)}</h3>${href ? `<a class="sp-link" href="${href}">${esc(linkText)}</a>` : ''}</div>`;
+
+/** Where the alerts go, in a few words, or null when it cannot be read. */
+const alertPlaces = async (config) => {
+    if (!config?.notify_result) return [];
+    if (!P.isAlertScript(config.notify_result)) return [P.notifyParse(config.notify_result)];
+    const r = await HostAPI.alerts().catch(() => null);
+    return r ? (r.channels || []).map(P.alertForm).filter(Boolean) : null;
+};
+
+const HERO_PILL = { ok: 'Protected', warn: 'Needs you', bad: 'Act now', busy: 'Working', setup: 'Not set up' };
+
 const loadHome = async () => {
     const d = await loadCommon('state array tasks config disks host storage');
-    const st = d.state || {};
     const model = d.storage?.model;
+    const [rec, space, events, others, places] = await Promise.all([
+        HostAPI.runs('', 300).catch(() => null),
+        HostAPI.space(30).catch(() => null),
+        HostAPI.events(12).catch(() => null),
+        otherArrayDisks(model),
+        alertPlaces(d.config)
+    ]);
+    const st = d.state || {};
     const configured = !!model && (model.data.length > 0 || model.parity.length > 0);
     const activeTask = (d.tasks?.active || [])[0];
     const status = P.homeStatus({
@@ -298,75 +327,218 @@ const loadHome = async () => {
         active: st.active_command ? { command: st.active_command, progress: st.progress, eta_seconds: st.eta_seconds } : activeTask ? { command: activeTask.command, progress: activeTask.progress } : null,
         array: d.array, tasks: d.tasks, config: d.config, diskProblems: diskProblems(d.disks)
     });
+    const nowIso = d.array?.pulse?.current_at;
+    const now = nowIso ? new Date(nowIso) : new Date();
 
     const findings = [
         ...(d.storage?.findings || []).filter(f => f.level === 'bad' || f.level === 'warn'),
-        ...P.machineFindings({ host: d.host, config: d.config, disks: d.disks, nowIso: d.array?.pulse?.current_at })
+        ...P.machineFindings({ host: d.host, config: d.config, disks: d.disks, nowIso })
     ];
     const tips = (d.storage?.findings || []).filter(f => f.level === 'tip');
-
-    // tiles
-    const live = model ? model.data.filter(x => x.ok) : [];
-    const total = live.reduce((a, x) => a + x.total, 0);
-    const free = live.reduce((a, x) => a + x.free, 0);
-    const usedPct = total ? Math.round((total - free) * 100 / total) : 0;
-    const k = model ? model.parity.length : 0;
-    const allDisks = [...(d.disks?.data_disks || []), ...(d.disks?.parity_disks || [])];
-    const problems = diskProblems(d.disks);
+    const host = d.host || {};
     const sync = P.lastTask(d.tasks, 'sync', true);
-    const shares = d.host?.shares || [];
-    const backups = d.host?.backups || [];
-    const lastBackup = backups.filter(b => b.last_time).sort((a, b) => b.last_time - a.last_time)[0];
+    const scrub = P.lastTask(d.tasks, 'scrub', true);
+    const next = P.nextRun(d.config?.maintenance_schedule, now);
+    const changes = P.pendingChanges(d.array);
 
-    const tile = (route, ic, label, value, sub, extra = '') => `
-        <a class="sp-tile" href="${route}">
-            <div class="sp-tile-head">${icon(ic)}<span>${esc(label)}</span></div>
-            <div class="sp-tile-value">${value}</div>
-            ${extra}
-            <div class="sp-tile-sub">${sub}</div>
-        </a>`;
-
-    const recent = (d.tasks?.history || []).filter(t => !P.ROUTINE.includes(t.command)).slice(0, 5);
-
-    // the main action is in the status itself: the header only offers what's not there
     if (status.level === 'busy') header(button('Stop', 'stop', {}, 'btn-danger'));
-    else if (!status.action && configured) header(button('Protect now', 'go', { act: 'protect' }, 'btn-secondary'));
     else header('');
 
-    draw(`
-        <div class="sp-hero sp-hero-${status.level}">
-            <div class="sp-hero-icon">${ICON[status.level === 'ok' ? 'ok' : status.level === 'busy' ? 'busy' : status.level === 'setup' ? 'setup' : status.level === 'bad' ? 'bad' : 'warn']}</div>
-            <div class="sp-hero-text">
-                <div class="sp-hero-title">${esc(status.title)}</div>
-                <div class="sp-hero-sub">${esc(status.text)}</div>
-                ${status.level === 'busy' && st.progress != null ? `<div class="progress-container sp-hero-progress"><div class="progress-bar" data-width="${st.progress}"></div></div>` : ''}
+    if (!configured) {
+        draw(`
+            <div class="sp-bento">
+                <section class="sp-b sp-b-12 sp-bhero sp-bhero-${status.level}" aria-label="${escAttr(status.title)}">
+                    <div class="sp-bhero-top">
+                        <div class="sp-hero-icon">${ICON.setup}</div>
+                        <div class="sp-hero-text"><div class="sp-hero-title">${esc(status.title)}</div><div class="sp-hero-sub">${esc(status.text)}</div></div>
+                    </div>
+                    ${status.action ? `<div class="sp-bhero-actions">${button(status.action.label, 'go', { act: status.action.act }, 'btn-primary')}</div>` : ''}
+                </section>
+            </div>`);
+        return;
+    }
+
+    // the hero: whether the files are safe, with the one action that fits
+    const level = status.level;
+    const heroIcon = ICON[level === 'ok' ? 'ok' : level === 'busy' ? 'busy' : level === 'bad' ? 'bad' : 'warn'];
+    const mainAction = status.action ? button(status.action.label, 'go', { act: status.action.act }, 'btn-primary')
+        : level !== 'busy' ? button('Update the protection now', 'go', { act: 'protect' }, 'btn-primary') : '';
+    const facts = [
+        ['Last update', sync ? P.ago(sync.finished_at, nowIso) : 'not yet', sync ? `took ${P.humanSpan(P.taskSeconds(sync))}` : ''],
+        ['Next update', next ? P.whenWords(next, now) : 'not planned', next ? '' : 'set it on Protection'],
+        ['Last check for damage', scrub ? P.ago(scrub.finished_at, nowIso) : 'not yet', ''],
+        ['Changed since', P.plural(changes, 'file', 'files'), changes ? 'protected at the next update' : 'nothing waiting']
+    ];
+    const nights = P.nightsStrip(rec?.runs || [], now, 14);
+    const hero = `
+        <section class="sp-b sp-b-8 sp-b-tall sp-bhero sp-bhero-${level}" aria-label="${escAttr(`${status.title}. ${status.text}`)}">
+            <div class="sp-bhero-top">
+                <div class="sp-hero-icon">${heroIcon}</div>
+                <div class="sp-hero-text">
+                    <span class="sp-pill sp-pill-${level === 'setup' ? 'busy' : level}">${esc(HERO_PILL[level] || '')}</span>
+                    <div class="sp-hero-title">${esc(status.title)}</div>
+                    <div class="sp-hero-sub">${esc(status.text)}</div>
+                    ${level === 'busy' && st.progress != null ? `<div class="progress-container sp-hero-progress"><div class="progress-bar" data-width="${st.progress}"></div></div>` : ''}
+                </div>
             </div>
-            ${status.action ? `<div class="sp-hero-action">${button(status.action.label, 'go', { act: status.action.act }, 'btn-primary')}</div>` : ''}
-        </div>
+            <div class="sp-bhero-actions">
+                ${mainAction}
+                ${button('Get back deleted files', 'restore', { path: '/' })}
+            </div>
+            <div class="sp-bfacts">
+                ${facts.map(([k, v, sub]) => `<div class="sp-bfact"><span class="sp-bfact-label">${esc(k)}</span><span class="sp-bfact-value">${esc(v)}</span>${sub ? `<span class="sp-bfact-sub">${esc(sub)}</span>` : ''}</div>`).join('')}
+            </div>
+            <div class="sp-nights-box">
+                <div class="sp-nights-head"><span class="sp-b-label">Last ${nights.length} days</span>
+                    <span class="sp-legend"><span><i class="sp-night-updated"></i>Updated</span><span><i class="sp-night-checked"></i>Checked too</span><span><i class="sp-night-warn"></i>Stopped</span><span><i class="sp-night-bad"></i>Problem</span></span></div>
+                <div class="sp-nights" role="list">
+                    ${nights.map(n => `<div class="sp-night-cell" role="listitem" aria-label="${escAttr(`${n.weekday} ${n.day}: ${n.text}`)}" data-tooltip="${escAttr(`${n.weekday} ${n.day} — ${n.text}`)}"><span class="sp-night sp-night-${n.level}"></span><span class="sp-night-day ${n.today ? 'sp-night-today' : ''}">${n.day}</span></div>`).join('')}
+                </div>
+            </div>
+        </section>`;
 
-        ${configured ? `
-        <div class="sp-tiles">
-            ${tile('#/files', 'folder', 'Space', total ? `${P.bytes(free)} <small>free</small>` : '–', total ? `${usedPct}% of ${P.bytes(total)} used` : 'no data disk',
-                total ? `<div class="progress-container"><div class="progress-bar ${usedPct >= 90 ? 'st-bar-red' : usedPct >= 75 ? 'st-bar-amber' : ''}" data-width="${usedPct}"></div></div>` : '')}
-            ${tile('#/drives', 'disk', 'Disks', problems ? `<span class="text-amber">${P.plural(problems, 'needs', 'need')} a look</span>` : `${allDisks.length} healthy`, `${model.data.length} for files, ${k} for protection`)}
-            ${tile('#/protection', 'shield', 'Protection', k ? `${P.plural(k, 'disk', 'disks')} can fail` : 'none', sync ? `updated ${P.ago(sync.finished_at, d.array?.pulse?.current_at)}` : 'not updated recently')}
-            ${tile('#/sharing', 'share', 'Sharing & backups', `${P.plural(shares.length, 'share', 'shares')}`, lastBackup ? `last backup ${P.humanSpan(Date.now() / 1000 - lastBackup.last_time)} ago` : backups.length ? 'backup not run yet' : 'no backup yet')}
-        </div>` : ''}
-
-        ${findings.length ? section('Needs your attention', 'Most important first. Each one says what to do.', `<div class="sp-rows">${findings.map(finding).join('')}</div>`)
-            : configured ? section('Needs your attention', '', empty(`${icon('ok', 'sp-icon-ok')} Nothing. Everything was checked and looks right.`)) : ''}
-
-        ${recent.length ? section('What happened lately', 'The work done by the server by itself or on your request.', `
-            <div class="sp-rows">
-                ${recent.map(t => {
-                    const w = P.taskWords(t);
-                    return `<div class="sp-row sp-row-${w.ok ? 'ok' : 'warn'}">${icon(w.ok ? 'ok' : 'warn', w.ok ? 'sp-icon-ok' : 'sp-icon-warn')}
-                        <div class="sp-row-main"><div class="sp-row-title">${esc(w.title)}</div><div class="sp-row-text">${esc(w.detail)}</div></div>
-                        <div class="sp-row-when">${esc(P.ago(t.finished_at || t.started_at, d.array?.pulse?.current_at))}</div></div>`;
+    // space, by array, and when it runs out
+    const sp = space?.arrays?.length ? space : null;
+    const live = model ? model.data.filter(x => x.ok) : [];
+    const total = sp ? sp.all.total_bytes : live.reduce((a, x) => a + x.total, 0);
+    const used = sp ? sp.all.used_bytes : live.reduce((a, x) => a + (x.total - x.free), 0);
+    const usedPct = total ? Math.round(used * 100 / total) : 0;
+    const fc = P.forecastWords(sp ? sp.all : { total_bytes: total, used_bytes: used, forecast: false });
+    const arrays = sp ? sp.arrays : [{ array: API.array(), used_bytes: used, total_bytes: total }];
+    const spaceTile = `
+        <section class="sp-b sp-b-4 sp-b-tall" aria-label="${escAttr(`Space: ${P.bytes(used)} used of ${P.bytes(total)}`)}">
+            ${tileHead('Space', '#/files', 'My files')}
+            <div class="sp-big">${esc(P.bytes(used))} <small>of ${esc(P.bytes(total))}</small></div>
+            <div class="sp-b-text">${esc(P.bytes(Math.max(0, total - used)))} free · ${usedPct}% used</div>
+            <div class="progress-container sp-b-bar"><div class="progress-bar ${usedPct >= 90 ? 'st-bar-red' : usedPct >= 75 ? 'st-bar-amber' : ''}" data-width="${usedPct}"></div></div>
+            <div class="sp-forecast sp-forecast-${fc.level}">${icon(fc.level === 'ok' ? 'ok' : fc.level === 'tip' ? 'tip' : 'warn', `sp-icon-${fc.level}`)}<span>${esc(fc.text)}</span></div>
+            <div class="sp-arrays">
+                ${arrays.map((a, i) => {
+                    const pct = a.total_bytes ? Math.round(a.used_bytes * 100 / a.total_bytes) : 0;
+                    const af = sp ? P.forecastWords(a) : null;
+                    return `<div class="sp-arr">
+                        <div class="sp-arr-head"><span class="sp-arr-name"><i class="sp-key sp-key-${i % 6}"></i>${esc(a.array)}</span><span class="sp-arr-num">${esc(P.bytes(a.used_bytes))} / ${esc(P.bytes(a.total_bytes))}</span></div>
+                        <div class="sp-meter"><span class="sp-meter-fill sp-key-${i % 6}" data-width="${pct}"></span></div>
+                        ${af && af.level !== 'ok' && af.level !== 'tip' ? `<div class="sp-arr-note text-amber">${esc(af.text)}</div>` : ''}
+                    </div>`;
                 }).join('')}
-            </div>`, '<a class="sp-link" href="#/tasks">All the activity</a>') : ''}
+            </div>
+        </section>`;
 
-        ${tips.length ? section('Ideas', 'Not problems: things that could be better.', `<div class="sp-rows">${tips.map(finding).join('')}</div>`) : ''}
+    // the disks of every array, as small bays
+    const entries = diskEntries(model, d.disks, others).filter(e => e.dev || e.role === 'data' || e.role === 'parity' || e.mount);
+    const problems = entries.filter(e => ['bad', 'warn'].includes(healthWords(e).level)).length;
+    const asleep = entries.filter(e => e.dev?.power === 'standby').length;
+    const shown = entries.slice(0, 12);
+    const disksTile = `
+        <section class="sp-b sp-b-6" aria-label="${escAttr(`Disks: ${entries.length}, ${problems ? `${problems} need a look` : 'all healthy'}`)}">
+            ${tileHead('Disks', '#/drives', 'Open Disks')}
+            <div class="sp-b-text">${problems ? `<b class="text-amber">${esc(P.plural(problems, 'disk needs', 'disks need'))} a look</b>` : `<b class="text-emerald">✓ All ${entries.length} healthy</b>`}${asleep ? ` · ${asleep} asleep to save power` : ''}</div>
+            <div class="sp-minibays">
+                ${shown.map(e => {
+                    const hw = healthWords(e);
+                    const temp = e.dev?.smart?.temperature_celsius;
+                    const state = e.missing ? 'not found' : e.dev?.power === 'standby' ? 'asleep' : temp ? `${temp} °C` : hw.level === 'tip' ? 'not watched' : '';
+                    return `<a class="sp-minibay sp-minibay-${hw.level}" href="#/drives" aria-label="${escAttr(`${e.name}, ${e.role === 'parity' ? 'protection' : e.role === 'data' ? 'files' : 'not used'}: ${hw.text}`)}" data-tooltip="${escAttr(`${e.name} — ${e.role === 'parity' ? 'keeps the protection' : e.role === 'data' ? 'keeps files' : 'not used'} — ${hw.text}`)}">
+                        <span class="sp-minibay-bar"></span>
+                        <span class="sp-minibay-name">${esc(e.name.split(': ').pop())}</span>
+                        <span class="sp-minibay-sub">${esc([e.array, P.bytes(e.size)].filter(Boolean).join(' · '))}</span>
+                        <span class="sp-minibay-state">${esc(state)}</span>
+                    </a>`;
+                }).join('')}
+            </div>
+            ${entries.length > shown.length ? `<div class="sp-b-text">And ${entries.length - shown.length} more on the Disks page.</div>` : ''}
+        </section>`;
+
+    // how much was read back for damage lately
+    const hist = d.array?.scrub_history;
+    const checked = P.checkedWithin(hist, 30);
+    const checkedTile = `
+        <section class="sp-b sp-b-3" aria-label="${escAttr(`Checked for damage in 30 days: ${checked ?? 0}%`)}">
+            ${tileHead('Checked for damage', '#/protection', 'Past runs')}
+            <div class="sp-big">${checked == null ? '–' : `${checked}%`}</div>
+            <div class="sp-meter"><span class="sp-meter-fill sp-meter-ok" data-width="${checked || 0}"></span></div>
+            <div class="sp-b-text">${checked == null ? 'Not checked yet.' : `of the data read back in the last 30 days${hist?.x_axis_low ? `. The oldest part was checked ${P.plural(hist.x_axis_low, 'day', 'days')} ago` : ''}.`}</div>
+        </section>`;
+
+    const upcoming = P.comingUp({ config: d.config, host }, now, 4);
+    const comingTile = `
+        <section class="sp-b sp-b-3" aria-label="Coming up">
+            ${tileHead('Coming up')}
+            ${upcoming.length ? `<ul class="sp-agenda">${upcoming.map(u => `<li><span class="sp-agenda-when">${esc(P.shortWhen(u.at, now))}</span><span class="sp-agenda-what"><b>${esc(u.what)}</b><small>${esc(u.sub)}</small></span></li>`).join('')}</ul>`
+                : `<div class="sp-b-text">Nothing planned. <a class="sp-link" href="#/protection">Plan the protection</a></div>`}
+        </section>`;
+
+    // backups, shares, power, fast disk
+    const backups = host.backups || [];
+    const backupTile = `
+        <section class="sp-b sp-b-4" aria-label="Backups">
+            ${tileHead('Backups', '#/backups', backups.length ? 'All backups' : 'Add one')}
+            ${backups.length ? `<ul class="sp-blist">${backups.slice(0, 3).map(b => {
+                const lv = b.last_time ? (b.last_status === 0 ? 'ok' : b.last_status === 499 ? 'warn' : 'bad') : 'tip';
+                const when = b.when ? P.describeSchedule(b.when) : b.plug ? 'when its disk is plugged in' : 'when you start it';
+                return `<li><span class="sp-blist-mark sp-blist-${lv}">${ICON[lv === 'ok' ? 'ok' : lv === 'tip' ? 'tip' : 'warn']}</span><span class="sp-blist-main"><b>${esc(b.name)}</b><small>${esc(when)}</small></span><span class="sp-blist-when">${b.last_time ? esc(P.humanSpan(Date.now() / 1000 - b.last_time)) + ' ago' : 'not run yet'}</span></li>`;
+            }).join('')}</ul>` : `<div class="sp-b-text">No backup yet. Protection rebuilds a failed disk; a backup keeps a second copy somewhere else.</div>`}
+        </section>`;
+    const shares = host.shares || [];
+    const hostName = window.location.hostname || 'server';
+    const shareTile = `
+        <section class="sp-b sp-b-4" aria-label="Shared folders">
+            ${tileHead('Shared folders', '#/sharing', shares.length ? 'Sharing' : 'Share one')}
+            ${shares.length ? `<ul class="sp-blist">${shares.slice(0, 4).map(s => `<li><span class="sp-blist-main"><b class="font-mono">\\\\${esc(hostName)}\\${esc(s.name)}</b><small>${esc([s.smb !== false ? 'Windows and Mac' : '', s.nfs ? 'NFS' : ''].filter(Boolean).join(' · '))}</small></span><span class="sp-pill sp-pill-${s.writable === false ? 'tip' : 'busy'}">${s.writable === false ? 'read only' : 'read and write'}</span></li>`).join('')}</ul>`
+                : `<div class="sp-b-text">No folder is shared with the other computers yet.</div>`}
+        </section>`;
+    const ups = P.upsWords(host.ups);
+    const powerTile = `
+        <section class="sp-b sp-b-2" aria-label="${escAttr(`Power: ${ups.text}`)}">
+            ${tileHead('Power')}
+            <div class="sp-b-state sp-b-state-${ups.level}">${esc(host.ups?.configured ? (ups.level === 'ok' ? 'On mains' : ups.level === 'warn' ? 'On battery' : 'Check UPS') : 'No UPS')}</div>
+            <div class="sp-b-text">${host.ups?.configured ? esc(ups.text.replace(/^On the mains · /, '')) : '<a class="sp-link" href="#/system">Watch a UPS</a>'}</div>
+        </section>`;
+    const cache = (host.caches || [])[0];
+    const cacheTile = `
+        <section class="sp-b sp-b-2" aria-label="Fast disk">
+            ${tileHead('Fast disk')}
+            ${cache ? `<div class="sp-b-state sp-b-state-${P.cacheWaiting(cache).files ? 'warn' : 'ok'}">${esc(P.cacheWaiting(cache).files ? P.plural(P.cacheWaiting(cache).files, 'file waits', 'files wait') : 'All moved')}</div>
+                <div class="sp-b-text">${P.cacheWaiting(cache).files ? 'Not protected until moved' : 'Every file is on the big disks'}</div>`
+                : `<div class="sp-b-state sp-b-state-tip">None</div><div class="sp-b-text"><a class="sp-link" href="#/drives">Add an SSD</a></div>`}
+        </section>`;
+
+    // what happened: the runs of every array and the events of the machine
+    const happened = [
+        ...(rec?.runs || []).slice(0, 10).map(r => ({ at: r.finished_at, ...P.runWords(r), who: (sp ? sp.arrays.length : 1) > 1 || (model?.inv?.arrays || []).length > 1 ? r.array : '' })),
+        ...(events?.events || []).map(e => ({ at: e.at, ...P.eventWords(e), who: '' }))
+    ].sort((a, b) => new Date(b.at) - new Date(a.at)).slice(0, 6);
+    const activityTile = `
+        <section class="sp-b sp-b-8" aria-label="What happened">
+            ${tileHead('What happened', '#/tasks', 'Everything')}
+            ${happened.length ? `<ul class="sp-feed">${happened.map(h => `<li><span class="sp-dot sp-dot-${h.level === 'tip' ? 'tip' : h.level}"></span><span class="sp-feed-when">${esc(P.ago(h.at, nowIso))}</span><span class="sp-feed-what"><b>${esc(h.title)}</b>${h.who ? ` <span class="sp-tag">${esc(h.who)}</span>` : ''} <span class="text-muted">${esc(h.detail || '')}</span></span></li>`).join('')}</ul>`
+                : '<div class="sp-b-text">Nothing yet.</div>'}
+        </section>`;
+    const alertTile = `
+        <section class="sp-b sp-b-4" aria-label="Alerts">
+            ${tileHead('Alerts', '#/alerts', 'Change')}
+            <div class="sp-b-text">${places == null ? 'Alerts can be seen with the storage rights only.' : esc(P.alertSummary(places))}</div>
+            ${places?.length ? `<div class="sp-chips-row">${places.map(x => `<span class="sp-chip-flat">${esc((P.CHANNELS[x.channel]?.label || 'Command').replace(/ \(.*\)$/, ''))}</span>`).join('')}</div>` : ''}
+            ${places && !places.length ? `<a class="btn btn-secondary btn-sm sp-b-push" href="#/alerts">Add a place</a>` : ''}
+        </section>`;
+
+    draw(`
+        <div class="sp-bento">
+            ${hero}
+            ${spaceTile}
+            ${findings.length ? `<section class="sp-b sp-b-12" aria-label="Needs your attention">${tileHead('Needs your attention')}<div class="sp-b-text">Most important first. Each one says what to do.</div><div class="sp-rows">${findings.map(finding).join('')}</div></section>` : ''}
+            ${disksTile}
+            ${checkedTile}
+            ${comingTile}
+            ${backupTile}
+            ${shareTile}
+            ${powerTile}
+            ${cacheTile}
+            ${activityTile}
+            ${alertTile}
+            ${tips.length ? `<section class="sp-b sp-b-12" aria-label="Ideas">${tileHead('Ideas')}<div class="sp-b-text">Not problems: things that could be better.</div><div class="sp-rows">${tips.map(finding).join('')}</div></section>` : ''}
+        </div>
     `);
 
     // the first visit starts with a short tour; never under a test driving the browser
@@ -835,8 +1007,7 @@ const bar = (values, max, cls) => {
 const loadDrives = async () => {
     const d = await loadCommon('disks host storage');
     const model = d.storage?.model;
-    const names = (d.storage?.model?.inv?.arrays || []).map(a => a.name).filter(n => n !== API.array());
-    const others = await Promise.all(names.map(n => fetch(`/snapraid/v1/arrays/${encodeURIComponent(n)}/disks`).then(r => r.ok ? r.json() : null).then(j => [n, j]).catch(() => [n, null])));
+    const others = await otherArrayDisks(model);
     const entries = diskEntries(model, d.disks, others);
     S.cache.drives = entries;
     S.cache.filesModel = model;
@@ -859,20 +1030,72 @@ const loadDrives = async () => {
         const id = Object.keys(bays.slots).find(k => bays.slots[k] === i);
         const e = entries.find(x => x.id === id);
         const hw = e ? healthWords(e) : null;
-        return `<button class="sp-bay ${e ? `sp-bay-${roleCls(e)} sp-bay-h-${hw.level}` : 'sp-bay-empty'} ${placing ? 'sp-bay-target' : ''}" data-sp="bay" data-bay="${i}" ${e ? `data-tooltip="${escAttr(`${e.name} — ${e.model} ${e.serial}`)}"` : ''}>
+        return `<button class="sp-bay ${e ? `sp-bay-${roleCls(e)} sp-bay-h-${hw.level}` : 'sp-bay-empty'} ${placing ? 'sp-bay-target' : ''} ${e && sel && e.id === sel.id && !placing ? 'sp-bay-sel' : ''}" data-sp="bay" data-bay="${i}" aria-label="${escAttr(e ? `Bay ${i + 1}: ${e.name}, ${hw.text}` : `Bay ${i + 1}: empty`)}" ${e && sel && e.id === sel.id ? 'aria-current="true"' : ''} ${e ? `data-tooltip="${escAttr(`${e.name} — ${e.model} ${e.serial}`)}"` : ''}>
             <span class="sp-bay-num">${i + 1}</span>
             ${e ? `<span class="sp-bay-name">${esc(e.name)}</span><span class="sp-bay-sub">${P.bytes(e.size)}</span>${hw.level === 'bad' ? '<span class="sp-bay-alert">this one</span>' : ''}` : '<span class="sp-bay-sub">empty</span>'}
         </button>`;
     };
     const unplaced = entries.filter(e => bays.slots[e.id] == null);
+    const sel = entries.find(x => x.id === S.cache.diskSel) || entries.find(x => ['bad', 'warn'].includes(healthWords(x).level))
+        || entries.find(x => bays.slots[x.id] != null) || entries[0];
+
+    /** What can be done with a disk: the everyday choices, and the finer ones in Advanced. */
+    const diskActions = (e) => `
+                            ${e.dev && !e.array ? `<button class="btn btn-sm btn-secondary" data-action="smart-details" data-node="${escAttr(e.node)}">Health details</button>` : ''}
+                            ${e.dev || ['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) ? `<button class="btn btn-sm btn-secondary" data-sp="disk-test" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}">Test…</button>` : ''}
+                            ${(e.role === 'data' || e.role === 'parity') && !e.array ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="replace" data-st-data="${escAttr(JSON.stringify({ kind: e.role, name: e.name }))}">Replace…</button>` : ''}
+                            ${['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) && !(e.mount && isCache(e.mount)) ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="" data-st-tab="array">Use it…</button>` : ''}
+                            ${e.mount && e.role !== 'parity' ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-busy" data-path="${escAttr(e.mount)}" data-tooltip="The programs with files open on it">What uses it?</button>` : ''}
+                            ${e.dev ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-power" data-id="${escAttr(e.id)}" data-tooltip="Power saving, noise and write cache of this disk">Power…</button>` : ''}
+                            ${e.role === 'data' && !e.array && e.mount ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-copy" data-path="${escAttr(e.mount)}" data-dir="1" data-tooltip="Copy everything on it to another disk">Copy its files…</button>` : ''}
+                            ${e.mount && !e.array && poolOf(e.mount)?.branches.length > 1 && !isCache(e.mount) ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-empty" data-path="${escAttr(e.mount)}" data-name="${escAttr(e.name)}" data-pool="${escAttr(poolOf(e.mount).mountpoint)}" data-tooltip="Move its files to the other disks of the pool, for example before taking it out">Empty it…</button>` : ''}
+                            ${e.role === 'parity' && !e.array ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="storage" data-st-action="parity-move" data-st-data="${escAttr(JSON.stringify({ name: e.disk?.name || '' }))}" data-tooltip="Copy the protection to a larger disk, to allow larger disks for files">Move to a larger disk…</button>` : ''}
+                            ${usbOpen(e) ? `<button class="btn btn-sm btn-secondary" data-sp="usb-mount" data-node="${escAttr(usbOpen(e))}" data-name="${escAttr(e.name)}" data-tooltip="Make its files reachable until you eject it. Nothing is changed on the disk.">Open</button>` : ''}
+                            ${usbEject(e, (m) => !!poolOf(m) || isCache(m)) ? `<button class="btn btn-sm btn-secondary" data-sp="usb-eject" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}" data-tooltip="Finish writing, release it and turn it off, so it can be unplugged safely">Eject</button>` : ''}
+                            ${['blank', 'unmounted', 'unformatted', 'other'].includes(e.role) && !e.dev ? `<button class="btn btn-sm btn-danger sp-adv-only" data-sp="disk-wipe" data-node="${escAttr(e.node)}" data-size="${e.size || 0}">Erase…</button>` : ''}`;
 
     const ioOf = (node) => {
         const base = (node || '').split('/').pop();
         return (history?.devices || []).find(x => x.device === base);
     };
 
+    /** The disk chosen in the picture: what it is, how it feels, what can be done. */
+    const diskPanel = (e) => {
+        const hw = healthWords(e);
+        const bay = bays.slots[e.id];
+        const temp = e.dev?.smart?.temperature_celsius;
+        const data = e.mount ? (model?.data || []).find(x => x.mount?.target === e.mount || x.name === e.disk?.name) : null;
+        const usedPct = data?.total ? Math.round((data.total - data.free) * 100 / data.total) : null;
+        const temps = (e.dev?.temp_history_24h || []).filter(v => v > 0);
+        const hours = e.dev?.smart?.power_on_hours;
+        const facts = [
+            ['Temperature', temp ? `${temp} °C` : '–'],
+            ['Now', e.missing ? 'not found' : e.dev?.power === 'standby' ? 'asleep' : e.dev?.power === 'active' ? 'awake' : '–'],
+            ['Powered on', hours ? P.humanSpan(hours * 3600) : '–'],
+            ['Risk of failing this year', e.dev?.failure_probability != null ? `${(e.dev.failure_probability * 100).toFixed(1)}%` : '–'],
+            ['Serial', e.serial || '–'],
+            ['Where its files are', e.mount || '–']
+        ];
+        return `
+        <div class="card sp-section sp-diskpanel sp-diskpanel-${hw.level}" aria-label="${escAttr(`Disk ${e.name}`)}">
+            <div class="sp-b-head">
+                <div class="min-w-0">
+                    <span class="sp-b-label">${bay != null ? `Bay ${bay + 1}` : 'Not placed'} · ${esc(e.mount && isCache(e.mount) ? 'fast disk' : (ROLE_WORDS[e.role] || e.role))}${e.array ? ` in ${esc(e.array)}` : ''}</span>
+                    <h3 class="font-mono">${esc(e.name)}</h3>
+                    <div class="text-sm text-muted">${esc([e.model, e.transport, P.bytes(e.size)].filter(Boolean).join(' · '))}</div>
+                </div>
+                <span class="sp-pill sp-pill-${hw.level}">${esc(hw.text)}</span>
+            </div>
+            ${usedPct != null ? `<div><div class="sp-arr-head"><span>Used</span><span class="sp-arr-num">${esc(P.bytes(data.total - data.free))} of ${esc(P.bytes(data.total))}</span></div><div class="sp-meter"><span class="sp-meter-fill sp-key-0" data-width="${usedPct}"></span></div></div>` : ''}
+            <dl class="sp-dl">${facts.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
+            ${temps.length >= 3 ? `<div class="sp-temps"><span class="sp-b-label">Temperature, last day</span>${bar(temps, Math.max(...temps), 'sp-spark-temp')}</div>` : ''}
+            ${advScope('drives', `<div class="sp-disk-actions">${diskActions(e)}<button class="btn btn-sm btn-secondary" data-sp="bay-pick" data-id="${escAttr(e.id)}">Change its bay</button></div>`)}
+        </div>`;
+    };
+
     draw(`
-        ${section('Where your disks are', 'A picture of your case. When a disk fails, it shows which one to pull out.', `
+        <div class="sp-split">
+        ${section('Where your disks are', 'A picture of your case. Click a disk to see it. When a disk fails, it shows which one to pull out.', `
             <div class="sp-bays" data-cols="${bays.cols}">
                 ${Array.from({ length: bays.rows * bays.cols }, (_, i) => bayCell(i)).join('')}
             </div>
@@ -882,8 +1105,10 @@ const loadDrives = async () => {
                 </div>` : ''}
             <div class="sp-unplaced">
                 ${unplaced.length ? `<span class="text-sm text-muted">Not placed yet — click one, then its bay:</span> ${unplaced.map(e => `<button class="sp-chip sp-chip-${roleCls(e)} ${placing === e.id ? 'active' : ''}" data-sp="bay-pick" data-id="${escAttr(e.id)}">${esc(e.name)} · ${P.bytes(e.size)}</button>`).join('')}`
-                    : '<span class="text-sm text-muted">Every disk has its place. Click a disk in the picture to move it.</span>'}
-            </div>`, `<span class="text-sm text-muted">Bays</span> <input class="form-control sp-num" type="number" min="1" max="12" id="sp-bay-rows" value="${bays.rows}" data-tooltip="Rows"> × <input class="form-control sp-num" type="number" min="1" max="12" id="sp-bay-cols" value="${bays.cols}" data-tooltip="Columns"> ${button('Set', 'bay-size')}`)}
+                    : '<span class="text-sm text-muted">Every disk has its place.</span>'}
+            </div>`, `<span class="text-sm text-muted">Bays</span> <input class="form-control sp-num" type="number" min="1" max="12" id="sp-bay-rows" value="${bays.rows}" data-tooltip="Rows" aria-label="Rows of bays"> × <input class="form-control sp-num" type="number" min="1" max="12" id="sp-bay-cols" value="${bays.cols}" data-tooltip="Columns" aria-label="Columns of bays"> ${button('Set', 'bay-size')}`)}
+        ${sel ? diskPanel(sel) : ''}
+        </div>
 
         ${section('Your disks', 'What each disk is for, and how it feels.', advScope('drives', `
             <div class="sp-disks">
@@ -907,20 +1132,7 @@ const loadDrives = async () => {
                             ${e.mount ? `<span class="font-mono text-xs">${esc(e.mount)}</span>` : ''}
                         </div>
                         ${io && io.read_kb.length >= 3 && max > 1 ? `<div class="sp-io" data-tooltip="Read and written in the last hours, every 5 minutes"><span class="text-xs text-muted">read</span>${bar(io.read_kb, max, 'sp-spark-read')}<span class="text-xs text-muted">write</span>${bar(io.write_kb, max, 'sp-spark-write')}</div>` : ''}
-                        <div class="sp-disk-actions">
-                            ${e.dev && !e.array ? `<button class="btn btn-sm btn-secondary" data-action="smart-details" data-node="${escAttr(e.node)}">Health details</button>` : ''}
-                            ${e.dev || ['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) ? `<button class="btn btn-sm btn-secondary" data-sp="disk-test" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}">Test…</button>` : ''}
-                            ${(e.role === 'data' || e.role === 'parity') && !e.array ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="replace" data-st-data="${escAttr(JSON.stringify({ kind: e.role, name: e.name }))}">Replace…</button>` : ''}
-                            ${['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) && !(e.mount && isCache(e.mount)) ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="" data-st-tab="array">Use it…</button>` : ''}
-                            ${e.mount && e.role !== 'parity' ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-busy" data-path="${escAttr(e.mount)}" data-tooltip="The programs with files open on it">What uses it?</button>` : ''}
-                            ${e.dev ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-power" data-id="${escAttr(e.id)}" data-tooltip="Power saving, noise and write cache of this disk">Power…</button>` : ''}
-                            ${e.role === 'data' && !e.array && e.mount ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-copy" data-path="${escAttr(e.mount)}" data-dir="1" data-tooltip="Copy everything on it to another disk">Copy its files…</button>` : ''}
-                            ${e.mount && !e.array && poolOf(e.mount)?.branches.length > 1 && !isCache(e.mount) ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-empty" data-path="${escAttr(e.mount)}" data-name="${escAttr(e.name)}" data-pool="${escAttr(poolOf(e.mount).mountpoint)}" data-tooltip="Move its files to the other disks of the pool, for example before taking it out">Empty it…</button>` : ''}
-                            ${e.role === 'parity' && !e.array ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="storage" data-st-action="parity-move" data-st-data="${escAttr(JSON.stringify({ name: e.disk?.name || '' }))}" data-tooltip="Copy the protection to a larger disk, to allow larger disks for files">Move to a larger disk…</button>` : ''}
-                            ${usbOpen(e) ? `<button class="btn btn-sm btn-secondary" data-sp="usb-mount" data-node="${escAttr(usbOpen(e))}" data-name="${escAttr(e.name)}" data-tooltip="Make its files reachable until you eject it. Nothing is changed on the disk.">Open</button>` : ''}
-                            ${usbEject(e, (m) => !!poolOf(m) || isCache(m)) ? `<button class="btn btn-sm btn-secondary" data-sp="usb-eject" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}" data-tooltip="Finish writing, release it and turn it off, so it can be unplugged safely">Eject</button>` : ''}
-                            ${['blank', 'unmounted', 'unformatted', 'other'].includes(e.role) && !e.dev ? `<button class="btn btn-sm btn-danger sp-adv-only" data-sp="disk-wipe" data-node="${escAttr(e.node)}" data-size="${e.size || 0}">Erase…</button>` : ''}
-                        </div>
+                        <div class="sp-disk-actions">${diskActions(e)}</div>
                     </div>`;
                 }).join('')}
             </div>
@@ -1303,6 +1515,20 @@ const scheduleForm = (text) => {
     return { mode: 'custom', days: [], time, text };
 };
 
+const RUN_KIND = { sync: 'Update', scrub: 'Check for damage', fix: 'Repair', check: 'Full check' };
+
+/** Bars of the age of the last check of the data. */
+const ageChart = (hist) => {
+    const ages = P.scrubAges(hist);
+    const max = Math.max(1, ...ages.map(a => a.pct));
+    if (!hist?.points?.length) return empty('Nothing protected yet.');
+    return `
+        <div class="sp-agechart" role="img" aria-label="${escAttr(ages.map(a => `${a.label}: ${a.pct}%`).join(', '))}">
+            ${ages.map((a, i) => `<div class="sp-agecol"><span class="sp-agepct">${a.pct}%</span><span class="sp-agetrack"><span class="sp-agebar sp-age-${i}" data-height="${Math.max(a.pct ? 3 : 0, Math.round(a.pct * 100 / max))}"></span></span><span class="sp-agelabel">${esc(a.label)}</span></div>`).join('')}
+        </div>
+        <div class="sp-b-text">${hist.x_axis_low ? `The oldest part was checked ${P.plural(hist.x_axis_low, 'day', 'days')} ago, half of the data within ${P.plural(hist.x_axis_median || 0, 'day', 'days')}.` : 'All of it was checked or written today.'} Data just written counts as checked on that day.</div>`;
+};
+
 const loadProtection = async () => {
     const d = await loadCommon('config array tasks host storage');
     const c = d.config || {};
@@ -1349,13 +1575,21 @@ const loadProtection = async () => {
             </div>
         </div>` : ''}
 
+        <div class="sp-split sp-split-7-5">
         ${section('How protected you are', `With ${term('parity', 'protection')} on ${P.plural(k, 'disk', 'disks')}, any ${P.plural(k, 'disk', 'disks')} can fail and every file can be rebuilt — as it was at the last ${term('sync', 'update')}.`, `
             <div class="sp-facts">
                 <div><div class="sp-fact-label">Last update</div><div class="sp-fact-value">${sync ? esc(P.ago(sync.finished_at, nowIso)) : '–'}</div></div>
                 <div><div class="sp-fact-label">Changed since then</div><div class="sp-fact-value">${P.plural(changes, 'file', 'files')}</div></div>
                 <div><div class="sp-fact-label">Next automatic update</div><div class="sp-fact-value">${esc(next ? P.whenWords(next) : 'not planned')}</div></div>
                 <div><div class="sp-fact-label">Last check for damage</div><div class="sp-fact-value">${scrub ? esc(P.ago(scrub.finished_at, nowIso)) : '–'}</div></div>
-            </div>`)}
+            </div>
+            <ul class="sp-rules">
+                <li>${icon('busy', 'sp-icon-tip')}<span><b>${c.maintenance_schedule ? `Updated ${esc(P.describeSchedule(c.maintenance_schedule))}` : 'Never updated by itself'}</b>${stopAt ? `, stopping by ${esc(stopAt)} if still running` : ''}${onChanges ? `, and as soon as ${P.plural(onChanges, 'file changes', 'files change')}` : ''}.</span></li>
+                <li>${icon('shield', 'sp-icon-tip')}<span><b>${Number(c.sync_threshold_deletes) ? `Waits for your OK if more than ${Number(c.sync_threshold_deletes)} files are deleted at once` : 'Never waits for your OK'}</b>, so files lost by mistake can still be brought back.</span></li>
+                <li>${icon('ok', 'sp-icon-tip')}<span><b>${pct ? `Checks ${pct}% of the data for damage each time` : 'Never checks for damage by itself'}</b>${pct ? `, the oldest first: everything about every ${P.plural(fullEvery, 'day', 'days')}` : ''}.</span></li>
+            </ul>`)}
+        ${section('Last read back', 'How long ago each part of the data was checked for damage.', ageChart(d.array?.scrub_history))}
+        </div>
 
         ${section('Automatic protection', 'When the server updates the protection and checks your data by itself. Pick a time when nobody uses it: the disks work hard for a while.', advScope('protection', `
             <div class="sp-form">
@@ -1420,17 +1654,24 @@ const loadProtection = async () => {
             </div>`), advSwitch('protection'))}
 
         ${section('Past runs', `Every update and every check, with the damage it found and what was repaired. ${esc(P.runsSummary(rec, nowIso))}`, recRuns.length ? `
-            <div class="sp-runs">
+            <div class="overflow-x-auto">
+            <table class="data-table sp-runs-table">
+                <thead><tr><th>When</th><th>What</th><th>Result</th><th>Took</th><th>Files added · changed · deleted</th><th>Damage found · repaired</th></tr></thead>
+                <tbody>
                 ${recRuns.map(r => {
                     const w = P.runWords(r);
-                    return `<div class="sp-run sp-run-rec">
-                        <span class="sp-run-when">${esc(P.ago(r.finished_at, nowIso))}</span>
-                        <span class="sp-run-what"><span class="sp-dot sp-dot-${w.level}"></span>${esc(w.title)}</span>
-                        <span class="sp-run-bar"><span class="sp-run-fill sp-run-${r.command} ${w.level === 'ok' ? '' : 'sp-run-bad'}" data-width="${Math.max(1, Math.round((r.seconds || 0) * 100 / recMax))}"></span></span>
-                        <span class="sp-run-dur">${esc(P.humanSpan(r.seconds || 0))}</span>
-                        <span class="sp-run-detail ${w.level === 'bad' ? 'text-red' : ''}">${esc(w.detail)}</span>
-                    </div>`;
+                    const found = (r.errors_io || 0) + (r.errors_data || 0);
+                    return `<tr>
+                        <td class="whitespace-nowrap text-muted">${esc(P.ago(r.finished_at, nowIso))}</td>
+                        <td class="whitespace-nowrap"><b>${esc(RUN_KIND[r.command] || r.command)}</b></td>
+                        <td><span class="sp-pill sp-pill-${w.level}" data-tooltip="${escAttr(w.detail)}">${esc(w.level === 'ok' ? (r.recovered ? 'Repaired' : 'Fine') : w.title.replace(/^.*: /, ''))}</span></td>
+                        <td><span class="sp-runbar"><span class="sp-run-fill sp-run-${r.command} ${w.level === 'ok' ? '' : 'sp-run-bad'}" data-width="${Math.max(1, Math.round((r.seconds || 0) * 100 / recMax))}"></span></span> <span class="text-muted">${esc(P.humanSpan(r.seconds || 0))}</span></td>
+                        <td class="whitespace-nowrap text-muted">${r.command === 'sync' ? `${r.added || 0} · ${r.updated || 0} · ${r.removed || 0}` : '–'}</td>
+                        <td class="whitespace-nowrap ${r.unrecoverable ? 'text-red' : found ? 'text-emerald' : 'text-muted'}">${r.command === 'sync' && !found ? '–' : `${found} · ${r.recovered || 0}${r.unrecoverable ? ` · ${r.unrecoverable} lost` : ''}`}</td>
+                    </tr>`;
                 }).join('')}
+                </tbody>
+            </table>
             </div>` : empty('No run yet.'), '<a class="sp-link" href="#/tasks">Every detail</a>')}
     `);
 
@@ -2285,7 +2526,7 @@ export const simplePulse = async (hash, pulse, old) => {
     const page = SIMPLE_PAGES[hash];
     if (!page || !page.pulse.length || S.busy) return;
     // never while a dialog is open or a field is being edited
-    if (document.querySelector('.modal-overlay') || S.view?.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
+    if (document.querySelector('.modal-overlay, .sp-pal-overlay') || S.view?.contains(document.activeElement) && /INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) return;
     // at most every 5 seconds: during a task the pulse changes all the time
     if (Date.now() - (S.lastPulseLoad || 0) < 5000) return;
     if (page.pulse.some(k => pulse[k] !== old[k])) {
@@ -2313,13 +2554,130 @@ export const simpleHealthWatch = (state) => {
     } catch (ignore) { /* not allowed */ }
 };
 
+/* ------------------------------------------------------------------ */
+/* search of pages, disks, shares, backups and settings (Ctrl K)       */
+/* ------------------------------------------------------------------ */
+
+const PALETTE_FIXED = [
+    { group: 'Page', label: 'Home', href: '#/', keys: 'status overview safe' },
+    { group: 'Page', label: 'My files', href: '#/files', keys: 'folders browse pool rename delete copy check damage' },
+    { group: 'Page', label: 'Sharing', href: '#/sharing', keys: 'smb nfs windows mac users password recycle bin permissions' },
+    { group: 'Page', label: 'Backups', href: '#/backups', keys: 'rsync usb copy other computers remote' },
+    { group: 'Page', label: 'Disks', href: '#/drives', keys: 'bays health smart temperature self-test fast disk ssd cache eject usb' },
+    { group: 'Page', label: 'Protection', href: '#/protection', keys: 'parity sync scrub schedule update check damage past runs safety limit' },
+    { group: 'Page', label: 'Alerts', href: '#/alerts', keys: 'email ntfy discord telegram notify messages' },
+    { group: 'Page', label: 'System', href: '#/system', keys: 'ups battery power idle sleep wake-on-lan diagnostics settings backup restore update' },
+    { group: 'Page', label: 'Help', href: '#/help', keys: 'guides glossary tour' },
+    { group: 'Advanced', label: 'Status details', href: '#/dashboard', keys: 'dashboard' },
+    { group: 'Advanced', label: 'Storage', href: '#/storage', keys: 'config snapraid.conf pool mergerfs add replace remove disk' },
+    { group: 'Advanced', label: 'Arrays', href: '#/arrays', keys: 'multiple arrays move disk' },
+    { group: 'Advanced', label: 'Disk details', href: '#/disks', keys: 'smart attributes' },
+    { group: 'Advanced', label: 'Tasks', href: '#/tasks', keys: 'log activity history' },
+    { group: 'Advanced', label: 'Differences', href: '#/diff', keys: 'diff changes' },
+    { group: 'Advanced', label: 'Recovery', href: '#/recovery', keys: 'fix undelete restore' },
+    { group: 'Advanced', label: 'Daemon settings', href: '#/settings', keys: 'snapraidd.conf config' },
+    { group: 'Do', label: 'Update the protection now', run: () => goTo('protect'), keys: 'sync protect now' },
+    { group: 'Do', label: 'Get back deleted files', run: () => restoreDeleted('/'), keys: 'undelete restore recover' },
+    { group: 'Do', label: 'Add or replace a disk', run: () => storageOpen('array', null, {}), keys: 'new disk storage' },
+    { group: 'Do', label: 'Switch light or dark', run: () => document.getElementById('theme-toggle')?.click(), keys: 'theme dark mode light mode' },
+    { group: 'Setting', label: 'Battery backup (UPS)', href: '#/system', keys: 'ups nut apc power cut shutdown' },
+    { group: 'Setting', label: 'Sleep when idle', href: '#/system', keys: 'suspend shutdown idle power' },
+    { group: 'Setting', label: 'Wake-on-LAN', href: '#/system', keys: 'wol network' },
+    { group: 'Setting', label: 'When the protection is updated', href: '#/protection', keys: 'schedule time sync scrub' },
+    { group: 'Setting', label: 'Safety limit of deleted files', href: '#/protection', keys: 'threshold deletes ask ok' },
+    { group: 'Setting', label: 'Disk self-tests', href: '#/drives', keys: 'smart short long schedule' },
+    { group: 'Setting', label: 'Users of the shares', href: '#/sharing', keys: 'password account samba' },
+    { group: 'Setting', label: 'Diagnostics file', href: '#/system', keys: 'support log report' }
+];
+
+let paletteData = { at: 0, items: [] };
+
+/** The disks, shares and backups of the machine, read again after a minute. */
+const paletteDynamic = async () => {
+    if (Date.now() - paletteData.at < 60000) return paletteData.items;
+    const items = [];
+    const [host, disks] = await Promise.all([HostAPI.status().catch(() => null), API.getDisks().catch(() => null)]);
+    for (const kind of ['data_disks', 'parity_disks'])
+        for (const dd of disks?.[kind] || [])
+            items.push({ group: 'Disk', label: dd.name, href: '#/drives', keys: `${kind === 'data_disks' ? 'data files' : 'parity protection'} ${(dd.devices || []).map(v => `${v.node} ${v.model || ''} ${v.serial || ''}`).join(' ')}`, sel: dd.name });
+    for (const sh of host?.shares || []) items.push({ group: 'Share', label: sh.name, href: '#/sharing', keys: `${sh.path || ''} shared folder` });
+    for (const b of host?.backups || []) items.push({ group: 'Backup', label: b.name, href: '#/backups', keys: `${b.source || ''} backup` });
+    paletteData = { at: Date.now(), items };
+    return items;
+};
+
+const openPalette = async () => {
+    if (document.querySelector('.sp-pal-overlay')) return;
+    const back = document.activeElement;
+    const overlay = document.createElement('div');
+    overlay.className = 'sp-pal-overlay';
+    overlay.innerHTML = `
+        <div class="sp-pal" role="dialog" aria-modal="true" aria-label="Search">
+            <div class="sp-pal-field">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3"/></svg>
+                <input class="sp-pal-input" type="text" placeholder="Search pages, disks, shares, settings…" aria-label="Search" role="combobox" aria-expanded="true" aria-controls="sp-pal-list" aria-autocomplete="list" autocomplete="off" spellcheck="false">
+                <kbd>Esc</kbd>
+            </div>
+            <ul class="sp-pal-list" id="sp-pal-list" role="listbox"></ul>
+            <div class="sp-pal-foot"><span><kbd>↑</kbd><kbd>↓</kbd> to move</span><span><kbd>Enter</kbd> to open</span><span><kbd>Esc</kbd> to close</span></div>
+        </div>`;
+    document.body.appendChild(overlay);
+    const input = overlay.querySelector('.sp-pal-input');
+    const list = overlay.querySelector('.sp-pal-list');
+    let items = [...PALETTE_FIXED];
+    let shown = [];
+    let at = 0;
+
+    const close = () => { overlay.remove(); back?.focus?.(); };
+    const choose = (it) => {
+        close();
+        if (!it) return;
+        if (it.sel) S.cache.diskSel = (S.cache.drives || []).find(x => x.name === it.sel || x.name.endsWith(`: ${it.sel}`))?.id || S.cache.diskSel;
+        if (it.run) it.run();
+        else if (window.location.hash === it.href) refresh();
+        else window.location.hash = it.href;
+    };
+    const paint = () => {
+        shown = P.paletteMatch(items, input.value, 12);
+        at = Math.min(at, Math.max(0, shown.length - 1));
+        list.innerHTML = shown.length ? shown.map((it, i) => `
+            <li role="option" id="sp-pal-${i}" class="sp-pal-item ${i === at ? 'active' : ''}" aria-selected="${i === at}" data-i="${i}">
+                <span class="sp-pal-group">${esc(it.group)}</span><span class="sp-pal-label">${esc(it.label)}</span>${it.href ? `<span class="sp-pal-hint">${esc(SIMPLE_PAGES[it.href]?.title || '')}</span>` : ''}
+            </li>`).join('') : '<li class="sp-pal-none">Nothing found. Try another word, like “ups”, “share” or a disk name.</li>';
+        input.setAttribute('aria-activedescendant', shown.length ? `sp-pal-${at}` : '');
+        list.querySelector('.active')?.scrollIntoView({ block: 'nearest' });
+    };
+    input.addEventListener('input', () => { at = 0; paint(); });
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown') { e.preventDefault(); at = Math.min(shown.length - 1, at + 1); paint(); }
+        else if (e.key === 'ArrowUp') { e.preventDefault(); at = Math.max(0, at - 1); paint(); }
+        else if (e.key === 'Enter') { e.preventDefault(); choose(shown[at]); }
+        else if (e.key === 'Escape') { e.preventDefault(); close(); }
+        else if (e.key === 'Tab') e.preventDefault();
+    });
+    list.addEventListener('click', (e) => { const li = e.target.closest('[data-i]'); if (li) choose(shown[Number(li.dataset.i)]); });
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+    paint();
+    input.focus();
+    items = [...PALETTE_FIXED, ...await paletteDynamic()];
+    if (overlay.isConnected) paint();
+};
+
 export const initSimple = () => {
+    // Ctrl K or Cmd K opens the search from any page
+    document.addEventListener('keydown', (e) => {
+        if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'k') {
+            e.preventDefault();
+            openPalette();
+        }
+    });
     document.addEventListener('click', async (e) => {
         const el = e.target.closest('[data-sp]');
         if (!el || el.disabled) return;
         const ds = el.dataset;
         switch (ds.sp) {
             case 'go': goTo(ds.act); break;
+            case 'palette': openPalette(); break;
             case 'adv': advToggle(ds.id); break;
             case 'tour': tour(); break;
             case 'file-usage': folderUsage(ds.path); break;
@@ -2363,7 +2721,7 @@ export const initSimple = () => {
                     await baySave(P.bayPlace(bays, id, bay));
                 } else {
                     const id = Object.keys(bays.slots).find(k => bays.slots[k] === bay);
-                    if (id) { S.cache.placing = id; refresh(); }
+                    if (id) { S.cache.diskSel = id; refresh(); }
                 }
                 break;
             }

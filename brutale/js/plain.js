@@ -430,8 +430,8 @@ export const moveWords = (job) => {
 
 export const TOUR = [
     { title: 'Welcome', text: 'This server keeps your files on several disks and protects them, so a broken disk does not cost you anything. Four things are worth knowing. It takes a minute.' },
-    { title: 'Home tells you if all is well', text: 'One sentence at the top says how things are, and one button does what is needed. Green means there is nothing to do. Under it, “Needs your attention” lists anything to look at, most important first.' },
-    { title: 'Your data and your server', text: 'The menu has two groups. “Your data”: My files, Sharing with the other computers, and Backups. “Your server”: the Disks, the Protection, Alerts and System. Each page starts with the everyday things.' },
+    { title: 'Home tells you if all is well', text: 'One sentence at the top says how things are, and one button does what is needed. Green means there is nothing to do. Around it, tiles show the space, the disks, what comes next and what happened; “Needs your attention” lists anything to look at, most important first.' },
+    { title: 'Your data and your server', text: 'The menu has two groups. “Your data”: My files, Sharing with the other computers, and Backups. “Your server”: the Disks, the Protection, Alerts and System. Each page starts with the everyday things. Ctrl K (Cmd K on a Mac) finds any page, disk, share or setting.' },
     { title: 'Advanced is there when you want it', text: 'Pages and windows with finer controls have an “Advanced” switch. Leave it off and the usual choices are made for you; turn it on to see and change them. The switch is remembered for each page.' },
     { title: 'Nothing happens by surprise', text: 'Before anything is changed, a window tells what will happen and what stays as it is. After saving, the page reads the setting back and tells when it runs next. Help explains every word and the common jobs.' }
 ];
@@ -664,3 +664,144 @@ export const upsWords = (u) => {
 
 /** The name of a UPS for people: "labups" for nut:labups, "APC (apcupsd)" for apc. */
 export const upsName = (id) => id === 'apc' ? 'APC (apcupsd)' : String(id || '').replace(/^nut:/, '');
+
+/* ------------------------------------------------------------------ */
+/* the tiles of Home                                                   */
+/* ------------------------------------------------------------------ */
+
+const dayKey = (d) => `${d.getFullYear()}-${d.getMonth()}-${d.getDate()}`;
+
+/**
+ * The last nights, one mark each, from the record of the runs of every array.
+ * level: bad (a run failed or found damage it could not repair), warn (stopped),
+ * checked (checked for damage), updated (protection updated), none.
+ */
+export const nightsStrip = (runs, now = new Date(), days = 14) => {
+    const byDay = new Map();
+    for (const r of runs || []) {
+        const at = new Date(r.finished_at);
+        if (Number.isNaN(at.getTime())) continue;
+        const k = dayKey(at);
+        const list = byDay.get(k) || [];
+        list.push(r);
+        byDay.set(k, list);
+    }
+    const out = [];
+    for (let i = days - 1; i >= 0; --i) {
+        const d = new Date(now.getFullYear(), now.getMonth(), now.getDate() - i);
+        const list = byDay.get(dayKey(d)) || [];
+        const words = list.map(runWords);
+        let level = 'none';
+        if (words.some(w => w.level === 'bad')) level = 'bad';
+        else if (words.some(w => w.level === 'warn')) level = 'warn';
+        else if (list.some(r => r.command === 'scrub' || r.command === 'check')) level = 'checked';
+        else if (list.length) level = 'updated';
+        const text = list.length ? list.map(r => `${r.array}: ${runWords(r).title}`).join('; ') : 'Nothing ran';
+        out.push({ day: d.getDate(), weekday: DAYS[d.getDay()].slice(0, 3), level, text, today: i === 0 });
+    }
+    return out;
+};
+
+/** When the space runs out, from the samples of the daemon: { level, text } */
+export const forecastWords = (f) => {
+    if (!f || !f.total_bytes) return { level: 'tip', text: 'No data disk measured yet.' };
+    const free = Math.max(0, f.total_bytes - f.used_bytes);
+    if (!f.forecast) return { level: 'tip', text: 'A forecast comes after a week of daily measures.' };
+    const growth = f.growth_bytes_per_day || 0;
+    if (growth <= 0 || f.days_to_full == null) return { level: 'ok', text: 'Not growing over the last 90 days.' };
+    const daysLeft = f.days_to_full;
+    const pace = `${bytes(growth * 30)} a month`;
+    if (daysLeft < 45) return { level: daysLeft < 14 ? 'bad' : 'warn', text: `At ${pace}, full in about ${plural(Math.max(1, daysLeft), 'day', 'days')}.` };
+    if (daysLeft < 730) return { level: daysLeft < 120 ? 'warn' : 'ok', text: `At ${pace}, full in about ${plural(Math.round(daysLeft / 30.4), 'month', 'months')}.` };
+    return { level: 'ok', text: `At ${pace}, ${bytes(free)} last more than two years.` };
+};
+
+/** Percent of the data read back for damage in the last days, from the scrub history of an array. */
+export const checkedWithin = (hist, days = 30) => {
+    if (!hist?.points?.length) return null;
+    let sum = 0;
+    for (const p of hist.points) if (p.ago <= days) sum += p.scrubbed || 0;
+    return Math.min(100, Math.round(sum));
+};
+
+/** The scrub history in five spans of age: [{ label, pct }] */
+export const SCRUB_SPANS = [[0, 7, '0–7 days'], [8, 14, '8–14 days'], [15, 30, '15–30 days'], [31, 60, '31–60 days'], [61, Infinity, 'over 60 days']];
+export const scrubAges = (hist) => {
+    const out = SCRUB_SPANS.map(([lo, hi, label]) => ({ lo, hi, label, pct: 0 }));
+    for (const p of hist?.points || []) {
+        const span = out.find(s => p.ago >= s.lo && p.ago <= s.hi);
+        if (span) span.pct += (p.scrubbed || 0) + (p.new || 0);
+    }
+    return out.map(s => ({ label: s.label, pct: Math.round(s.pct * 10) / 10 }));
+};
+
+/** A time to come, short: "Tonight 02:00", "Tomorrow 05:00", "Sat 04:30", "1 Dec 04:00" */
+export const shortWhen = (date, now = new Date()) => {
+    if (!date) return '';
+    const days = Math.round((new Date(date.getFullYear(), date.getMonth(), date.getDate()) - new Date(now.getFullYear(), now.getMonth(), now.getDate())) / 86400000);
+    const t = hhmm({ hour: date.getHours(), minute: date.getMinutes() });
+    if (days === 0) return `${date.getHours() >= 18 || date.getHours() < 5 ? 'Tonight' : 'Today'} ${t}`;
+    if (days === 1) return `${date.getHours() < 5 ? 'Tonight' : 'Tomorrow'} ${t}`;
+    if (days < 7) return `${DAYS[date.getDay()].slice(0, 3)} ${t}`;
+    return `${date.getDate()} ${date.toLocaleString('en', { month: 'short' })} ${t}`;
+};
+
+/** What the server does by itself next, the soonest first: [{ at, what, sub }] */
+export const comingUp = ({ config, host }, now = new Date(), max = 4) => {
+    const list = [];
+    const add = (when, what, sub) => {
+        const at = nextRun(when, now);
+        if (at) list.push({ at, what, sub });
+    };
+    if (config?.maintenance_schedule) {
+        const pct = Number(config.scrub_percentage) || 0;
+        add(config.maintenance_schedule, 'Update the protection', pct ? `then check ${pct}% of the data for damage` : 'of every array');
+    }
+    add(host?.smart_tests?.short, 'Short disk self-test', 'all the disks, a few minutes');
+    add(host?.smart_tests?.long, 'Long disk self-test', 'all the disks, some hours');
+    for (const b of host?.backups || []) if (b.enabled !== false && b.when) add(b.when, `Backup “${b.name}”`, b.source || '');
+    for (const c of host?.caches || []) if (c.enabled !== false && c.when) add(c.when, 'Move from the fast disk', c.pool || '');
+    return list.sort((a, b) => a.at - b.at).slice(0, max);
+};
+
+const EVENT_JOBS = {
+    wipe: 'Disk erased', burnin: 'Write test of a disk', surface: 'Reading test of a disk', move: 'Files moved to other disks',
+    empty: 'Disk emptied', mover: 'Files moved from the fast disk', copy: 'Copy', permissions: 'Permissions reset',
+    format: 'Disk prepared', balance: 'Disks balanced', parity_move: 'Protection moved to a larger disk'
+};
+
+/** An event of the machine in words: { level, title, detail } */
+export const eventWords = (e) => {
+    const level = ['ok', 'info', 'warn', 'bad'].includes(e.level) ? (e.level === 'info' ? 'tip' : e.level) : 'tip';
+    switch (e.kind) {
+        case 'power_cut': return { level, title: 'Power cut', detail: e.text };
+        case 'power_back': return { level, title: 'Power back', detail: e.text };
+        case 'power_shutdown': return { level, title: 'Battery running out', detail: e.text };
+        case 'idle': return { level, title: 'Went to sleep', detail: e.text };
+        case 'usb_open': return { level, title: 'USB disk opened', detail: e.text ? `Its files are in ${e.text}` : '' };
+        case 'usb_eject': return { level, title: `USB disk ${e.target} ejected`, detail: e.text };
+        case 'backup': return { level, title: `Backup “${e.target}” ${level === 'ok' ? 'finished' : level === 'warn' ? 'did not copy everything' : 'failed'}`, detail: e.text };
+        default: {
+            const words = EVENT_JOBS[e.kind] || e.kind;
+            return { level, title: level === 'ok' ? words : `${words}: ${level === 'warn' ? 'stopped' : 'failed'}`, detail: e.text };
+        }
+    }
+};
+
+/** Search of the palette: the items with every word of the query, the best first. */
+export const paletteMatch = (items, query, max = 12) => {
+    const words = String(query || '').toLowerCase().split(/\s+/).filter(Boolean);
+    if (!words.length) return items.slice(0, max);
+    const scored = [];
+    for (const it of items) {
+        const label = it.label.toLowerCase();
+        const hay = `${label} ${(it.keys || '').toLowerCase()} ${(it.group || '').toLowerCase()}`;
+        if (!words.every(w => hay.includes(w))) continue;
+        let score = 0;
+        if (label.startsWith(words[0])) score += 4;
+        else if (label.split(/[^a-z0-9]+/).some(p => p.startsWith(words[0]))) score += 2;
+        if (words.every(w => label.includes(w))) score += 1;
+        scored.push({ it, score });
+    }
+    return scored.sort((a, b) => b.score - a.score).slice(0, max).map(x => x.it);
+};

@@ -364,3 +364,107 @@ test('battery backup in words', () => {
     assert.equal(P.upsName('nut:labups@nas'), 'labups@nas');
     assert.equal(P.upsName('apc'), 'APC (apcupsd)');
 });
+
+/* ------------------------------------------------------------------ */
+/* the tiles of Home                                                   */
+/* ------------------------------------------------------------------ */
+
+test('the last nights: one mark a day, the worst run of the day wins', () => {
+    const now = new Date(2026, 10, 20, 15, 0);
+    const at = (d, h) => new Date(2026, 10, d, h, 0).toISOString();
+    const runs = [
+        { finished_at: at(20, 2), array: 'media', command: 'sync', result: 'ok' },
+        { finished_at: at(19, 2), array: 'media', command: 'sync', result: 'ok' },
+        { finished_at: at(19, 4), array: 'media', command: 'scrub', result: 'ok' },
+        { finished_at: at(18, 2), array: 'photos', command: 'sync', result: 'stopped' },
+        { finished_at: at(18, 3), array: 'media', command: 'sync', result: 'ok' },
+        { finished_at: at(17, 2), array: 'media', command: 'scrub', result: 'ok', errors_data: 2, unrecoverable: 1 },
+        { finished_at: at(1, 2), array: 'media', command: 'sync', result: 'ok' }
+    ];
+    const n = P.nightsStrip(runs, now, 14);
+    assert.equal(n.length, 14);
+    assert.deepEqual(n.slice(-4).map(x => x.level), ['bad', 'warn', 'checked', 'updated']);
+    assert.equal(n[13].today, true);
+    assert.equal(n[13].day, 20);
+    assert.equal(n[0].day, 7);
+    assert.equal(n[0].level, 'none');
+    assert.match(n[11].text, /photos: Protection updated: stopped/);
+    assert.equal(P.nightsStrip(null, now, 3).length, 3);
+});
+
+test('the forecast of the space in words', () => {
+    const TB = 1e12;
+    assert.equal(P.forecastWords(null).level, 'tip');
+    assert.match(P.forecastWords({ total_bytes: 48 * TB, used_bytes: 31.4 * TB, forecast: false }).text, /after a week/);
+    assert.match(P.forecastWords({ total_bytes: 48 * TB, used_bytes: 31.4 * TB, forecast: true, growth_bytes_per_day: -1e9 }).text, /Not growing/);
+    const year = P.forecastWords({ total_bytes: 48 * TB, used_bytes: 31.4 * TB, forecast: true, growth_bytes_per_day: 40e9, days_to_full: 415 });
+    assert.equal(year.level, 'ok');
+    assert.match(year.text, /full in about 14 months/);
+    assert.match(year.text, /1\.2 TB a month/);
+    const soon = P.forecastWords({ total_bytes: TB, used_bytes: 0.95 * TB, forecast: true, growth_bytes_per_day: 5e9, days_to_full: 10 });
+    assert.equal(soon.level, 'bad');
+    assert.match(soon.text, /about 10 days/);
+    assert.equal(P.forecastWords({ total_bytes: TB, used_bytes: 0.5 * TB, forecast: true, growth_bytes_per_day: 5e9, days_to_full: 100 }).level, 'warn');
+    assert.match(P.forecastWords({ total_bytes: TB, used_bytes: 0.1 * TB, forecast: true, growth_bytes_per_day: 1e6, days_to_full: 9000 }).text, /more than two years/);
+});
+
+test('how much was checked for damage, and how old the checks are', () => {
+    const hist = { x_axis_low: 70, points: [{ ago: 70, scrubbed: 5, new: 0 }, { ago: 40, scrubbed: 20, new: 0 }, { ago: 20, scrubbed: 30, new: 5 }, { ago: 3, scrubbed: 30, new: 10 }] };
+    assert.equal(P.checkedWithin(hist, 30), 60);
+    assert.equal(P.checkedWithin(null), null);
+    const ages = P.scrubAges(hist);
+    assert.deepEqual(ages.map(a => a.pct), [40, 0, 35, 20, 5]);
+    assert.equal(ages[4].label, 'over 60 days');
+    assert.deepEqual(P.scrubAges(null).map(a => a.pct), [0, 0, 0, 0, 0]);
+});
+
+test('what comes next, the soonest first', () => {
+    const now = new Date(2026, 10, 20, 15, 0); // a Friday
+    const list = P.comingUp({
+        config: { maintenance_schedule: '02:00', scrub_percentage: 8 },
+        host: {
+            smart_tests: { short: 'Sat 04:30', long: '' },
+            backups: [{ name: 'Photos', when: '01:00', source: '/mnt/pool/photos' }, { name: 'Off', when: '01:30', enabled: false }],
+            caches: [{ pool: '/mnt/pool', when: '03:00' }]
+        }
+    }, now, 4);
+    assert.deepEqual(list.map(x => x.what), ['Backup “Photos”', 'Update the protection', 'Move from the fast disk', 'Short disk self-test']);
+    assert.match(list[1].sub, /8%/);
+    assert.equal(P.shortWhen(list[0].at, now), 'Tonight 01:00');
+    assert.equal(P.shortWhen(list[3].at, now), 'Tonight 04:30');
+    assert.equal(P.shortWhen(new Date(2026, 10, 21, 9, 0), now), 'Tomorrow 09:00');
+    assert.equal(P.shortWhen(new Date(2026, 10, 20, 16, 0), now), 'Today 16:00');
+    assert.equal(P.shortWhen(new Date(2026, 10, 23, 9, 0), now), 'Mon 09:00');
+    assert.equal(P.shortWhen(new Date(2026, 11, 1, 4, 0), now), '1 Dec 04:00');
+    assert.deepEqual(P.comingUp({ config: {}, host: {} }, now), []);
+});
+
+test('the events of the machine in words', () => {
+    assert.deepEqual(P.eventWords({ level: 'warn', kind: 'power_cut', text: 'Running on the battery of the UPS, 90% charged' }).title, 'Power cut');
+    const b = P.eventWords({ level: 'bad', kind: 'backup', target: 'Photos', text: 'The copy failed' });
+    assert.equal(b.title, 'Backup “Photos” failed');
+    assert.equal(b.level, 'bad');
+    assert.equal(P.eventWords({ level: 'ok', kind: 'backup', target: 'Photos' }).title, 'Backup “Photos” finished');
+    assert.equal(P.eventWords({ level: 'ok', kind: 'wipe', target: '/dev/sdk' }).title, 'Disk erased');
+    assert.equal(P.eventWords({ level: 'warn', kind: 'mover', target: 'ssd' }).title, 'Files moved from the fast disk: stopped');
+    assert.equal(P.eventWords({ level: 'info', kind: 'usb_eject', target: 'sdj' }).level, 'tip');
+    assert.equal(P.eventWords({ level: 'odd', kind: 'something' }).title, 'something: failed');
+});
+
+test('the search finds by name and by the words behind it', () => {
+    const items = [
+        { group: 'Page', label: 'Disks', keys: 'smart bays fast disk' },
+        { group: 'Page', label: 'Protection', keys: 'parity sync scrub schedule' },
+        { group: 'Setting', label: 'Battery backup (UPS)', keys: 'ups nut apc' },
+        { group: 'Share', label: 'photos', keys: '/mnt/pool/photos' },
+        { group: 'Disk', label: 'parity', keys: 'protection /dev/sdb' }
+    ];
+    assert.deepEqual(P.paletteMatch(items, 'ups').map(x => x.label), ['Battery backup (UPS)']);
+    // a word inside brackets starts a word too: the UPS comes before the Backups
+    assert.deepEqual(P.paletteMatch([{ label: 'Backups' }, ...items], 'ups').map(x => x.label), ['Battery backup (UPS)', 'Backups']);
+    assert.deepEqual(P.paletteMatch(items, 'PAR').map(x => x.label), ['parity', 'Protection']);
+    assert.deepEqual(P.paletteMatch(items, 'pool photos').map(x => x.label), ['photos']);
+    assert.equal(P.paletteMatch(items, '').length, 5);
+    assert.equal(P.paletteMatch(items, '', 2).length, 2);
+    assert.deepEqual(P.paletteMatch(items, 'nothing here'), []);
+});
