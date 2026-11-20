@@ -40,8 +40,8 @@ Features
 
 3. Protection window, what is left
    - Done: the files changed since the last sync, its age and the next one;
-     the sync after the mover; the added/deleted ratio ('sync_ratio').
-   - Optional sync when the changes pass a threshold.
+     the sync after the mover; the added/deleted ratio ('sync_ratio'); the
+     sync when the changes pass a threshold ('sync_changes').
 
 4. Shares, what is left
    - Done: SMB and NFS shares, users, recycle bin, permission reset, size of
@@ -51,35 +51,42 @@ Features
      night. Friendly names of the placement policies on the Pool tab.
 
 5. Disk burn-in, what is left
-   - Done: SMART short and long self-tests, and a reading test of the whole
-     disk as a background job.
-   - A test that also writes (badblocks -w) for a new, empty disk.
+   - Done: SMART short and long self-tests, a reading test of the whole
+     disk, and a write and read back test for a new, empty disk.
+   - Tried on loop devices only: try it on a real disk of some TB.
 
 6. Empty a disk
    - Done: a disk emptied to the others of the pool, then taken out of the
      array in the same window; a folder moved to chosen disks.
 
 7. Notification channels
-   - Done: ntfy, Discord, Telegram, email and any web address, with a test,
-     and pop-ups of the browser.
-   - More channels at once, and Web Push without the page open.
+   - Done: ntfy, Discord, Telegram, email and any web address, more of them
+     at once, with a test, and pop-ups of the browser.
+   - Web Push without the page open. It needs the pages served over HTTPS,
+     and a key pair of the server: today the pages are plain HTTP.
 
 8. History of sync and scrub
-   - Done: duration and speed of every run on the Protection page, read and
-     write history of the disks.
-   - Errors found and fixed for every run.
+   - Done: duration and speed of every run, the errors found, repaired and
+     lost of every run kept on disk, read and write history of the disks.
 
 9. Encrypted disks
    - LUKS at format time, unlock at boot with a key file, state in the
      inventory.
+   - Not built yet: the lab cannot open a LUKS volume (no device-mapper in
+     its kernel), and a change that can lock people out of their files must
+     be tried end to end first.
 
 10. External disks and remote mounts
-    - Done for backups: a USB disk is mounted for the run and released.
-    - Mount and eject USB disks with one click.
-    - SMB and NFS mounts as sources to copy data into the array.
+    - Done: a USB disk mounted for a backup and released; Open and Eject of
+      any plugged disk; SMB and NFS folders as sources of backups.
+    - Tried in the lab with a stand-in of mount.cifs: try real SMB and NFS
+      servers (Windows, macOS, a NAS, Linux).
 
 11. UPS
-    - Pause sync and scrub on battery (NUT, apcupsd).
+    - Done: sync and scrub stopped on battery, shutdown before the battery
+      is empty (NUT, apcupsd).
+    - Tried in the lab with a stand-in of upsc: try a real UPS, and the
+      shutdown for real.
 
 12. Pages for everyday use, what is left
     - The time window of the maintenance tried end to end in the lab: the

@@ -1271,13 +1271,18 @@ paths:
         mount busy), diagnostics (one text file without serial numbers, name
         of the machine, credentials, access lists and commands of hooks and
         notifications), settings_backup (the configuration files, as JSON).
+        runs?array=NAME&limit=N (the record of the syncs, scrubs, fixes and
+        checks, the newest first, with the errors found, repaired and lost,
+        and the totals), ups_detect (the UPS units known to upsc and
+        apcaccess), alerts (the places of the alerts script, needs the
+        storage administration rights).
       parameters:
         - name: what
           in: path
           required: true
           schema:
             type: string
-            enum: [history, network, share_users, smart, openfiles, diagnostics, settings_backup]
+            enum: [history, network, share_users, smart, openfiles, diagnostics, settings_backup, runs, ups_detect, alerts]
         - name: device
           in: query
           required: false
@@ -1288,6 +1293,16 @@ paths:
           required: false
           schema:
             type: string
+        - name: array
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
       responses:
         '200':
           description: Retrieved successfully.
@@ -1307,7 +1322,9 @@ paths:
         settings: simple settings and documents (maintenance_stop_at,
         smart_short, smart_long, dircache, dircache_minutes, idle_action
         none|suspend|shutdown, idle_minutes, idle_check_network, wol,
-        sync_ratio, doc.NAME); an empty value removes the setting. Answers with the
+        sync_ratio, sync_changes, sync_changes_minutes, ups nut:NAME[@HOST]|apc,
+        ups_shutdown, ups_percent, ups_minutes, doc.NAME); an empty value
+        removes the setting. Answers with the
         state, as GET /host.
 
         share_save {name, path, smb, nfs, writable, guest, users, recycle,
@@ -1329,11 +1346,26 @@ paths:
         (background job): size of a folder, disk by disk. surface {device}
         (background job): a whole disk read block by block.
 
+        usb_mount {device}: a filesystem opened under /media until ejected,
+        "target" in the answer. usb_eject {device}: every filesystem of the
+        disk unmounted and the disk turned off, "note" in the answer.
+
+        remote_save {name, kind smb|nfs, host, share, user, password, domain,
+        vers}, remote_delete {name}, remote_test {name}: a folder of another
+        computer, mounted read-only under /mnt/remote/NAME for the backups
+        whose source is inside it; remote_test answers with "folders" and
+        "entries".
+
+        alerts_save {channels}: one place for each line, as kind=ntfy|discord|
+        telegram|email|webhook with url, token, chat or to, separated by
+        tabs. Answers with the "command" to set as notify_result.
+
         power_save {disk (serial or device name), apm, aam, wcache}: saved
         and applied with hdparm; "applied" tells if the disk took them.
 
         smart_test {device, kind short|long}. wipe {device, method
-        zero|random, confirm (the device again)}, copy {source, target,
+        zero|random|test, confirm (the device again)}, test writing and
+        reading back every block, copy {source, target,
         mirror}: background jobs. file_rename {path, name}, file_delete
         {path}. wol: apply Wake-on-LAN now. restore {path, text}: write one
         configuration file given by settings_backup; a SnapRAID configuration

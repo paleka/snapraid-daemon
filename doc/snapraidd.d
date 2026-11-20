@@ -1526,6 +1526,21 @@ REST API
 	moving or renaming many files. A sync stopped by `sync_threshold_updates`
 	always waits. 0 or nothing turns it off.
 
+	`sync_changes`, `sync_changes_minutes`: every `sync_changes_minutes`
+	(default 60) the daemon runs a diff of every array, and the maintenance,
+	with its thresholds, when at least `sync_changes` files were added,
+	changed or deleted. The diff reads the disks, waking up the ones in
+	standby. 0 or nothing turns it off.
+
+	`ups`: a UPS read with NUT, `nut:NAME` or `nut:NAME@HOST`, or with
+	apcupsd, `apc`. While it runs on battery a running sync or scrub is
+	stopped, and goes on from there at the next run. `ups_shutdown` (default
+	1) turns the machine off when the UPS says the battery is low, when the
+	charge is below `ups_percent` (default 20) or when less than `ups_minutes`
+	(default 5) are left, read twice in a row. A UPS that does not answer is
+	not taken as a power cut. With SNAPRAIDD_HOST_DRYRUN=1 the shutdown is only
+	logged.
+
 	The other requests: `share_save`, `share_delete`, `share_user_set`,
 	`share_user_delete`, `permissions` (SMB and NFS shares), `backup_save`,
 	`backup_delete`, `backup_run` (copies of a folder with rsync to a disk
@@ -1534,7 +1549,9 @@ REST API
 	`smart_test`, `wipe`, `copy` (a folder or a single file), `usage` (the
 	size of a folder, and how much of it is on every disk of its pool),
 	`surface` (a whole disk read block by block, writing nothing),
-	`file_rename`, `file_delete`, `wol` and `restore`. Wipe, copy, backup,
+	`file_rename`, `file_delete`, `wol` and `restore`. The `wipe` method
+	`test` writes a pattern on every block of the disk, reads it back and
+	compares it, then leaves the disk blank. Wipe, copy, backup,
 	usage, surface and permissions run as the background job of
 	/snapraid/v1/storage/job. The OpenAPI description has every field.
 
@@ -1557,6 +1574,25 @@ REST API
 	chosen ones with /snapraid/v1/storage/move. New files are still placed by
 	the pool, so they can be on another disk until then.
 
+	`usb_mount` opens a filesystem of a plugged disk under /media, until
+	`usb_eject` or the next start, without writing /etc/fstab. `usb_eject`
+	unmounts every filesystem of a disk and turns it off. A disk of an array or
+	of a pool, the system disk and a disk with files open are refused.
+
+	`remote_save`, `remote_delete` and `remote_test` handle a folder shared by
+	another computer: `kind` smb or nfs, `host`, `share`, and for SMB `user`,
+	`password`, `domain` and `vers`. The password is kept in
+	snapraidd-remote-NAME.cred next to the settings, readable by root only. A
+	backup whose `source` is under /mnt/remote/NAME mounts it read-only for the
+	run and releases it after. `remote_test` mounts it once and lists its
+	folders.
+
+	`alerts_save` with `channels`, one place for each line as options
+	(`kind` ntfy, discord, telegram, email or webhook, with `url`, `token`,
+	`chat` or `to`), writes snapraidd-alerts.sh next to the settings, readable
+	by root only, and gives back the `command` to set as `notify_result`: it
+	sends every report to all the places. An empty list removes the script.
+
 	SMB shares are written in /etc/samba/snapraidd-shares.conf, included by
 	one line added at the end of /etc/samba/smb.conf, whose previous version
 	is kept as smb.conf.snapraidd.bak. NFS exports are written in
@@ -1567,7 +1603,11 @@ REST API
 	minutes, for a day. `network`: the network cards and their Wake-on-LAN
 	state. `share_users`: the users of the SMB shares. `smart?device=DEV`: the
 	self-test log of a disk. `openfiles?path=DIR`: the programs keeping a mount
-	busy. `diagnostics`: one text file for a request of help, without serial
+	busy. `runs?array=NAME&limit=N`: the record of the syncs, scrubs, fixes and
+	checks of the arrays, the newest first, with the errors found, repaired and
+	lost, kept in snapraidd-runs.log next to the settings. `ups_detect`: the
+	UPS units the tools of the machine know. `alerts`: the places of
+	snapraidd-alerts.sh. `diagnostics`: one text file for a request of help, without serial
 	numbers, the name of the machine, credentials, access lists and the
 	commands of hooks and notifications. `settings_backup`: the configuration
 	files of the daemon, of the arrays, of the machine and fstab, as JSON, for

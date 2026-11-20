@@ -223,6 +223,51 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
   configuration, and replaces its line in place of adding a second one.
 
 
+* Write test of a new disk ('method' "test" of the wipe request, job kind
+  "burnin"): a pattern is written on every block, then read back straight
+  from the disk and compared. At the end the disk is left blank. Disks of an
+  array and disks in use are refused, as for the wipe. In the pages: Test…
+  on a disk in no use.
+
+* Record of the runs: every sync, scrub, fix and check of every array, with
+  its result, duration, files added, changed and deleted, errors found,
+  repaired and lost, is kept in snapraidd-runs.log next to the settings
+  (about 2500 runs). GET /host/runs, with 'array' and 'limit'. The Protection
+  page shows it with the totals.
+
+* Update as soon as enough files changed (settings 'sync_changes' and
+  'sync_changes_minutes'): the daemon looks for changes with a diff, and runs
+  the maintenance, with its safety limits, when enough files were added,
+  changed or deleted. Protection page, Advanced.
+
+* Battery backup (UPS) through NUT (upsc) or apcupsd (apcaccess), setting
+  'ups' ("nut:NAME[@HOST]" or "apc"): on battery a running sync or scrub
+  stops and goes on at the next run; with 'ups_shutdown' the machine turns
+  itself off when the charge is below 'ups_percent', when less than
+  'ups_minutes' are left, or when the UPS says the battery is low (two reads
+  in a row). A UPS that stops answering is not taken as a power cut. State in
+  GET /host, units found in GET /host/ups_detect. System page.
+
+* Disks plugged for a while: usb_mount opens a filesystem under /media
+  until it is ejected, without writing fstab; usb_eject finishes the writes,
+  unmounts every filesystem of the disk and turns it off. Disks of an array
+  or of a pool, the system disk and disks with files open are refused.
+  Disks page: Open and Eject.
+
+* Folders of other computers (settings 'remote.NAME', requests remote_save,
+  remote_delete, remote_test): SMB or NFS shares mounted read-only under
+  /mnt/remote/NAME for the time of a backup that copies them, and released
+  after. The password is kept apart in snapraidd-remote-NAME.cred, readable
+  by root only. Backups page: Other computers, and backups from them.
+
+* Alerts to more places at once: alerts_save writes snapraidd-alerts.sh next
+  to the settings (mode 0700) that sends one report to every place (ntfy,
+  Discord, Telegram, email, any web address), and gives back the command for
+  'notify_result'. GET /host/alerts reads the places back.
+
+* The thread of the machine looks again right after a setting is saved.
+
+
 Changes to existing files
 -------------------------
 
