@@ -1080,10 +1080,10 @@ paths:
                   description: 'Folder inside the pool, starting with /. Empty: everything.'
                 to:
                   type: string
-                  description: 'Branch getting the files. Empty: for every file the other writable branch with most room.'
+                  description: 'Branches getting the files, separated by colons. Empty: for every file the other writable branch with most room, or the disks chosen for its folder.'
                 kind:
                   type: string
-                  enum: [move, empty, mover]
+                  enum: [move, empty, mover, keep]
                   description: 'What the job is called: a folder to a chosen disk, a disk emptied, a fast disk emptied to the array.'
                 age_minutes:
                   type: string
@@ -1106,7 +1106,7 @@ paths:
     post:
       summary: Move a parity file to another disk
       description: >
-        Copies the file of a parity level to the disk mounted at "target", reads it back and compares it byte by byte with the original, and only then rewrites the SnapRAID configuration with the new place, in background. The array cannot sync or scrub meanwhile; the old file is never touched, and on any error the copy is deleted. Then run /storage/recover with "accept" to record the new disk. A split parity is refused. Requires net_storage_admin.
+        Copies the file of a parity level to the disk mounted at "target", reads it back and compares it byte by byte with the original, and only then rewrites the SnapRAID configuration with the new place, in background. The array cannot sync or scrub meanwhile; the old file is never touched, and on any error the copy is deleted. Then run /storage/recover with "accept" to record the new disk. Requires net_storage_admin.
       requestBody:
         required: true
         content:
@@ -1120,6 +1120,9 @@ paths:
                 parity:
                   type: string
                   description: 'Parity level: parity, 2-parity, ... 6-parity.'
+                part:
+                  type: string
+                  description: 'For a parity split in more files, the file to move, counting from 1.'
                 target:
                   type: string
                   description: 'Mount point of the new disk: in no array, in no pool, with room for the file.'
@@ -1318,8 +1321,11 @@ paths:
         (background job).
 
         cache_save {name, pool, branch, when, age_hours, fill, sync,
-        enabled, policy}, cache_delete {name}, cache_run {name} (background
-        job): a fast disk in front of a pool and its mover. usage {path}
+        enabled, policy, stay}, cache_delete {name}, cache_run {name}
+        (background job): a fast disk in front of a pool and its mover.
+        keep_save {name, pool, path, disks, when, enabled}, keep_delete
+        {name}, keep_run {name} (background job): a folder of a pool kept on
+        chosen disks. usage {path}
         (background job): size of a folder, disk by disk. surface {device}
         (background job): a whole disk read block by block.
 

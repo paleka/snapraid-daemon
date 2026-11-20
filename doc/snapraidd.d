@@ -1428,10 +1428,12 @@ REST API
 	POST starts in background the move of files from some branches of the pool
 	`mountpoint` to other ones, keeping their path inside the pool. `from` has
 	the branches to take the files from, separated by colons; `path` a folder
-	inside the pool, or nothing for everything; `to` the branch getting the
-	files, or nothing for the emptiest of the others, file by file. `kind` is
-	`move` (a folder brought to a chosen disk), `empty` (a disk emptied before
-	it is taken out) or `mover` (a fast disk emptied to the array). With
+	inside the pool, or nothing for everything; `to` the branches getting the
+	files, separated by colons, or nothing for the emptiest of the others, file
+	by file. `kind` is `move` (a folder brought to chosen disks), `empty` (a
+	disk emptied before it is taken out), `mover` (a fast disk emptied to the
+	array) or `keep` (a folder brought back to its disks). Without `to`, the
+	files of a folder kept on chosen disks go to those disks. With
 	`age_minutes` the files changed more recently are left. With `sync` the
 	maintenance of the arrays getting the files runs at the end.
 
@@ -1457,8 +1459,8 @@ REST API
 	the job is stopped, the copy is deleted and the array goes on as before.
 
 	For the array the parity is then on a changed disk: run
-	/snapraid/v1/storage/recover with `accept` to record it. A parity split in
-	more files is refused.
+	/snapraid/v1/storage/recover with `accept` to record it. For a parity split
+	in more files, `part` tells which file to move, counting from 1.
 
     /snapraid/v1/storage/duplicates
 	POST starts in background the search of files present with the same path in
@@ -1544,7 +1546,16 @@ REST API
 	in the last `age_hours`, and at once, all of them, when the disk is more
 	than `fill` percent full; `sync` runs the maintenance after. A file on the
 	fast disk is not protected by the parity until it is moved: GET
-	/snapraid/v1/host tells how many files wait on every fast disk.
+	/snapraid/v1/host tells how many files wait on every fast disk. `stay` is a
+	list of folders of the pool, separated by colons, whose files are never
+	moved, and so never protected.
+
+	`keep_save`, `keep_delete` and `keep_run` handle a folder kept on chosen
+	disks: `path` is the folder inside the pool `pool`, `disks` the branches
+	chosen for it, separated by colons. At the times of `when`, and with
+	`keep_run`, what of the folder is on the other branches is moved to the
+	chosen ones with /snapraid/v1/storage/move. New files are still placed by
+	the pool, so they can be on another disk until then.
 
 	SMB shares are written in /etc/samba/snapraidd-shares.conf, included by
 	one line added at the end of /etc/samba/smb.conf, whose previous version

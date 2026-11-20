@@ -197,6 +197,24 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
   network traffic in the idle check). A short tour at the first visit, also
   in Help.
 
+* Folders kept on chosen disks of a pool (settings 'keep.NAME', requests
+  keep_save, keep_delete, keep_run): what of the folder is on other disks is
+  moved to the chosen ones, and so are, every day at a set time, the files
+  that landed elsewhere since. The mover of a fast disk and the emptying of
+  a disk take the files of such a folder straight to its disks. In the
+  pages: "Disks…" on a folder of My files (Advanced) and on a share.
+
+* A fast disk can have folders that stay on it ('stay'), never moved and
+  never protected.
+
+* The move of the parity takes also one file of a split parity ('part'),
+  and the Add dialog offers it when a new data disk is larger than the
+  parity.
+
+* Emptying a disk can end with taking it out of the array: out of the
+  pool, the sync that forgets it, and out of the configuration, in one
+  window.
+
 * The Protection page reads the temperature limit of an existing SnapRAID
   configuration, and replaces its line in place of adding a second one.
 

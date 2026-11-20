@@ -26,21 +26,17 @@ Open items
 Features
 ========
 
-1. Parity swap, what is left
-   - Done: "Move to a larger disk" copies the parity to a new disk, checks
-     the copy, switches the array to it and can make the old parity disk a
-     data disk. Offered from the parity row, from the Disks page and from the
-     advisor when a free disk is larger than the parity.
-   - Offer it also from the Add dialog when the chosen disk is larger than
-     the parity.
-   - A split parity: today it's refused.
+1. Parity swap
+   - Done: the parity, or one file of a split parity, copied to a larger
+     disk, checked and switched to, with the old disk reused for files;
+     offered from the parity row, the Disks page, the advisor and the Add
+     dialog.
 
 2. Fast disk and mover, what is left
    - Done: an SSD first in the pool, a mover by schedule, by fill level or
-     on request, followed by the maintenance, and the warning about files
-     not yet protected.
-   - A per-folder choice to stay on the fast disk.
-   - More fast disks in front of the same pool, mirrored.
+     on request, followed by the maintenance; folders that stay on it.
+   - Two fast disks mirrored in front of the same pool. It needs the health
+     of the mirror watched and reported, or it is a false comfort.
 
 3. Protection window, what is left
    - Done: the files changed since the last sync, its age and the next one;
@@ -49,20 +45,19 @@ Features
 
 4. Shares, what is left
    - Done: SMB and NFS shares, users, recycle bin, permission reset, size of
-     a share disk by disk, a folder brought together on one disk.
-   - Keep a folder on one disk also for the files to come (mergerfs "ep"
-     policies), include and exclude disks per share. Friendly names of the
-     placement policies on the Pool tab.
+     a share disk by disk, a folder or a share kept on chosen disks.
+   - New files of a kept folder written straight to its disks (mergerfs
+     "ep" policies or a pool of its own), in place of being brought back at
+     night. Friendly names of the placement policies on the Pool tab.
 
 5. Disk burn-in, what is left
    - Done: SMART short and long self-tests, and a reading test of the whole
      disk as a background job.
    - A test that also writes (badblocks -w) for a new, empty disk.
 
-6. Empty a disk, what is left
-   - Done: a disk emptied to the others of the pool, a folder moved to a
-     chosen disk.
-   - Chain the emptying with the removal from the array in one dialog.
+6. Empty a disk
+   - Done: a disk emptied to the others of the pool, then taken out of the
+     array in the same window; a folder moved to chosen disks.
 
 7. Notification channels
    - Done: ntfy, Discord, Telegram, email and any web address, with a test,
@@ -90,7 +85,8 @@ Features
     - The time window of the maintenance tried end to end in the lab: the
       emulated disks are too fast for a sync still running at a set time.
     - The idle action tried on a real machine: the lab only logs it.
-    - The installer does not add samba, nfs-kernel-server, hdparm, ethtool.
+    - The installer adding samba, nfs-kernel-server, hdparm and ethtool is on
+      the branch installer-tools, to be reviewed.
 
 13. More arrays, what is left
     - Windows: built from the same sources, but not compiled nor tried.
