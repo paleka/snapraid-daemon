@@ -1,0 +1,1180 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Andrea Mazzoleni
+
+import { API, ARRAY_DEFAULT } from './api.js';
+import { loadStorage, initStorage } from './storage.js';
+import { loadArrays, refreshArrays, renderSwitcher, initArrays } from './arrays.js';
+import { Icons, showToast, showConfirm, showConfirmDown, showConfirmDownThreshold, showModal, formatElapsedTime, formatDiskSize, formatSeconds, formatAttr } from './utils.js';
+import { SIMPLE_PAGES, loadSimplePage, simplePulse, simpleHealthWatch, initSimple } from './simple.js';
+import { renderDashboard, renderDisks, renderTasks, renderDifferences, renderRecovery, renderSettings, renderTempSparkline, renderScrubHistory, renderHealthBanner, escHtml } from './ui.js';
+
+// Periodic refresh for pages that need to be updated even without a pulse.
+// Used by the Dashboard to update "memory usage" in the System card.
+// Used by the Disks page to slide temperature graphs as time passes.
+const REFRESH_INTERVAL_MS = 60000;
+
+const app = {
+    state: {
+        currentRoute: '',
+        lastDisksRefresh: 0,
+        pulse: {},
+        pollingInterval: null,
+        isConnected: true,
+        hidePeriodic: true,
+        system: null,
+        lastSystemRefresh: 0,
+        dashboardArray: null,
+        dashboardActivity: null,
+        disks: null,
+        instance: null,
+        arrays: null,
+        arraysCount: 1
+    },
+
+    init: () => {
+        // Theme Init
+        const savedTheme = localStorage.getItem('theme') || document.documentElement.dataset.theme || 'light';
+        document.documentElement.dataset.theme = savedTheme;
+        // following the computer: its change is followed too, until a choice is made here
+        if (document.documentElement.dataset.themeDefault === 'system' && window.matchMedia) {
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+                if (localStorage.getItem('theme')) return;
+                document.documentElement.dataset.theme = e.matches ? 'dark' : 'light';
+                const iconEl = document.querySelector('#icon-theme');
+                if (iconEl) iconEl.innerHTML = e.matches ? Icons.sun : Icons.moon;
+                app.redrawGraphs();
+            });
+        }
+
+        // Render Icons
+        document.querySelectorAll('[data-icon]').forEach(el => {
+            if (Icons[el.dataset.icon]) el.innerHTML = Icons[el.dataset.icon];
+        });
+        document.querySelectorAll('[id^="icon-"]').forEach(el => {
+            const iconName = el.id.replace('icon-', '');
+            if (iconName === 'theme') {
+                el.innerHTML = savedTheme === 'light' ? Icons.moon : Icons.sun;
+            } else if (Icons[iconName]) {
+                el.innerHTML = Icons[iconName];
+            }
+        });
+
+        // Theme Toggle Handler
+        document.getElementById('theme-toggle').addEventListener('click', () => {
+            const current = document.documentElement.dataset.theme;
+            const next = current === 'light' ? 'dark' : 'light';
+            document.documentElement.dataset.theme = next;
+            localStorage.setItem('theme', next);
+
+            // Update Icon
+            const iconEl = document.querySelector('#icon-theme');
+            if (iconEl) iconEl.innerHTML = next === 'light' ? Icons.moon : Icons.sun;
+
+            // Redraw graphs to match theme colors if needed (sparklines use hardcoded colors but maybe background changes?)
+            // Sparklines have transparent backgrounds, but axes lines are white with opacity.
+            // We might need to re-render them if we want to change axis colors.
+            // For now, let's just redraw.
+            app.redrawGraphs();
+        });
+
+        // Global Tooltip Manager
+        const tooltip = document.createElement('div');
+        tooltip.className = 'tooltip-floating';
+        document.body.appendChild(tooltip);
+
+        document.addEventListener('mouseover', (e) => {
+            const el = e.target.closest('[data-tooltip]');
+            if (!el) {
+                tooltip.classList.remove('active');
+                return;
+            }
+
+            // On touch devices, do not show tooltips for buttons to avoid them sticking after click
+            const isTouch = !window.matchMedia('(hover: hover)').matches;
+            const isButton = el.tagName === 'BUTTON' || el.classList.contains('btn');
+            if (isTouch && isButton) return;
+
+            tooltip.innerText = el.getAttribute('data-tooltip');
+            tooltip.classList.add('active');
+
+            const updatePos = (me) => {
+                const padding = 15;
+                let x = me.clientX + padding;
+                let y = me.clientY + padding;
+
+                // Flip if near edges
+                if (x + tooltip.offsetWidth > window.innerWidth) x = me.clientX - tooltip.offsetWidth - padding;
+                if (y + tooltip.offsetHeight > window.innerHeight) y = me.clientY - tooltip.offsetHeight - padding;
+
+                tooltip.style.left = `${x}px`;
+                tooltip.style.top = `${y}px`;
+            };
+
+            updatePos(e);
+            el._tooltipHandler = updatePos;
+            el.addEventListener('mousemove', updatePos);
+        });
+
+        document.addEventListener('mouseout', (e) => {
+            const el = e.target.closest('[data-tooltip]');
+            if (el && el._tooltipHandler) {
+                el.removeEventListener('mousemove', el._tooltipHandler);
+                delete el._tooltipHandler;
+            }
+            tooltip.classList.remove('active');
+        });
+
+        initStorage();
+        initSimple();
+        initArrays(app.selectArray);
+        app.initMenu();
+
+        // Navigation
+        window.addEventListener('hashchange', app.handleRoute);
+        app.handleRoute();
+
+        // Mobile Menu
+        document.getElementById('mobile-menu-btn').addEventListener('click', () => {
+            document.getElementById('sidebar').classList.toggle('open');
+        });
+
+        // Global Action: Close sidebar on link click (mobile)
+        document.querySelectorAll('.nav-item').forEach(l => {
+            l.addEventListener('click', () => {
+                if (window.innerWidth < 768) document.getElementById('sidebar').classList.remove('open');
+            });
+        });
+
+        // Centralized Event Dispatcher (for CSP compliance)
+        document.addEventListener('click', (e) => {
+            const el = e.target.closest('[data-action]');
+            if (!el) return;
+
+            const action = el.dataset.action;
+            const ds = el.dataset;
+
+            switch (action) {
+                case 'maintenance': app.triggerMaintenance(); break;
+                case 'refresh': app.triggerRefresh(); break;
+                case 'stop-task': app.triggerStop(); break;
+                case 'clear-queue': app.triggerClear(); break;
+                case 'spin-up': app.triggerUp(); break;
+                case 'spin-down': app.triggerDown(); break;
+                case 'diff': app.triggerDiff(); break;
+                case 'recovery-cancel':
+                    app.handleRoute();
+                    showToast('Refreshed settings', 'info');
+                    break;
+                case 'settings-save': app.saveSettings(); break;
+                case 'undelete': app.triggerUndelete(ds.disk, ds.path); break;
+                case 'undelete-batch': app.triggerUndeleteBatch(); break;
+                case 'heal': app.triggerHeal(); break;
+                case 'smart-details': app.showSmartDetails(ds.node); break;
+                case 'toggle-log':
+                    document.getElementById(ds.target).classList.toggle('hidden');
+                    break;
+            }
+        });
+
+        document.addEventListener('change', (e) => {
+            const el = e.target.closest('[data-action]');
+            if (!el) return;
+
+            const action = el.dataset.action;
+            if (action === 'toggle-periodic') {
+                app.toggleHidePeriodic(el.checked);
+            } else if (action === 'hold-off') {
+                app.toggleHoldOff(el.checked);
+            }
+        });
+
+        // Resize handler for graphs
+        let resizeTimer;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimer);
+            resizeTimer = setTimeout(app.redrawGraphs, 100);
+        });
+    },
+
+    /** The advanced group of the menu stays as the person left it. */
+    initMenu: () => {
+        const adv = document.getElementById('nav-advanced');
+        if (!adv) return;
+        try { adv.open = localStorage.getItem('nav-advanced') === '1'; } catch (ignore) { /* no storage */ }
+        adv.addEventListener('toggle', () => {
+            try { localStorage.setItem('nav-advanced', adv.open ? '1' : '0'); } catch (ignore) { /* no storage */ }
+        });
+    },
+
+    redrawGraphs: () => {
+        const hash = app.state.currentRoute;
+        if (hash === '#/dashboard' && app.state.dashboardArray?.scrub_history) {
+            renderScrubHistory('scrub-history-graph', app.state.dashboardArray.scrub_history);
+        } else if (hash === '#/disks' && app.state.disks) {
+            const data = app.state.disks;
+            [...data.parity_disks, ...data.data_disks, ...data.extra_disks].forEach(disk => {
+                disk.devices.forEach(dev => {
+                    if (dev.temp_history_24h) {
+                        const safeId = dev.node.replace(/[^a-z0-9]/gi, '-');
+                        renderTempSparkline(`sparkline-${safeId}`, dev.temp_history_24h, dev.smart?.temperature_min_celsius, dev.smart?.temperature_max_celsius, dev.smart?.temperature_warning_celsius, dev.smart?.temperature_critical_celsius, dev.smart?.temperature_danger_celsius);
+                    }
+                });
+            });
+        }
+    },
+
+    applyDynamicStyles: (container) => {
+        if (!container) return;
+        container.querySelectorAll('[data-style-width]').forEach(el => {
+            el.style.width = el.dataset.styleWidth;
+        });
+        container.querySelectorAll('[data-style-height]').forEach(el => {
+            el.style.height = el.dataset.styleHeight;
+        });
+    },
+
+    stopPolling: () => {
+        if (app.state.pollingInterval) clearInterval(app.state.pollingInterval);
+        app.state.pollingInterval = null;
+    },
+
+    /** Work on another array: what was loaded belongs to the previous one. */
+    selectArray: () => {
+        app.state.pulse = {};
+        app.state.dashboardArray = null;
+        app.state.dashboardActivity = null;
+        app.state.disks = null;
+        app.state.config = null;
+        app.updateSwitcher();
+        app.handleRoute();
+    },
+
+    updateSwitcher: () => {
+        const box = document.getElementById('array-switcher');
+        if (box) box.innerHTML = renderSwitcher(app.state.arrays);
+    },
+
+    /** With more arrays: the switcher, and a notice for the arrays in trouble that are not the one shown. */
+    pollArrays: async (count) => {
+        const many = count > 1;
+        if (!many && app.state.currentRoute !== '#/arrays') {
+            if (app.state.arrays) { app.state.arrays = null; app.updateSwitcher(); }
+            app.state.arraysCount = count;
+            return '';
+        }
+        const arrays = await API.getArrays();
+        const changed = app.state.arraysCount !== count;
+        app.state.arrays = arrays;
+        app.state.arraysCount = count;
+        app.updateSwitcher();
+        if (changed) app.updatePageTitle();
+        if (app.state.currentRoute === '#/arrays') await refreshArrays(arrays);
+        return arrays.arrays
+            .filter(a => a.name !== API.array() && a.configured && ['corrupt', 'degraded', 'prefail', 'failing'].includes(a.health))
+            .map(a => `
+                <div class="health-banner ${escHtml(a.health)}">
+                    <div class="health-banner-title">ARRAY ${escHtml(a.name.toUpperCase())}: ${escHtml(a.health.toUpperCase())}</div>
+                    <div class="text-sm">${escHtml(a.health_reason || '')}
+                        <button class="btn btn-secondary btn-sm" data-ar="open" data-name="${escHtml(a.name)}" data-to="#/">Open ${escHtml(a.name)}</button></div>
+                </div>`).join('');
+    },
+
+    pollState: async () => {
+        try {
+            let state;
+            try {
+                state = await API.getState();
+            } catch (e) {
+                // the array shown was removed, here or by somebody else: go back to the one that always exists
+                if (API.array() !== ARRAY_DEFAULT && /no array/i.test(e.message)) {
+                    API.setArray(ARRAY_DEFAULT);
+                    app.selectArray();
+                    return;
+                }
+                throw e;
+            }
+            const otherAlerts = await app.pollArrays(state.arrays_count || 1).catch(() => '');
+            if (state.instance && app.state.instance !== state.instance) {
+                app.state.instance = state.instance;
+                app.updatePageTitle();
+            }
+            const pulse = state.pulse;
+            const oldPulse = app.state.pulse || {};
+            const wasDisconnected = !app.state.isConnected;
+
+            if (wasDisconnected) {
+                app.setConnection(true);
+            }
+
+            let needsRefresh = false;
+            let needsSystemRefresh = false;
+            let needsDiskRefresh = false;
+
+            const now = Date.now();
+            const hash = app.state.currentRoute;            
+            if (hash === '#/dashboard' && (now - app.state.lastSystemRefresh) > REFRESH_INTERVAL_MS) {
+                needsSystemRefresh = true;
+            }
+            if (hash === '#/disks' && (now - app.state.lastDisksRefresh) > REFRESH_INTERVAL_MS) {
+                needsDiskRefresh = true;
+            }
+
+            switch (app.state.currentRoute) {
+                case '#/dashboard': // Dashboard - check array and activity
+                    if (pulse.array !== oldPulse.array || pulse.activity !== oldPulse.activity) needsRefresh = true;
+                    break;
+                case '#/disks': // Disks - check disks
+                    if (pulse.disks !== oldPulse.disks) needsRefresh = true;
+                    break;
+                case '#/tasks': // Tasks - check tasks
+                    if (pulse.tasks !== oldPulse.tasks) needsRefresh = true;
+                    break;
+                case '#/diff': // Difference - check array
+                    if (pulse.array !== oldPulse.array) needsRefresh = true;
+                    break;
+                case '#/recovery': // Recovery - check array (fixes/bad blocks are in array)
+                    if (pulse.array !== oldPulse.array) needsRefresh = true;
+                    break;
+                case '#/settings': // Settings - check config
+                    if (pulse.config !== oldPulse.config) needsRefresh = true;
+                    break;
+            }
+
+            // the pages for everyday use refresh themselves
+            simpleHealthWatch(state);
+            if (SIMPLE_PAGES[hash]) await simplePulse(hash, pulse, oldPulse);
+
+            // Also refresh if we reconnected and are currently showing an error
+            const isShowingError = !!document.querySelector('#view-container .border-red-500');
+
+            if (needsRefresh || needsSystemRefresh || needsDiskRefresh || (wasDisconnected && isShowingError)) {
+                if (hash === '#/dashboard') {
+                    await app.loadDashboard({
+                        array: (pulse.array !== oldPulse.array) || wasDisconnected,
+                        activity: (pulse.activity !== oldPulse.activity) || wasDisconnected,
+                        system: needsSystemRefresh || wasDisconnected
+                    });
+                }
+                else if (hash === '#/disks') await app.loadDisks();
+                else if (hash === '#/tasks') await app.loadTasks();
+                else if (hash === '#/diff') await app.loadDifferences();
+                else if (hash === '#/recovery') await app.loadRecovery();
+                else if (hash === '#/settings') await app.loadSettings();
+            }
+
+            // Update Sidebar Status
+            const statusBar = document.getElementById('sidebar-status');
+            if (statusBar && state) {
+                if (state.active_command) {
+                    const hasProgress = state.progress !== undefined;
+                    const hasEta = state.eta_seconds !== undefined;
+
+                    let html = `
+                        <div class="status-title">
+                            <span class="status-command flex items-center">
+                                <span class="status-icon icon-spin">${Icons.refresh}</span>
+                                ${escHtml(state.active_command.toUpperCase())}
+                                ${state.next_command ? `
+                                    <span class="status-separator">${Icons.arrowRight}</span>
+                                    <span class="status-next">${escHtml(state.next_command.toUpperCase())}</span>
+                                ` : ''}
+                            </span>
+                            ${hasProgress ? `<span>${state.progress}%</span>` : ''}
+                        </div>
+                    `;
+
+                    if (hasProgress) {
+                        html += `
+                        <div class="progress-container">
+                            <div class="progress-bar" data-style-width="${state.progress}%"></div>
+                        </div>`;
+                    }
+
+                    if (hasEta) {
+                        html += `
+                        <div class="status-meta">
+                            <span>ETA: ${formatSeconds(state.eta_seconds)}</span>
+                        </div>`;
+                    }
+
+                    statusBar.innerHTML = html;
+                    app.applyDynamicStyles(statusBar);
+                } else {
+                    statusBar.innerHTML = '';
+                }
+            }
+
+            // Global Health Banner
+            const globalAlerts = document.getElementById('global-alerts');
+            if (globalAlerts && state) {
+                globalAlerts.innerHTML = renderHealthBanner(state) + otherAlerts;
+            }
+
+            app.state.pulse = pulse;
+        } catch (e) {
+            console.error("Pulse check failed", e);
+            app.setConnection(false);
+        }
+    },
+
+    /** Something changed in the arrays page: show it in the switcher without waiting for the next poll. */
+    updateSwitcherNow: async () => {
+        try {
+            app.state.arrays = await API.getArrays();
+            app.state.arraysCount = app.state.arrays.arrays.length;
+            if (app.state.arraysCount < 2) app.state.arrays = app.state.currentRoute === '#/arrays' ? app.state.arrays : null;
+            app.updateSwitcher();
+        } catch (ignore) { /* the next poll tries again */ }
+    },
+
+    setConnection: (isConnected) => {
+        if (app.state.isConnected === isConnected) return;
+        app.state.isConnected = isConnected;
+
+        const dot = document.querySelector('.pulse-dot');
+        const text = document.getElementById('connection-text');
+
+        if (isConnected) {
+            dot.classList.remove('disconnected');
+            text.innerText = 'Connected';
+            text.classList.remove('text-red');
+        } else {
+            dot.classList.add('disconnected');
+            text.innerText = 'Disconnected';
+            text.classList.add('text-red');
+        }
+    },
+
+    getRouteTitle: (route) => {
+        switch (route) {
+            case '#/dashboard': return 'Status details';
+            case '#/disks': return 'Disks';
+            case '#/tasks': return 'Tasks';
+            case '#/diff': return 'Differences';
+            case '#/recovery': return 'Recovery';
+            case '#/storage': return 'Storage';
+            case '#/arrays': return 'Arrays';
+            case '#/settings': return 'Settings';
+            default: return SIMPLE_PAGES[route]?.title || 'Page Not Found';
+        }
+    },
+
+    updatePageTitle: (baseTitle) => {
+        const route = app.state.currentRoute || '#/';
+        const title = baseTitle || app.getRouteTitle(route);
+        const titleEl = document.getElementById('page-title');
+        if (titleEl && app.state.arraysCount > 1 && route !== '#/arrays' && !SIMPLE_PAGES[route]?.machine) {
+            // with more arrays every page says which one it's about
+            titleEl.innerText = `${API.array()} · ${title}`;
+        } else if (titleEl) {
+            if (app.state.instance) {
+                const capInstance = app.state.instance.charAt(0).toUpperCase() + app.state.instance.slice(1);
+                titleEl.innerText = `${capInstance} ${title}`;
+            } else {
+                titleEl.innerText = title;
+            }
+        }
+    },
+
+    handleRoute: async () => {
+        app.stopPolling();
+
+        // Start Pulse Polling (Global for all pages)
+        app.pollState();
+        app.state.pollingInterval = setInterval(app.pollState, 3000);
+
+        const hash = window.location.hash || '#/';
+        app.state.currentRoute = hash;
+
+        // Update Sidebar
+        document.querySelectorAll('.nav-item').forEach(el => {
+            el.classList.toggle('active', el.getAttribute('href') === hash);
+        });
+        // a page of the advanced group opens the group
+        const adv = document.getElementById('nav-advanced');
+        if (adv && adv.querySelector(`.nav-item[href="${hash}"]`)) adv.open = true;
+
+        const view = document.getElementById('view-container');
+        const actions = document.getElementById('header-actions');
+
+        view.innerHTML = '<div class="loading-spinner"></div>';
+        actions.innerHTML = '';
+
+        try {
+            if (SIMPLE_PAGES[hash]) {
+                app.updatePageTitle(SIMPLE_PAGES[hash].title);
+                await loadSimplePage(hash, view, actions);
+                app.setConnection(true);
+                return;
+            }
+            switch (hash) {
+                case '#/dashboard':
+                    app.updatePageTitle('Status details');
+                    const health = app.state.dashboardArray?.health;
+                    if (health === 'failing' || health === 'prefail' || health === 'degraded') {
+                        actions.innerHTML = `
+                            <button class="btn btn-primary" data-tooltip="Re-read the array status after performing manual fixes via the command line" data-action="refresh">Refresh</button>
+                        `;
+                    } else if (health === 'pending') {
+                        actions.innerHTML = `
+                            <button class="btn btn-primary" data-tooltip="Re-read the array status after performing manual configuration" data-action="refresh">Refresh</button>
+                        `;
+                    } else {
+                        actions.innerHTML = `
+                            <button class="btn btn-primary" data-tooltip="Trigger full maintenance sequence and generate a report" data-action="maintenance">Maintenance</button>
+                        `;
+                    }
+                    await app.loadDashboard({ array: true, activity: true, system: true });
+                    break;
+                case '#/disks':
+                    app.updatePageTitle('Disks');
+                    actions.innerHTML = `
+                        <button class="btn btn-primary" data-tooltip="Spin up all array disks" data-action="spin-up">Up</button>
+                        <button class="btn btn-primary" data-tooltip="Spin down all array disks" data-action="spin-down">Down</button>
+                    `;
+                    await app.loadDisks();
+                    break;
+                case '#/tasks':
+                    app.updatePageTitle('Tasks');
+                    actions.innerHTML = '';
+                    await app.loadTasks();
+                    break;
+                case '#/diff':
+                    app.updatePageTitle('Differences');
+                    actions.innerHTML = `
+                        <button class="btn btn-primary" data-tooltip="Trigger a new differences check" data-action="diff">Differences</button>
+                    `;
+                    await app.loadDifferences();
+                    break;
+                case '#/recovery':
+                    app.updatePageTitle('Recovery');
+                    actions.innerHTML = '';
+                    await app.loadRecovery();
+                    break;
+                case '#/storage':
+                    app.updatePageTitle('Storage');
+                    actions.innerHTML = `
+                        <button class="btn btn-secondary" data-tooltip="Read again disks, mounts and configuration" data-st="reload">Reload</button>
+                        <button class="btn btn-primary" data-tooltip="Prepare disks, pool and SnapRAID configuration step by step" data-st="wizard">Guided setup</button>
+                    `;
+                    try {
+                        await loadStorage(view);
+                        app.setConnection(true);
+                    } catch (e) {
+                        throw e;
+                    }
+                    break;
+                case '#/arrays':
+                    app.updatePageTitle('Arrays');
+                    actions.innerHTML = '';
+                    await loadArrays(view, app.updateSwitcherNow);
+                    app.setConnection(true);
+                    break;
+                case '#/settings':
+                    app.updatePageTitle('Settings');
+                    actions.innerHTML = `
+                        <button class="btn btn-secondary" data-tooltip="Discard changes and refresh settings" data-action="recovery-cancel">Cancel</button>
+                        <button class="btn btn-primary" data-tooltip="Save configuration changes to server" data-action="settings-save">Save</button>
+                    `;
+                    await app.loadSettings();
+                    break;
+                default:
+                    view.innerHTML = '<p>Page Not Found</p>';
+            }
+        } catch (e) {
+            view.innerHTML = `<div class="card border-red"><h3 class="text-red">Error</h3><p>${escHtml(e.message)}</p></div>`;
+        }
+    },
+
+    /* --- Page Loaders --- */
+
+    loadDashboard: async (refreshFlags = { array: true, activity: true, system: true }) => {
+        try {
+            const promises = [];
+
+            if (refreshFlags.array) promises.push(API.getArray({ limit_diffs: 0, limit_fixes: 0 }));
+            else promises.push(Promise.resolve(app.state.dashboardArray));
+
+            if (refreshFlags.activity) promises.push(API.getActivity({ limit_messages: 500 }));
+            else promises.push(Promise.resolve(app.state.dashboardActivity));
+
+            if (refreshFlags.system) promises.push(API.getSystem());
+            else promises.push(Promise.resolve(app.state.system));
+
+            const [array, activity, system] = await Promise.all(promises);
+
+            // Update pulse state (use most recent)
+            if (array && array.pulse) app.state.pulse = array.pulse;
+            if (activity && activity.pulse) app.state.pulse = activity.pulse;
+
+            // Track if messages changed
+            const oldMessages = app.state.dashboardActivity?.messages || [];
+            const newMessages = activity?.messages || [];
+            const messagesChanged = oldMessages.length !== newMessages.length;
+
+            app.state.dashboardArray = array;
+            app.state.dashboardActivity = activity;
+            app.state.system = system;
+            if (refreshFlags.system) app.state.lastSystemRefresh = Date.now();
+
+            app.setConnection(true);
+
+            // Only re-render if we are still on the dashboard
+            if (app.state.currentRoute === '#/dashboard') {
+                const active = activity && activity.status !== 'terminated' && activity.status !== 'signaled' && activity.status !== 'canceled';
+                const actions = document.getElementById('header-actions');
+                const health = array?.health;
+                let actionBtn = '';
+                if (health === 'failing' || health === 'prefail' || health === 'degraded') {
+                    actionBtn = `
+                        <button class="btn btn-primary" data-tooltip="Re-read the array status after performing manual fixes via the command line" data-action="refresh">Refresh</button>
+                    `;
+                } else if (health === 'pending') {
+                    actionBtn = `
+                        <button class="btn btn-primary" data-tooltip="Re-read the array status after performing manual configuration" data-action="refresh">Refresh</button>
+                    `;
+                } else {
+                    actionBtn = `
+                        <button class="btn btn-primary" data-tooltip="Trigger full maintenance sequence and generate a report" data-action="maintenance">Maintenance</button>
+                    `;
+                }
+                actions.innerHTML = `
+                    ${active ? `<button class="btn btn-danger" data-tooltip="Stop the current running task" data-action="stop-task">Stop</button>` : ''}
+                    ${actionBtn}
+                `;
+
+                // Capture scroll state
+                const logWindowBefore = document.querySelector('.log-window');
+                let scrollPos = 0;
+                let isAtBottom = true;
+                if (logWindowBefore) {
+                    scrollPos = logWindowBefore.scrollTop;
+                    isAtBottom = (logWindowBefore.scrollHeight - logWindowBefore.scrollTop - logWindowBefore.clientHeight) < 50;
+                }
+
+                const view = document.getElementById('view-container');
+                view.innerHTML = renderDashboard(array, activity, app.state.system);
+                app.applyDynamicStyles(view);
+
+                // Draw graphs
+                app.redrawGraphs();
+
+                // Restore scroll state
+                const logWindowAfter = document.querySelector('.log-window');
+                if (logWindowAfter) {
+                    if (isAtBottom) {
+                        logWindowAfter.scrollTop = logWindowAfter.scrollHeight;
+                    } else {
+                        logWindowAfter.scrollTop = scrollPos;
+                    }
+                }
+            }
+        } catch (e) {
+            app.setConnection(false);
+            throw e;
+        }
+    },
+
+    loadDisks: async () => {
+        try {
+            const data = await API.getDisks();
+            if (data.pulse) app.state.pulse = data.pulse;
+            app.setConnection(true);
+            app.state.disks = data;
+            app.state.lastDisksRefresh = Date.now();
+            const view = document.getElementById('view-container');
+            view.innerHTML = renderDisks(data);
+            app.applyDynamicStyles(view);
+
+            // Post-render: Draw graphs
+            app.redrawGraphs();
+        } catch (e) {
+            app.setConnection(false);
+            throw e;
+        }
+    },
+
+    loadTasks: async () => {
+        try {
+            const openTaskNumbers = Array.from(document.querySelectorAll('[id^="task-details-"]:not(.hidden)'))
+                .map(el => parseInt(el.id.replace('task-details-', ''), 10));
+
+            const data = await API.getTasks({ limit_history: 2000, limit_messages: 500 });
+            if (data.pulse) app.state.pulse = data.pulse;
+            app.setConnection(true);
+
+            if (app.state.currentRoute === '#/tasks') {
+                const actions = document.getElementById('header-actions');
+                if (actions) {
+                    actions.innerHTML = data.pending?.length ? `
+                        <button class="btn btn-danger" data-tooltip="Clear all tasks in the queue" data-action="clear-queue">Clear</button>
+                    ` : '';
+                }
+            }
+
+            const view = document.getElementById('view-container');
+            view.innerHTML = renderTasks(data, app.state.hidePeriodic, openTaskNumbers);
+            app.applyDynamicStyles(view);
+        } catch (e) {
+            app.setConnection(false);
+            throw e;
+        }
+    },
+
+    loadDifferences: async () => {
+        try {
+            const array = await API.getArray({ limit_diffs: 2000, limit_fixes: 0 });
+            if (array.pulse) app.state.pulse = array.pulse;
+            app.setConnection(true);
+            const view = document.getElementById('view-container');
+            view.innerHTML = renderDifferences(array);
+            app.applyDynamicStyles(view);
+        } catch (e) {
+            app.setConnection(false);
+            throw e;
+        }
+    },
+
+    loadRecovery: async () => {
+        try {
+            const array = await API.getArray({ limit_diffs: 0, limit_fixes: 2000 });
+            if (array.pulse) app.state.pulse = array.pulse;
+            app.setConnection(true);
+            // Dynamic import to avoid circular dependency issues if any, though we can likely just use the import at top
+            // Assuming renderRecovery is exported from ui.js and we imported it.
+            // Wait, I need to update the import statement at the top of the file too.
+            // I'll assume I update the import in a separate tool call if needed or just use consistent updates.
+            // But since I can't update multiple files in one go easily without separate tool calls...
+            const view = document.getElementById('view-container');
+            view.innerHTML = renderRecovery(array);
+            app.applyDynamicStyles(view);
+        } catch (e) {
+            app.setConnection(false);
+            throw e;
+        }
+    },
+
+    loadSettings: async () => {
+        try {
+            const config = await API.getConfig();
+            if (config.pulse) app.state.pulse = config.pulse;
+            app.setConnection(true);
+            app.state.config = config;
+            const view = document.getElementById('view-container');
+            view.innerHTML = renderSettings(config);
+            app.applyDynamicStyles(view);
+        } catch (e) {
+            app.setConnection(false);
+            throw e;
+        }
+    },
+
+    /* --- Actions --- */
+
+    triggerMaintenance: async () => {
+        const res = await showConfirmDownThreshold('Start full maintenance sequence?');
+        if (res) {
+            try {
+                await API.startMaintenance({
+                    spindown_on_finish: res.action === 'spindown',
+                    ignore_thresholds: res.ignoreThresholds
+                });
+                showToast('Maintenance Triggered', 'info');
+                setTimeout(app.loadDashboard, 500);
+            } catch (e) {
+                showToast('Failed to start maintenance: ' + e.message, 'error');
+            }
+        }
+    },
+
+    triggerRefresh: async () => {
+        try {
+            await API.refreshArray();
+            showToast('Refresh Triggered', 'info');
+            setTimeout(app.loadDashboard, 500);
+        } catch (e) {
+            showToast('Refresh failed: ' + e.message, 'error');
+        }
+    },
+
+    triggerStop: async () => {
+        if (await showConfirm('Are you sure you want to STOP the running task?', 'Stop Task')) {
+            try {
+                await API.stopTask();
+                showToast('Stop Signal Sent', 'info');
+            } catch (e) {
+                showToast('Failed to stop: ' + e.message, 'error');
+            }
+        }
+    },
+
+    triggerClear: async () => {
+        if (await showConfirm('Are you sure you want to clear all tasks in the queue?', 'Clear Queue')) {
+            try {
+                const res = await API.clearQueue();
+                const countMsg = res && res.count !== undefined ? ` (${res.count} task${res.count === 1 ? '' : 's'} removed)` : '';
+                showToast('Queue Cleared' + countMsg, 'info');
+                await app.loadTasks();
+            } catch (e) {
+                showToast('Failed to clear queue: ' + e.message, 'error');
+            }
+        }
+    },
+
+    triggerDiff: async () => {
+        if (await showConfirm('Trigger a new differences check?', 'Differences')) {
+            try {
+                await API.startDiff();
+                showToast('Diff Command Triggered', 'info');
+                setTimeout(app.loadDifferences, 500);
+            } catch (e) {
+                showToast('Failed to start diff: ' + e.message, 'error');
+            }
+        }
+    },
+
+    toggleHidePeriodic: (checked) => {
+        app.state.hidePeriodic = checked;
+        app.loadTasks();
+    },
+
+    toggleHoldOff: async (checked) => {
+        try {
+            await API.setHoldOff(checked);
+            showToast(checked ? 'Maintenance Hold-Off Enabled' : 'Maintenance Hold-Off Disabled', 'info');
+        } catch (e) {
+            showToast('Failed to toggle hold-off: ' + e.message, 'error');
+            app.loadDashboard({ array: true, activity: false, system: false });
+        }
+    },
+
+    triggerHeal: async () => {
+        const res = await showConfirmDown('Start healing sequence for silent errors?', 'Heal Errors');
+        if (res) {
+            try {
+                await API.startHeal({ spindown_on_finish: res === 'spindown' });
+                showToast('Heal Command Triggered', 'info');
+            } catch (e) {
+                showToast('Failed to start heal: ' + e.message, 'error');
+            }
+        }
+    },
+
+    triggerUndeleteBatch: async () => {
+        const input = document.getElementById('undelete-patterns');
+        if (!input) return;
+
+        const filters = input.value.split(/\r?\n/).filter(line => line.length !== 0);
+        if (filters.length === 0) {
+            showToast('Please enter at least one file pattern', 'warning');
+            return;
+        }
+
+        const confirmRes = await showConfirmDown(`Recover files matching ${filters.length} patterns?`, 'Undelete Files');
+
+        if (confirmRes) {
+            try {
+                await API.undelete({ filters, spindown_on_finish: confirmRes === 'spindown' });
+                showToast(`Undelete queued for ${filters.length} patterns`, 'info');
+                input.value = ''; // Clear input on success
+            } catch (e) {
+                showToast('Failed to start undelete: ' + e.message, 'error');
+            }
+        }
+    },
+
+    triggerUndelete: async (disk, path) => {
+        // Escape literal SnapRAID wildcards
+        const escapedRootPath = (path.startsWith('/') ? path : '/' + path)
+            .replace(/[\\*?\[\]]/g, '\\$&');
+        const escapedDisk = disk ? disk.replace(/[\\*?\[\]]/g, '\\$&') : '';
+        if (await showConfirm(`Recover missing file?\n${disk}:${path}`, 'Undelete File')) {
+            try {
+                await API.undelete({ filter_disks: escapedDisk ? [escapedDisk] : [], filters: [escapedRootPath] });
+                showToast('Undelete Task Queued', 'info');
+            } catch (e) {
+                showToast('Failed to start undelete: ' + e.message, 'error');
+            }
+        }
+    },
+
+    triggerUp: async () => {
+        try {
+            await API.spinUp();
+            showToast(`Command Up sent`, 'info');
+        } catch (e) {
+            showToast('Failed to start Up command: ' + e.message, 'error');
+        }
+    },
+    
+    triggerDown: async () => {
+        try {
+            await API.spinDown();
+            showToast(`Command Down sent`, 'info');
+        } catch (e) {
+            showToast('Failed to start Down command: ' + e.message, 'error');
+        }
+    },
+
+    saveSettings: async () => {
+        try {
+            const form = document.getElementById('settings-form');
+            const formData = new FormData(form);
+            const updates = {};
+
+            const fullAccess = app.state.config?.config_full_access !== false;
+            const protectedFields = [
+                'hook_run_as_user', 'hook_script', 'hook_docker_pause',
+                'notify_run_as_user', 'notify_heartbeat', 'notify_start', 'notify_result', 'notify_result_level',
+            ];
+
+            // Manual conversion to handle types correctly
+            for (let [key, value] of formData.entries()) {
+                if (!fullAccess && protectedFields.includes(key)) continue;
+
+                // Check if it should be a number
+                if (['sync_threshold_deletes', 'sync_threshold_updates',
+                    'scrub_older_than', 'probe_interval_minutes'].includes(key)) {
+                    const parsed = Number(value);
+                    if (value.trim() === '' || !Number.isInteger(parsed)) {
+                        const displayVal = value.trim() === '' ? 'empty' : `"${value}"`;
+                        showToast(`Failed to save: Invalid value ${displayVal} for ${key}`, 'error');
+                        return;
+                    }
+                    updates[key] = parsed;
+                } else if (key === 'spindown_idle_minutes') {
+                    if (/^\s*\d+\s*(?:,\s*\d+\s*)?$/.test(value)) {
+                        if (value.includes(',')) {
+                            updates[key] = value.split(',').map(v => parseInt(v.trim(), 10)).join(', ');
+                        } else {
+                            updates[key] = parseInt(value, 10).toString();
+                        }
+                    } else {
+                        const displayVal = value.trim() === '' ? 'empty' : `"${value}"`;
+                        showToast(`Failed to save: Invalid value ${displayVal} for ${key}`, 'error');
+                        return;
+                    }
+                } else if (key === 'scrub_percentage') {
+                    const parsed = Number(value);
+                    if (value.trim() === '' || !Number.isFinite(parsed)) {
+                        const displayVal = value.trim() === '' ? 'empty' : `"${value}"`;
+                        showToast(`Failed to save: Invalid value ${displayVal} for ${key}`, 'error');
+                        return;
+                    }
+                    updates[key] = parsed;
+                } else {
+                    updates[key] = value;
+                }
+            }
+
+            // Handle unchecked booleans (FormData doesn't include them)
+            ['sync_prehash', 'sync_prevent_truncations', 'touch_zero_subseconds', 'notify_syslog_enabled', 'notify_differences', 'check_updates', 'array_parallel'].forEach(key => {
+                if (!fullAccess && protectedFields.includes(key)) return;
+                const el = form.querySelector(`[name="${key}"]`);
+                if (el) updates[key] = el.checked;
+            });
+
+            await API.updateConfig(updates);
+            showToast('Configuration Saved', 'info');
+        } catch (e) {
+            showToast('Failed to save: ' + e.message, 'error');
+        }
+    },
+
+    showSmartDetails: async (deviceNode) => {
+        // the Disks page for everyday use has not loaded them
+        if (!app.state.disks || app.state.currentRoute !== '#/disks') {
+            try { app.state.disks = await API.getDisks(); } catch (e) { showToast(e.message, 'error'); return; }
+        }
+
+        let device = null;
+        let parentDisk = null;
+        [...app.state.disks.parity_disks, ...app.state.disks.data_disks, ...app.state.disks.extra_disks].forEach(disk => {
+            disk.devices.forEach(dev => {
+                if (dev.node === deviceNode) {
+                    device = dev;
+                    parentDisk = disk;
+                }
+            });
+        });
+
+        if (!device || !device.smart) {
+            showToast('SMART data not available for this device', 'warning');
+            return;
+        }
+
+        const s = device.smart;
+        const criticalRows = [];
+        const statusRows = [];
+        const otherRows = [];
+
+        if (parentDisk && parentDisk.error_io != null) {
+            const rowClass = parentDisk.error_io > 0 ? 'text-amber' : 'text-emerald';
+            const label = parentDisk.error_io_ignored ? 'INPUT OUTPUT ERRORS (ignored)' : 'INPUT OUTPUT ERRORS';
+            criticalRows.push(`
+                <tr>
+                    <td class="font-bold text-xs">${label}</td>
+                    <td class="${rowClass} font-mono text-xs font-bold">${parentDisk.error_io}</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs font-bold uppercase">-</td>
+                </tr>
+            `);
+        }
+        if (parentDisk && parentDisk.error_data != null) {
+            const rowClass = parentDisk.error_data > 0 ? 'text-amber' : 'text-emerald';
+            const label = parentDisk.error_data_ignored ? 'SILENT ERRORS (ignored)' : 'SILENT ERRORS';
+            criticalRows.push(`
+                <tr>
+                    <td class="font-bold text-xs">${label}</td>
+                    <td class="${rowClass} font-mono text-xs font-bold">${parentDisk.error_data}</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs font-bold uppercase">-</td>
+                </tr>
+            `);
+        }
+        if (device.error_protocol != null) {
+            const rowClass = device.error_protocol > 0 ? 'text-amber' : 'text-emerald';
+            const label = device.error_protocol_ignored ? 'PROTOCOL ERRORS (ignored)' : 'PROTOCOL ERRORS';
+            criticalRows.push(`
+                <tr>
+                    <td class="font-bold text-xs">${label}</td>
+                    <td class="${rowClass} font-mono text-xs font-bold">${device.error_protocol}</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs font-bold uppercase">-</td>
+                </tr>
+            `);
+        }
+        if (device.error_medium != null) {
+            const rowClass = device.error_medium > 0 ? 'text-amber' : 'text-emerald';
+            const label = device.error_medium_ignored ? 'MEDIUM ERRORS (ignored)' : 'MEDIUM ERRORS';
+            criticalRows.push(`
+                <tr>
+                    <td class="font-bold text-xs">${label}</td>
+                    <td class="${rowClass} font-mono text-xs font-bold">${device.error_medium}</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs">-</td>
+                    <td class="${rowClass} font-mono text-xs font-bold uppercase">-</td>
+                </tr>
+            `);
+        }
+
+        // 1. Process top-level boolean flags for statusRows
+        Object.entries(s).forEach(([key, value]) => {
+            if (key === 'attributes' || typeof value !== 'boolean') return;
+            const label = escHtml(key.replace(/_/g, ' ').toUpperCase());
+            const valStr = value ? 'YES' : 'NO';
+            const valClass = value ? 'text-amber' : 'text-emerald';
+            statusRows.push(`<tr><td class="font-bold text-xs">${label}</td><td class="font-mono font-bold text-xs ${valClass}">${valStr}</td></tr>`);
+        });
+
+        if (device.failure_probability != null) {
+            otherRows.push(`
+                        <tr>
+                            <td class="font-bold text-xs">FAILURE PROBABILITY</td>
+                            <td class="font-mono text-xs">${(device.failure_probability * 100).toFixed(0)}% (in one year)</td>
+                        </tr>
+            `);
+        }
+
+        if (device.wear_level != null) {
+            otherRows.push(`
+                        <tr>
+                            <td class="font-bold text-xs">WEAR LEVEL</td>
+                            <td class="font-mono text-xs">${device.wear_level}% &uarr;</td>
+                        </tr>
+            `);
+        }
+
+        // 2. Process attributes array for criticalRows and otherRows
+        if (s.attributes) {
+            s.attributes.forEach(attr => {
+                let label = escHtml(attr.name.replace(/_/g, ' ').toUpperCase());
+                if (attr.ignored) {
+                    label += ' (ignored)';
+                }
+                if (attr.critical || attr.when_failed === 'now' || attr.when_failed === 'past') {
+                    let rowClass = 'text-emerald';
+                    if (attr.when_failed === 'now')
+                        rowClass = 'text-red';
+                    else if (attr.when_failed === 'past' || (attr.measure == 'count' && attr.raw > 0))
+                        rowClass = 'text-amber';
+                    let attrClass = rowClass;
+                    if (attr.measure == 'vendor')
+                        attrClass = 'text-muted';
+                    else
+                        attrClass += ' font-bold'
+
+                    criticalRows.push(`
+                        <tr>
+                            <td class="font-bold text-xs">${label}</td>
+                            <td class="${attrClass} font-mono text-xs">${formatAttr(attr)}</td>
+                            <td class="${rowClass} font-mono text-xs">${attr.norm != null ? attr.norm : '-'}</td>
+                            <td class="${rowClass} font-mono text-xs">${attr.worst != null ? attr.worst : '-'}</td>
+                            <td class="${rowClass} font-mono text-xs">${attr.thresh != null ? attr.thresh : '-'}</td>
+                            <td class="${rowClass} font-mono text-xs font-bold uppercase">${attr.when_failed != null ? escHtml(attr.when_failed) : '-'}</td>
+                        </tr>
+                    `);
+                } else {
+                    let valStr = formatAttr(attr);
+
+                    otherRows.push(`
+                        <tr>
+                            <td class="font-bold text-xs">${label}</td>
+                            <td class="font-mono text-xs">${valStr}</td>
+                        </tr>
+                    `);
+                }
+            });
+        }
+
+        const html = `<div>
+            ${criticalRows.length ? `
+                <h4 class="text-xs font-bold text-muted uppercase mb-1">Critical Metrics</h4>
+                <div class="overflow-x-auto mb-2">
+                    <table class="data-table v-dense">
+                        <thead>
+                            <tr>
+                                <th>Attribute</th>
+                                <th>Raw</th>
+                                <th>Norm</th>
+                                <th>Worst</th>
+                                <th>Thresh</th>
+                                <th>Failed</th>
+                            </tr>
+                        </thead>
+                        <tbody>${criticalRows.join('')}</tbody>
+                    </table>
+                </div>` : ''}
+            ${statusRows.length ? `
+                <h4 class="text-xs font-bold text-muted uppercase mb-1">SMART Health Flags</h4>
+                <table class="data-table v-dense mb-2">
+                    <tbody>${statusRows.join('')}</tbody>
+                </table>` : ''}
+            ${otherRows.length ? `
+                <h4 class="text-xs font-bold text-muted uppercase mb-1">Other Info</h4>
+                <div class="overflow-x-auto">
+                    <table class="data-table v-dense">
+                        <thead>
+                            <tr>
+                                <th>Attribute</th>
+                                <th>Value</th>
+                            </tr>
+                        </thead>
+                        <tbody>${otherRows.join('')}</tbody>
+                    </table>
+                </div>` : ''}
+        </div>`;
+
+        showModal(`SMART Details for ${deviceNode}`, html, true);
+    }
+};
+
+// Initialize
+document.addEventListener('DOMContentLoaded', app.init);

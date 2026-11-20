@@ -24,12 +24,30 @@ const { API } = await import(pathToFileURL(join(tmp, 'api.mjs')).href);
 
 const GB = 1e9;
 
-test('the two themes ship the same code', () => {
+test('the three themes ship the same code', () => {
     const names = readdirSync(join(here, '..', '..', 'commander', 'js')).sort();
-    assert.deepEqual(readdirSync(join(here, '..', '..', 'brutale', 'js')).sort(), names);
-    names.forEach(n => assert.equal(
-        readFileSync(join(here, '..', '..', 'brutale', 'js', n), 'utf8'),
-        readFileSync(join(here, '..', '..', 'commander', 'js', n), 'utf8'), n));
+    for (const theme of ['brutale', 'quiet']) {
+        assert.deepEqual(readdirSync(join(here, '..', '..', theme, 'js')).sort(), names, theme);
+        names.forEach(n => assert.equal(
+            readFileSync(join(here, '..', '..', theme, 'js', n), 'utf8'),
+            readFileSync(join(here, '..', '..', 'commander', 'js', n), 'utf8'), `${theme}/js/${n}`));
+    }
+});
+
+test('the three themes share the pages for everyday use, and Quiet the layout of Commander', () => {
+    const css = (theme, name) => readFileSync(join(here, '..', '..', theme, 'css', name), 'utf8');
+    for (const theme of ['brutale', 'quiet']) assert.equal(css(theme, 'simple.css'), css('commander', 'simple.css'), theme);
+    assert.equal(css('quiet', 'style.css'), css('commander', 'style.css'));
+});
+
+test('Quiet follows the light or dark of the computer, the others start light', () => {
+    const html = (theme) => readFileSync(join(here, '..', '..', theme, 'index.html'), 'utf8');
+    assert.match(html('quiet'), /data-theme-default="system"/);
+    assert.doesNotMatch(html('commander'), /data-theme-default/);
+    assert.doesNotMatch(html('brutale'), /data-theme-default/);
+    // every file of the theme is in the package
+    const make = readFileSync(join(here, '..', '..', 'Makefile.am'), 'utf8');
+    for (const f of ['css/quiet.css', 'css/fonts/Inter-400.woff2', 'css/fonts/OFL-Inter']) assert.match(make, new RegExp(`quiet/${f.replace(/\./g, '\\.')}`));
 });
 
 /* ------------------------------------------------------------------ */

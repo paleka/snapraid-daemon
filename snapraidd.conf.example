@@ -242,7 +242,7 @@ net_storage_admin = 0
 #
 # ZIP Filename:
 # If the value is a simple filename ending in .zip with no path
-# components (e.g., commander.zip or brutale.zip), the daemon searches for the file
+# components (e.g., quiet.zip, commander.zip or brutale.zip), the daemon searches for the file
 # in the installation data directories. It first checks the configured
 # installation prefix at $PREFIX/share/snapraidd/, followed by the
 # system-wide directory at /usr/share/snapraidd/.
@@ -279,10 +279,11 @@ net_storage_admin = 0
 # It requires a manual edit and a configuration reload (SIGHUP) to apply.
 #
 # Available options:
-#   - commander.zip (Default dashboard)
+#   - quiet.zip (Default dashboard: calm tiles, light and dark following the computer)
+#   - commander.zip (The original dashboard)
 #   - brutale.zip (Alternative high-contrast Neo-Brutalist dashboard)
 #
-net_web_root = commander.zip
+net_web_root = quiet.zip
 
 # The net_auth_credential specifies the credentials required to access the
 # REST API and dashboard via HTTP Basic Authentication.

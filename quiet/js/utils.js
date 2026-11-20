@@ -1,0 +1,441 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Andrea Mazzoleni
+
+export const escHtml = (str) => {
+    if (str == null) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+};
+
+export const escAttr = (str) => {
+    if (str == null) return '';
+    return escHtml(str).replace(/\r/g, '&#13;');
+};
+
+export const formatFullTime = (isoString, referenceIsoString) => {
+    if (!isoString || !referenceIsoString)
+        return '-';
+
+    const date = new Date(isoString);
+    const now = new Date(referenceIsoString);
+
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+
+    const taskDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+
+    let datePart;
+    if (taskDate.getTime() === today.getTime()) {
+        datePart = 'Today at';
+    } else if (taskDate.getTime() === yesterday.getTime()) {
+        datePart = 'Yesterday at';
+    } else {
+        const day = String(date.getDate()).padStart(2, '0');
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        const month = months[date.getMonth()];
+        const year = date.getFullYear();
+        datePart = `${day} ${month} ${year} -`;
+    }
+
+    const hours = String(date.getHours()).padStart(2, '0');
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    const seconds = String(date.getSeconds()).padStart(2, '0');
+    return `${datePart} ${hours}:${minutes}:${seconds}`;
+};
+
+export const formatRelativeTime = (isoString, referenceIsoString) => {
+    if (!isoString || !referenceIsoString)
+        return 'unknown';
+
+    const date = new Date(isoString);
+    const reference = new Date(referenceIsoString);
+    const diffSeconds = Math.floor((reference - date) / 1000);
+
+    if (diffSeconds < 60) return 'now';
+    if (diffSeconds < 3600) return `${Math.floor(diffSeconds / 60)}m ago`;
+    if (diffSeconds < 86400) return `${Math.floor(diffSeconds / 3600)}h ago`;
+    return `${Math.floor(diffSeconds / 86400)}d ago`;
+};
+
+export const formatElapsedTime = (seconds) => {
+    if (seconds < 60) return 'now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hours`;
+    if (seconds < 86400 * 30) return `${Math.floor(seconds / 86400)} days`;
+    if (seconds < 86400 * 365) return `${Math.floor(seconds / (86400 * 30))} months`;
+    return `${(seconds / (86400 * 365)).toFixed(1)} years`;
+};
+
+const formatWithSigFigs = (val, reference_val) => {
+    if (reference_val >= 100) return val.toFixed(0);
+    if (reference_val >= 10) return val.toFixed(1);
+    return val.toFixed(2);
+};
+
+export const formatMemorySize = (bytes, reference_bytes = bytes) => {
+    if (bytes === 0) return '0 bytes';
+    if (bytes === 1) return '1 byte';
+
+    const units = [' bytes', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+    const k = 1024;
+
+    let i = Math.min(
+        Math.floor(Math.log(Math.abs(reference_bytes)) / Math.log(k)),
+        units.length - 1
+    );
+
+    let reference_value = reference_bytes / Math.pow(k, i);
+    let value = bytes / Math.pow(k, i);
+
+    return `${formatWithSigFigs(value, reference_value)} ${units[i]}`;
+};
+
+export const formatDiskSize = (bytes, reference_bytes = bytes) => {
+    if (bytes === 0) return '0 bytes';
+    if (bytes === 1) return '1 byte';
+
+    const units = [' bytes', 'kB', 'MB', 'GB', 'TB', 'PB'];
+    const k = 1000;
+
+    let i = Math.min(
+        Math.floor(Math.log(Math.abs(reference_bytes)) / Math.log(k)),
+        units.length - 1
+    );
+
+    let refecence_value = reference_bytes / Math.pow(k, i);
+    let value = bytes / Math.pow(k, i);
+
+    // toPrecision(3) can round up to the next unit (e.g. 999.99 → 1000)
+    if (parseFloat(refecence_value.toPrecision(3)) >= k && i < units.length - 1) {
+        i += 1;
+        value /= k;
+        refecence_value /= k;
+    }
+
+    return `${formatWithSigFigs(value, refecence_value)} ${units[i]}`;
+};
+
+export const formatAgoMins = (mins) => {
+    const seconds = mins * 60;
+    if (seconds < 60) return 'now';
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+    return `${Math.floor(seconds / 86400)} days ago`;
+};
+
+export const formatAgoDays = (days) => {
+    if (days < 7)
+        return "past week";
+    return `${Math.floor(days)} days ago`;
+};
+
+export const formatDuration = (start, end) => {
+    if (!start || !end) return '-';
+    const diff = Math.floor((new Date(end) - new Date(start)) / 1000);
+    return formatSeconds(diff);
+};
+
+export const formatSeconds = (seconds) => {
+    if (!seconds && seconds !== 0) return '-';
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+
+    if (d > 0) return `${d}d ${h}h ${m}m`;
+    return `${h}h ${m}m`;
+};
+
+export const formatSignal = (sig) => {
+    const signals = {
+        1: 'SIGHUP',
+        2: 'SIGINT',
+        3: 'SIGQUIT',
+        4: 'SIGILL',
+        5: 'SIGTRAP',
+        6: 'SIGABRT',
+        7: 'SIGBUS',
+        8: 'SIGFPE',
+        9: 'SIGKILL',
+        11: 'SIGSEGV',
+        13: 'SIGPIPE',
+        14: 'SIGALRM',
+        15: 'SIGTERM'
+    };
+    return signals[sig] || sig;
+};
+
+export const formatHistory = (value, history, pulseAt) => {
+    let label = '';
+    if (history?.prev !== undefined && history?.prev !== null && history?.prev_at) {
+        if (history.prev < value) {
+            label += ` (+${value - history.prev}, ${formatRelativeTime(history.prev_at, pulseAt)})`;
+        } else if (history.prev > value) {
+            label += ` (-${history.prev - value}, ${formatRelativeTime(history.prev_at, pulseAt)})`;
+        }
+    }
+    return label;
+}
+
+export const formatAttr = (attr) => {
+    let raw = escHtml(attr.raw);
+    let valStr = raw;
+    if (attr.measure == 'time') {
+        if (attr.unit == 0.001) {
+            if (attr.avg)
+                valStr = `${raw} ms (avg ${escHtml(attr.avg)})`;
+            else
+                valStr = `${raw} ms`;
+        } else {
+            const seconds = attr.raw * attr.unit;
+            if (seconds < 60) {
+                valStr = `${raw} (${seconds} seconds)`;
+            } else {
+                valStr = `${raw} (${formatElapsedTime(seconds)})`;
+            }
+        }
+    }
+    if (attr.measure == 'size') {
+        const bytes = attr.raw * attr.unit;
+        valStr = `${raw} (${formatDiskSize(bytes)})`;
+    }
+    if (attr.measure == 'temperature') {
+        valStr = `${raw} °C`;
+        if (attr.min != null && attr.max != null) {
+            valStr += ` (min ${escHtml(attr.min)}, max ${escHtml(attr.max)})`;
+        }
+    }
+    if (attr.measure == 'count') {
+        valStr = `${raw}`;
+    }
+    if (attr.measure == 'use_ratio') {
+        valStr = `${raw}% &uarr;`;
+    }
+    if (attr.measure == 'life_ratio') {
+        valStr = `${raw}% &darr;`;
+    }
+    if (attr.measure == 'vendor') {
+        valStr = `(${raw})`;
+    }
+    return valStr;
+};
+
+// SVG Icons (Strings)
+export const Icons = {
+    home: `<svg viewBox="0 0 24 24"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>`,
+    folder: `<svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>`,
+    share: `<svg viewBox="0 0 24 24"><path d="M16 11c1.66 0 3-1.34 3-3s-1.34-3-3-3-3 1.34-3 3 1.34 3 3 3zm-8 0c1.66 0 3-1.34 3-3S9.66 5 8 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5C15 14.17 10.33 13 8 13zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/></svg>`,
+    backup: `<svg viewBox="0 0 24 24"><path d="M19.35 10.04A7.49 7.49 0 0 0 12 4C9.11 4 6.6 5.64 5.35 8.04A5.99 5.99 0 0 0 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z"/></svg>`,
+    bell: `<svg viewBox="0 0 24 24"><path d="M12 22c1.1 0 2-.9 2-2h-4a2 2 0 0 0 2 2zm6-6v-5c0-3.07-1.64-5.64-4.5-6.32V4a1.5 1.5 0 0 0-3 0v.68C7.63 5.36 6 7.92 6 11v5l-2 2v1h16v-1l-2-2z"/></svg>`,
+    help: `<svg viewBox="0 0 24 24"><path d="M11 18h2v-2h-2v2zm1-16C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm0-14c-2.21 0-4 1.79-4 4h2c0-1.1.9-2 2-2s2 .9 2 2c0 2-3 1.75-3 5h2c0-2.25 3-2.5 3-5 0-2.21-1.79-4-4-4z"/></svg>`,
+    tools: `<svg viewBox="0 0 24 24"><path d="M22.7 19 13.6 9.9c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/></svg>`,
+    logo: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
+    dashboard: `<svg viewBox="0 0 24 24"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>`,
+    harddrive: `<svg viewBox="0 0 24 24"><path d="M6 2h12c1.1 0 2 .9 2 2v16c0 1.1-.9 2-2 2H6c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2zm0 2v16h12V4H6zm2 4h8v2H8V8zm0 4h8v2H8v-2z"/></svg>`,
+    arrays: `<svg viewBox="0 0 24 24"><path d="M3 4h8v7H3V4zm2 2v3h4V6H5zm8-2h8v7h-8V4zm2 2v3h4V6h-4zM3 13h8v7H3v-7zm2 2v3h4v-3H5zm8-2h8v7h-8v-7zm2 2v3h4v-3h-4z"/></svg>`,
+    storage: `<svg viewBox="0 0 24 24"><path d="M12 2 2 7l10 5 10-5-10-5zm-7.8 9.1L2 12.2l10 5 10-5-2.2-1.1L12 15l-7.8-3.9zm0 5L2 17.2l10 5 10-5-2.2-1.1L12 20l-7.8-3.9z"/></svg>`,
+    activity: `<svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2zm0 18a8 8 0 1 1 8-8 8 8 0 0 1-8 8zM11 7h2v7h-2zm0 9h2v2h-2z"/></svg>`,
+    settings: `<svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.488.488 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>`,
+    menu: `<svg viewBox="0 0 24 24"><path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/></svg>`,
+    play: `<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>`,
+    stop: `<svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>`,
+    refresh: `<svg viewBox="0 0 24 24"><path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>`,
+    check: `<svg viewBox="0 0 24 24"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>`,
+    alert: `<svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>`,
+    shield: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>`,
+    trash: `<svg viewBox="0 0 24 24" stroke="currentColor" fill="none" stroke-width="2"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>`,
+    arrowRight: `<svg viewBox="0 0 24 24"><path d="M12 4l-1.41 1.41L16.17 11H4v2h12.17l-5.58 5.59L12 20l8-8z"/></svg>`,
+    moon: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>`,
+    sun: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>`
+};
+
+export const showToast = (message, type = 'info') => {
+    const container = document.getElementById('toast-container');
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+
+    let icon = Icons.activity;
+    if (type === 'error' || type === 'warning') icon = Icons.alert;
+    if (type === 'success' || type === 'info') icon = Icons.check;
+
+    toast.innerHTML = `
+        <div class="flex items-center gap-2">
+            <span class="toast-icon">${icon}</span>
+            <div>
+                <span class="font-bold">${type.toUpperCase()}:</span> ${escHtml(message)}
+            </div>
+        </div>
+    `;
+    container.appendChild(toast);
+    setTimeout(() => toast.remove(), 5000);
+};
+
+export const showConfirm = (message, title = 'Confirmation Required') => {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal-container">
+                <div class="modal-title">${escHtml(title)}</div>
+                <div class="modal-body">${escHtml(message)}</div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+                    <button class="btn btn-primary" id="modal-confirm">Confirm</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        // Force reflow for animation
+        overlay.offsetHeight;
+        overlay.classList.add('active');
+
+        const cleanup = (result) => {
+            overlay.classList.remove('active');
+            setTimeout(() => {
+                overlay.remove();
+                resolve(result);
+            }, 200);
+        };
+
+        overlay.querySelector('#modal-cancel').addEventListener('click', () => cleanup(false));
+        overlay.querySelector('#modal-confirm').addEventListener('click', () => cleanup(true));
+
+        // Close on overlay click
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) cleanup(false);
+        });
+    });
+};
+
+export const showConfirmDown = (message, title = 'Confirmation Required') => {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal-container">
+                <div class="modal-title">${escHtml(title)}</div>
+                <div class="modal-body">${escHtml(message)}</div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+                    <button class="btn btn-primary" id="modal-confirm">Run</button>
+                    <button class="btn btn-primary" id="modal-spindown">Run & SpinDown</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        // Force reflow for animation
+        overlay.offsetHeight;
+        overlay.classList.add('active');
+
+        const cleanup = (result) => {
+            overlay.classList.remove('active');
+            setTimeout(() => {
+                overlay.remove();
+                resolve(result);
+            }, 200);
+        };
+
+        overlay.querySelector('#modal-cancel').addEventListener('click', () => cleanup(null));
+        overlay.querySelector('#modal-confirm').addEventListener('click', () => cleanup('confirm'));
+        overlay.querySelector('#modal-spindown').addEventListener('click', () => cleanup('spindown'));
+
+        // Close on overlay click
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) cleanup(null);
+        });
+    });
+};
+
+export const showConfirmDownThreshold = (message, title = 'Confirmation Required') => {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal-container">
+                <div class="modal-title">${escHtml(title)}</div>
+                <div class="modal-body">
+                    ${escHtml(message)}
+                    <div class="mt-4 flex items-center gap-2">
+                        <label class="switch switch-sm">
+                            <input type="checkbox" id="modal-ignore-thresholds">
+                            <span class="slider"></span>
+                        </label>
+                        <label for="modal-ignore-thresholds" class="text-sm cursor-pointer mb-0">Ignore Update/Delete Thresholds</label>
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+                    <button class="btn btn-primary" id="modal-confirm">Run</button>
+                    <button class="btn btn-primary" id="modal-spindown">Run & SpinDown</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+
+        // Force reflow for animation
+        overlay.offsetHeight;
+        overlay.classList.add('active');
+
+        const cleanup = (result) => {
+            const ignoreThresholds = overlay.querySelector('#modal-ignore-thresholds').checked;
+            overlay.classList.remove('active');
+            setTimeout(() => {
+                overlay.remove();
+                if (result === null) resolve(null);
+                else resolve({ action: result, ignoreThresholds });
+            }, 200);
+        };
+
+        overlay.querySelector('#modal-cancel').addEventListener('click', () => cleanup(null));
+        overlay.querySelector('#modal-confirm').addEventListener('click', () => cleanup('confirm'));
+        overlay.querySelector('#modal-spindown').addEventListener('click', () => cleanup('spindown'));
+
+        // Close on overlay click
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) cleanup(null);
+        });
+    });
+};
+
+export const showModal = (title, content, large = false) => {
+    return new Promise((resolve) => {
+        const overlay = document.createElement('div');
+        overlay.className = 'modal-overlay';
+        overlay.innerHTML = `
+            <div class="modal-container ${large ? 'large' : ''}">
+                <div class="modal-title">${escHtml(title)}</div>
+                <div class="modal-body">${content}</div>
+                <div class="modal-actions">
+                    <button class="btn btn-secondary" id="modal-close">Close</button>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(overlay);
+        overlay.offsetHeight;
+        overlay.classList.add('active');
+
+        const cleanup = () => {
+            overlay.classList.remove('active');
+            setTimeout(() => {
+                overlay.remove();
+                resolve();
+            }, 200);
+        };
+
+        overlay.querySelector('#modal-close').addEventListener('click', cleanup);
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) cleanup();
+        });
+    });
+};
+

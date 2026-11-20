@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2025 Andrea Mazzoleni
+
+// The array the pages work on. The default one keeps the addresses it always had.
+export const ARRAY_DEFAULT = 'default';
+let currentArray = ARRAY_DEFAULT;
+try {
+    const saved = localStorage.getItem('array');
+    if (saved && /^[a-z0-9][a-z0-9_-]{0,30}$/.test(saved)) currentArray = saved;
+} catch (ignore) { /* no storage */ }
+
+async function request(endpoint, options = {}) {
+    const version = options.version || 'v1';
+    // what is of the machine, and not of an array, has only one address
+    const global = options.global || currentArray === ARRAY_DEFAULT;
+    const baseUrl = global ? `/snapraid/${version}` : `/snapraid/v1/arrays/${currentArray}`;
+    const cleanOptions = { ...options };
+    delete cleanOptions.version;
+    delete cleanOptions.global;
+    try {
+        const response = await fetch(`${baseUrl}${endpoint}`, {
+            headers: { 'Content-Type': 'application/json', 'X-Pinggy-No-Screen': 'true' },
+            ...cleanOptions
+        });
+
+        if (response.status === 204)
+            return null; // No Content
+
+        if (!response.ok) {
+            const errorText = await response.text();
+            let errorMessage = `API Error ${response.status}: ${errorText}`;
+            try {
+                const errorJson = JSON.parse(errorText);
+                if (errorJson && errorJson.message) {
+                    errorMessage = errorJson.message;
+                }
+            } catch (ignore) { }
+            throw new Error(errorMessage);
+        }
+
+        const contentType = response.headers.get("content-type");
+        if (contentType && contentType.indexOf("application/json") !== -1) {
+            return await response.json();
+        }
+        return await response.text();
+    } catch (error) {
+        console.error('Request failed:', error);
+        throw error;
+    }
+}
+
+export const API = {
+    getArray: (params = {}) => {
+        const query = new URLSearchParams(params).toString();
+        return request(`/array${query ? `?${query}` : ''}`);
+    },
+    getState: () => request('/state'),
+    getDisks: () => request('/disks', { version: 'v2' }),
+    getActivity: (params = {}) => {
+        const query = new URLSearchParams(params).toString();
+        return request(`/activity${query ? `?${query}` : ''}`);
+    },
+    getTasks: (params = {}) => {
+        const query = new URLSearchParams(params).toString();
+        return request(`/tasks${query ? `?${query}` : ''}`);
+    },
+    getConfig: () => request('/config', { version: 'v2' }),
+    getSystem: () => request('/system', { global: true }),
+
+    // Arrays
+    array: () => currentArray,
+    setArray: (name) => {
+        currentArray = name || ARRAY_DEFAULT;
+        try { localStorage.setItem('array', currentArray); } catch (ignore) { /* no storage */ }
+    },
+    /** Address of the endpoints of the selected array. */
+    base: () => (currentArray === ARRAY_DEFAULT ? '/snapraid/v1' : `/snapraid/v1/arrays/${currentArray}`),
+    getArrays: () => request('/arrays', { global: true }),
+    createArray: (name, engineConf) => request('/arrays', { method: 'POST', global: true, body: JSON.stringify(engineConf ? { name, engine_conf: engineConf } : { name }) }),
+    removeArray: (name) => request(`/arrays/${name}`, { method: 'DELETE', global: true, body: '{}' }),
+    getInventory: () => request('/storage', { global: true }),
+    updateConfig: (config) => request('/config', { method: 'PATCH', body: JSON.stringify(config), version: 'v2' }),
+
+    schedule: (tasks) => request('/schedule', { method: 'POST', body: JSON.stringify({ tasks }) }),
+
+    // Commands
+    startMaintenance: (options = {}) => request('/maintenance', { method: 'POST', body: JSON.stringify(options) }),
+    startProbe: () => API.schedule([{ command: 'probe' }]),
+    startHeal: (options = {}) => request('/heal', { method: 'POST', body: JSON.stringify(options) }),
+    startDiff: () => API.schedule([{ command: 'diff' }]),
+    spinUp: () => API.schedule([{ command: 'up' }]),
+    spinDown: () => API.schedule([{ command: 'down' }]),
+    spinDownIdle: () => request('/suspend_idle', { method: 'POST', body: JSON.stringify({}) }),
+    undelete: (options = {}) => request('/undelete', { method: 'POST', body: JSON.stringify(options) }),
+    stopTask: () => request('/stop', { method: 'POST', body: JSON.stringify({}) }),
+    clearQueue: () => request('/clear', { method: 'POST', body: JSON.stringify({}) }),
+    refreshArray: () => request('/refresh', { method: 'POST', body: JSON.stringify({}) }),
+    setHoldOff: (enabled) => request('/hold_off', { method: 'POST', body: JSON.stringify({ enabled }) })
+};

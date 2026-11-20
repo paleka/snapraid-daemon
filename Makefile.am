@@ -58,7 +58,21 @@ BRUTALE_DIST = \
 	css/fonts/JetBrainsMono-Bold.woff2 \
 	css/fonts/OFL
 
-data_DATA = commander.zip brutale.zip
+QUIET_DIST = \
+	$(COMMANDER_DIST) \
+	css/quiet.css \
+	css/fonts/Inter-400.woff2 \
+	css/fonts/Inter-500.woff2 \
+	css/fonts/Inter-600.woff2 \
+	css/fonts/Inter-700.woff2 \
+	css/fonts/JetBrainsMono-Regular.woff2 \
+	css/fonts/OFL-Inter \
+	css/fonts/OFL-JetBrainsMono
+
+data_DATA = quiet.zip commander.zip brutale.zip
+
+quiet.zip: $(patsubst %, $(srcdir)/quiet/%, $(QUIET_DIST))
+	cd $(srcdir)/quiet && $(ZIP) -0 -r -q $(abs_builddir)/quiet.zip $(QUIET_DIST)
 
 commander.zip: $(patsubst %, $(srcdir)/commander/%, $(COMMANDER_DIST))
 	cd $(srcdir)/commander && $(ZIP) -0 -r -q $(abs_builddir)/commander.zip $(COMMANDER_DIST)
@@ -227,6 +241,33 @@ EXTRA_DIST = \
 	snapraidd.service.in \
 	rc.snapraidd.in \
 	snapraidd.conf.example \
+	quiet/index.html \
+	quiet/site.webmanifest \
+	quiet/image/favicon-16x16.png \
+	quiet/image/android-chrome-512x512.png \
+	quiet/image/apple-touch-icon.png \
+	quiet/image/android-chrome-192x192.png \
+	quiet/image/favicon-32x32.png \
+	quiet/favicon.ico \
+	quiet/css/style.css \
+	quiet/css/simple.css \
+	quiet/css/quiet.css \
+	quiet/css/fonts/Inter-400.woff2 \
+	quiet/css/fonts/Inter-500.woff2 \
+	quiet/css/fonts/Inter-600.woff2 \
+	quiet/css/fonts/Inter-700.woff2 \
+	quiet/css/fonts/JetBrainsMono-Regular.woff2 \
+	quiet/css/fonts/OFL-Inter \
+	quiet/css/fonts/OFL-JetBrainsMono \
+	quiet/js/init.js \
+	quiet/js/ui.js \
+	quiet/js/api.js \
+	quiet/js/storage.js \
+	quiet/js/simple.js \
+	quiet/js/plain.js \
+	quiet/js/arrays.js \
+	quiet/js/app.js \
+	quiet/js/utils.js \
 	commander/index.html \
 	commander/site.webmanifest \
 	commander/image/favicon-16x16.png \
@@ -282,7 +323,7 @@ distuninstallcheck_listfiles = \
 
 clean-local:
 	rm -f valgrind.log callgrind.log cachegrind.log
-	rm -f commander.zip brutale.zip
+	rm -f quiet.zip commander.zip brutale.zip
 	rm -f makeslackware.sh makeslackdist.sh pkg/snapraid-daemon.SlackBuild pkg/snapraid-daemon.info makedeb.sh pkg/control makerpm.sh pkg/spec
 	rm -fr *.plist
 

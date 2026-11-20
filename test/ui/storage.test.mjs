@@ -22,10 +22,10 @@ for (const name of ['storage', 'api', 'utils']) {
 const { __test: T } = await import(pathToFileURL(join(tmp, 'storage.mjs')).href);
 
 // the two themes ship the same code
-test('brutale has the same storage.js of commander', () => {
+test('brutale and quiet have the same storage.js of commander', () => {
     const a = readFileSync(join(here, '..', '..', 'commander', 'js', 'storage.js'), 'utf8');
-    const b = readFileSync(join(here, '..', '..', 'brutale', 'js', 'storage.js'), 'utf8');
-    assert.equal(a, b);
+    for (const theme of ['brutale', 'quiet'])
+        assert.equal(readFileSync(join(here, '..', '..', theme, 'js', 'storage.js'), 'utf8'), a, theme);
 });
 
 /* ------------------------------------------------------------------ */

@@ -33,8 +33,18 @@ const app = {
 
     init: () => {
         // Theme Init
-        const savedTheme = localStorage.getItem('theme') || 'light';
+        const savedTheme = localStorage.getItem('theme') || document.documentElement.dataset.theme || 'light';
         document.documentElement.dataset.theme = savedTheme;
+        // following the computer: its change is followed too, until a choice is made here
+        if (document.documentElement.dataset.themeDefault === 'system' && window.matchMedia) {
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+                if (localStorage.getItem('theme')) return;
+                document.documentElement.dataset.theme = e.matches ? 'dark' : 'light';
+                const iconEl = document.querySelector('#icon-theme');
+                if (iconEl) iconEl.innerHTML = e.matches ? Icons.sun : Icons.moon;
+                app.redrawGraphs();
+            });
+        }
 
         // Render Icons
         document.querySelectorAll('[data-icon]').forEach(el => {
