@@ -22,6 +22,10 @@ Recommends:     util-linux
 Recommends:     e2fsprogs
 Recommends:     xfsprogs
 Recommends:     btrfs-progs
+Recommends:     hdparm
+Recommends:     ethtool
+Suggests:       samba
+Suggests:       nfs-utils
 Recommends:     rsync
 Recommends:     smartmontools
 Recommends:     curl

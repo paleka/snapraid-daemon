@@ -215,6 +215,10 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
   pool, the sync that forgets it, and out of the configuration, in one
   window.
 
+* The installer adds Samba and the NFS server on a machine new to SnapRAID
+  (SNAPRAIDD_SHARES=0 leaves them out, =1 adds them to an existing setup),
+  and the package recommends hdparm and ethtool, used by the power settings.
+
 * The Protection page reads the temperature limit of an existing SnapRAID
   configuration, and replaces its line in place of adding a second one.
 

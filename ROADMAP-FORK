@@ -85,8 +85,6 @@ Features
     - The time window of the maintenance tried end to end in the lab: the
       emulated disks are too fast for a sync still running at a set time.
     - The idle action tried on a real machine: the lab only logs it.
-    - The installer adding samba, nfs-kernel-server, hdparm and ethtool is on
-      the branch installer-tools, to be reviewed.
 
 13. More arrays, what is left
     - Windows: built from the same sources, but not compiled nor tried.

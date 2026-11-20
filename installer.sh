@@ -33,6 +33,10 @@
 #                           the latest.
 #   SNAPRAIDD_DEB=file      Install this daemon package instead of downloading it.
 #   SNAPRAID_DEB=file       Install this engine package instead of downloading it.
+#   SNAPRAIDD_SHARES=1      Install the servers the Sharing page works with,
+#                           Samba and NFS. This is the default on a machine
+#                           new to SnapRAID; 0 leaves them out. Nothing is
+#                           shared until a share is added in the web UI.
 #   SNAPRAIDD_AUTO=1        With an array already in use, let the daemon take the
 #                           maintenance over right away: sync and scrub every
 #                           night at 02:00, idle disks spun down.
@@ -273,6 +277,29 @@ apt-get update -q
 # shellcheck disable=SC2086
 apt-get install -y -q -o Dpkg::Options::=--force-confold $ENGINE "$DAEMON"
 
+# The servers behind the Sharing page. They listen on the network as soon
+# as installed, so they are added by default only to a machine that is new
+# to SnapRAID and to this daemon: an existing setup is left as it is, unless
+# asked. Not having them is not an error: the Sharing page says what to do.
+SHARES="${SNAPRAIDD_SHARES:-}"
+if [ -z "$SHARES" ]; then
+	if [ "$NEW" = "1" ] && [ -z "$CONTENT" ]; then SHARES=1; else SHARES=0; fi
+fi
+SHARES_DONE=0
+if [ "$SHARES" = "1" ]; then
+	if command -v smbd >/dev/null 2>&1 && command -v exportfs >/dev/null 2>&1; then
+		SHARES_DONE=2
+	else
+		say "Installing Samba and NFS, for the Sharing page"
+		if apt-get install -y -q -o Dpkg::Options::=--force-confold samba nfs-kernel-server; then
+			SHARES_DONE=1
+		else
+			say "warning: Samba and NFS could not be installed. Everything else works; to try again:"
+			say "  apt-get install samba nfs-kernel-server"
+		fi
+	fi
+fi
+
 USER_NAME="${SNAPRAIDD_USER:-admin}"
 PASSWORD=""
 OPENED=0
@@ -356,6 +383,16 @@ elif [ "$NEW" = "1" ]; then
 	say "net_auth_credential and net_storage_admin in $CONF."
 else
 	say "The existing configuration in $CONF was kept."
+fi
+
+if [ "$SHARES_DONE" = "1" ]; then
+	say ""
+	say "Samba and NFS were installed for the Sharing page. No folder is shared and no"
+	say "user can log in until you add a share and a user in the web UI."
+elif [ "$SHARES_DONE" = "0" ] && ! command -v smbd >/dev/null 2>&1; then
+	say ""
+	say "Samba is not installed, so the Sharing page cannot share folders yet. To add it:"
+	say "  apt-get install samba nfs-kernel-server"
 fi
 
 if [ "$NEW" = "1" ] && [ -n "$CONTENT" ]; then
