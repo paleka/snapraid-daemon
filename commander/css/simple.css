@@ -587,3 +587,8 @@ a.sp-file-name { font-weight: 600; }
 }
 /* tracks seen in every theme, also where the theme has no color for them */
 .sp-meter, .sp-night-none, .sp-runbar { background: color-mix(in srgb, var(--text-secondary) 14%, transparent); }
+
+/* the menu scrolls by itself when it is taller than the window (the page itself never scrolls) */
+.sidebar { overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.sidebar > * { flex-shrink: 0; }
+.sidebar .nav-links { flex: 1 0 auto; }
