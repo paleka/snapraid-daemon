@@ -337,3 +337,25 @@ a.sp-file-name { font-weight: 600; }
     .sp-hero-busy .sp-hero-icon svg, .sp-bay-h-bad { animation: none; }
 }
 .sp-danger-text { color: var(--sp-bad); }
+
+/* advanced mode: the finer controls stay out of sight until asked for */
+.sp-adv-off .sp-adv-only { display: none !important; }
+.sp-adv-switch {
+    display: inline-flex; align-items: center; gap: 0.5rem;
+    padding: 0.3rem 0.75rem 0.3rem 0.4rem; border-radius: 999px;
+    border: 1px solid var(--sp-tip); background: transparent; color: var(--text-secondary, inherit);
+    font: inherit; font-size: 0.85rem; font-weight: 600; cursor: pointer;
+}
+.sp-adv-knob { width: 1.7rem; height: 0.95rem; border-radius: 999px; background: var(--sp-tip-bg); border: 1px solid var(--sp-tip); position: relative; flex: none; }
+.sp-adv-knob::after { content: ""; position: absolute; top: 1px; left: 1px; width: 0.7rem; height: 0.7rem; border-radius: 50%; background: var(--sp-tip); transition: transform 0.15s; }
+.sp-adv-switch.on { border-color: var(--sp-busy); color: var(--sp-busy); background: var(--sp-busy-bg); }
+.sp-adv-switch.on .sp-adv-knob { border-color: var(--sp-busy); }
+.sp-adv-switch.on .sp-adv-knob::after { background: var(--sp-busy); transform: translateX(0.72rem); }
+.sp-adv-note { margin-top: 0.9rem; padding: 0.55rem 0.8rem; border-left: 3px solid var(--sp-busy); background: var(--sp-busy-bg); font-size: 0.85rem; border-radius: 0 6px 6px 0; }
+.sp-section-extra { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+
+/* the tour of the first visit */
+.sp-tour-text { font-size: 1.02rem; line-height: 1.6; min-height: 6.5rem; }
+.sp-tour-dots { display: flex; gap: 0.4rem; justify-content: center; margin-top: 1rem; }
+.sp-tour-dot { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--sp-tip-bg); border: 1px solid var(--sp-tip); }
+.sp-tour-dot.on { background: var(--sp-busy); border-color: var(--sp-busy); }

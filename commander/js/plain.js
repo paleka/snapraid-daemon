@@ -56,7 +56,9 @@ export const GLOSSARY = {
     array: 'The group of disks protected together: data disks and protection disks.',
     smart: 'Self-diagnosis built into every disk. It warns about wear and errors before a disk fails.',
     share: 'A folder that the other computers of your network can open.',
-    'recycle bin': 'Files deleted from a share over the network go here first, and are really deleted after some days.'
+    'recycle bin': 'Files deleted from a share over the network go here first, and are really deleted after some days.',
+    'fast disk': 'An SSD placed in front of the big disks. New files are written to it first, then moved to the big disks at night. Also called cache.',
+    mover: 'The nightly work that moves the files from the fast disk to the disks of the array, where the protection covers them.'
 };
 
 /* ------------------------------------------------------------------ */
@@ -157,10 +159,10 @@ const PLAIN_ERRORS = [
     [/There are soft errors/, 'Some files changed after the last update of the protection: that is not damage.'],
     [/Too many files were removed \((\d+), limit is (\d+)\)/, 'Stopped by the safety check: $1 files were deleted, more than $2. It waits for your OK on the Protection page.'],
     [/Too many files were updated \((\d+), limit is (\d+)\)/, 'Stopped by the safety check: $1 files were changed, more than $2. It waits for your OK on the Protection page.'],
-    [/--force-empty/, 'A data disk looks empty: it may not be mounted. Nothing was changed.'],
+    [/--force-empty/, 'A data disk looks empty: it may not be mounted. Nothing was changed. If you emptied it on purpose, say so on the Disks page: turn on Advanced, then “Empty it…”.'],
     [/The preceding sync operation failed/, 'Skipped, because the update of the protection before it did not finish.'],
     [/Insufficient parity space|Failed to allocate all the required parity space/, 'The protection disk is full: a data disk holds more than it can protect.'],
-    [/are now missing or have been rewritten/, 'A data disk looks empty: it may not be mounted. Nothing was changed.'],
+    [/are now missing or have been rewritten/, 'A data disk looks empty: it may not be mounted. Nothing was changed. If you emptied it on purpose, say so on the Disks page: turn on Advanced, then “Empty it…”.'],
     [/Unrecoverable errors detected/, 'Some files could not be rebuilt: they had changed after the last update of the protection, which keeps only the state of that moment.']
 ];
 
@@ -311,6 +313,9 @@ export const machineFindings = ({ host, config, disks, nowIso }) => {
         }
     }
 
+    for (const f of cacheFindings(host))
+        out.push(f);
+
     if (config && !config.notify_result)
         add('warn', 'Nobody is told when something goes wrong', 'Problems are only shown here. Get a message on your phone or by email instead.', { label: 'Set up alerts', act: 'alerts' });
     if (host && !host.smart_tests?.short && !host.smart_tests?.long)
@@ -326,6 +331,84 @@ export const machineFindings = ({ host, config, disks, nowIso }) => {
     const order = { bad: 0, warn: 1, tip: 2, ok: 3 };
     return out.sort((a, b) => order[a.level] - order[b.level]);
 };
+
+/* ------------------------------------------------------------------ */
+/* fast disks                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What waits on a fast disk, as counted by the daemon: { files, bytes, more }.
+ * 'more' tells that the count stopped at its limit.
+ */
+export const cacheWaiting = (c) => ({ files: c?.waiting_files || 0, bytes: c?.waiting_bytes || 0, more: !!c?.waiting_more });
+
+/** The same in words: "3 files (12 MB) waiting", "empty". */
+export const cacheWaitingWords = (c) => {
+    const w = cacheWaiting(c);
+    if (!w.files) return 'empty';
+    return w.more ? `more than ${w.files} files waiting` : `${plural(w.files, 'file', 'files')} (${bytes(w.bytes)}) waiting`;
+};
+
+/** The line of the SnapRAID configuration that sets the temperature limit, however it was parsed. */
+export const isTempLimit = (e) => (e.type === 'option' && e.key === 'temp_limit') || (e.type === 'raw' && /^\s*temp_limit(\s|$)/.test(e.raw || ''));
+
+/** The temperature limit of a parsed SnapRAID configuration, or '' when there is none. */
+export const confTempLimit = (conf) => {
+    const e = (conf || []).find(isTempLimit);
+    if (!e) return '';
+    return String(e.type === 'option' ? e.value : (e.raw.trim().split(/\s+/)[1] || '')).trim();
+};
+
+/** What a fast disk does, in one sentence. */
+export const cacheWords = (c) => {
+    const when = c.when ? describeSchedule(c.when) : '';
+    const age = Number(c.age_hours) > 0 ? `files not changed for ${plural(Number(c.age_hours), 'hour', 'hours')}` : 'every file';
+    const parts = [when ? `${when}, ${age} is moved to the other disks` : 'Files are moved only when you press Move now'];
+    if (Number(c.fill) > 0) parts.push(`at once when it is more than ${c.fill}% full`);
+    const text = `${parts.join('; ')}${c.sync === false ? '' : '. Then the protection is updated'}.`;
+    return text.charAt(0).toUpperCase() + text.slice(1);
+};
+
+/** What the home page says about the fast disks. */
+export const cacheFindings = (host) => {
+    const out = [];
+    for (const c of host?.caches || []) {
+        if (c.last_status != null && c.last_status !== 0 && c.last_status !== 499)
+            out.push({ level: 'bad', title: `The move from the fast disk “${c.name}” failed`, text: c.last_message || 'See the Disks page.', action: { label: 'Open Disks', act: 'drives' } });
+        else if (c.total_bytes && c.free_bytes < c.total_bytes * 0.05)
+            out.push({ level: 'warn', title: `The fast disk “${c.name}” is full`, text: 'New files go straight to the big disks until it is emptied. Move its files now, or let it move them earlier.', action: { label: 'Open Disks', act: 'drives' } });
+        else if (c.enabled === false || (!c.when && !(Number(c.fill) > 0)))
+            out.push({ level: 'warn', title: `The fast disk “${c.name}” is never emptied`, text: 'Its files stay there, outside the protection. Set a time for the move.', action: { label: 'Open Disks', act: 'drives' } });
+    }
+    return out;
+};
+
+/** How a folder is spread over the disks, from the result of the 'usage' job. */
+export const usageRows = (job) => (job?.result || []).map(r => {
+    const [b, f] = String(r.value || '').split(' ');
+    return { path: r.name, bytes: Number(b) || 0, files: Number(f) || 0 };
+}).sort((a, b) => b.bytes - a.bytes);
+
+/** The outcome of a move of files among disks, in plain words. */
+export const moveWords = (job) => {
+    if (!job) return '';
+    const moved = `${plural(job.files || 0, 'file', 'files')} moved (${bytes(job.bytes || 0)})`;
+    if (!job.success) return `${job.message || 'Not finished'}`;
+    if (job.skipped) return `${moved}. ${plural(job.skipped, 'file was', 'files were')} left where ${job.skipped === 1 ? 'it was' : 'they were'}: see why below.`;
+    return job.files ? `${moved}.` : 'There was nothing to move.';
+};
+
+/* ------------------------------------------------------------------ */
+/* the first visit                                                     */
+/* ------------------------------------------------------------------ */
+
+export const TOUR = [
+    { title: 'Welcome', text: 'This server keeps your files on several disks and protects them, so a broken disk does not cost you anything. Four things are worth knowing. It takes a minute.' },
+    { title: 'Home tells you if all is well', text: 'One sentence at the top says how things are, and one button does what is needed. Green means there is nothing to do. Under it, “Needs your attention” lists anything to look at, most important first.' },
+    { title: 'Your data and your server', text: 'The menu has two groups. “Your data”: My files, Sharing with the other computers, and Backups. “Your server”: the Disks, the Protection, Alerts and System. Each page starts with the everyday things.' },
+    { title: 'Advanced is there when you want it', text: 'Pages and windows with finer controls have an “Advanced” switch. Leave it off and the usual choices are made for you; turn it on to see and change them. The switch is remembered for each page.' },
+    { title: 'Nothing happens by surprise', text: 'Before anything is changed, a window tells what will happen and what stays as it is. After saving, the page reads the setting back and tells when it runs next. Help explains every word and the common jobs.' }
+];
 
 /* ------------------------------------------------------------------ */
 /* notifications                                                       */

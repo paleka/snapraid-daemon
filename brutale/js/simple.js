@@ -8,7 +8,7 @@
 
 import { API } from './api.js';
 import { escHtml, escAttr, showToast } from './utils.js';
-import { dialog, confirmDo, applyWidths, storageSnapshot, storageOpen, StorageAPI, waitJob } from './storage.js';
+import { dialog, confirmDo, applyWidths, storageSnapshot, storageOpen, StorageAPI, waitJob, setOption } from './storage.js';
 import * as P from './plain.js';
 
 /* ------------------------------------------------------------------ */
@@ -51,6 +51,11 @@ export const HostAPI = {
     copy: (source, target, mirror = false) => hostCall('/copy', 'POST', { source, target, mirror }),
     fileDelete: (path) => hostCall('/file_delete', 'POST', { path }),
     fileRename: (path, name) => hostCall('/file_rename', 'POST', { path, name }),
+    cacheSave: (c) => hostCall('/cache_save', 'POST', c),
+    cacheDelete: (name) => hostCall('/cache_delete', 'POST', { name }),
+    cacheRun: (name) => hostCall('/cache_run', 'POST', { name }),
+    usage: (path) => hostCall('/usage', 'POST', { path }),
+    surface: (device) => hostCall('/surface', 'POST', { device }),
     wol: () => hostCall('/wol', 'POST', {}),
     restore: (path, text) => hostCall('/restore', 'POST', { path, text })
 };
@@ -121,6 +126,26 @@ const toggle = (id, on, label, help = '') => `
         <label for="${id}" class="sp-toggle-text"><span class="sp-field-label">${esc(label)}</span>${help ? `<span class="sp-field-help">${help}</span>` : ''}</label>
     </div>`;
 
+/*
+ * Advanced mode. Every page and window shows the everyday choices only.
+ * What fine tunes them is marked "sp-adv-only" and stays hidden until the
+ * person turns on the "Advanced" switch of that page, which is remembered.
+ */
+const advOn = (id) => { try { return localStorage.getItem(`sp-adv-${id}`) === '1'; } catch (ignore) { return false; } };
+
+const advSwitch = (id, label = 'Advanced') => `
+    <button type="button" class="sp-adv-switch ${advOn(id) ? 'on' : ''}" data-sp="adv" data-id="${id}" aria-pressed="${advOn(id)}" data-tooltip="Show the finer controls. Off: the usual choices are made for you.">
+        <span class="sp-adv-knob"></span>${esc(label)}</button>`;
+
+const advScope = (id, html) => `<div class="sp-adv-scope ${advOn(id) ? '' : 'sp-adv-off'}" data-adv-scope="${id}">${html}</div>`;
+
+const advToggle = (id) => {
+    const on = !advOn(id);
+    try { localStorage.setItem(`sp-adv-${id}`, on ? '1' : '0'); } catch (ignore) { /* not remembered */ }
+    document.querySelectorAll(`[data-adv-scope="${id}"]`).forEach(el => el.classList.toggle('sp-adv-off', !on));
+    document.querySelectorAll(`[data-sp="adv"][data-id="${id}"]`).forEach(el => { el.classList.toggle('on', on); el.setAttribute('aria-pressed', String(on)); });
+};
+
 const val = (id) => document.getElementById(id)?.value ?? '';
 const checked = (id) => !!document.getElementById(id)?.checked;
 
@@ -177,24 +202,30 @@ const healNow = async () => {
 };
 
 /** Follow a background job of the machine in a dialog until it ends. */
-const followJob = async (title) => {
+const followJob = async (title, opts = {}) => {
     const dlg = dialog({ title, large: false, body: '<div class="loading-spinner"></div>', buttons: [{ label: 'Stop', cls: 'btn-danger', onClick: () => StorageAPI.jobStop().catch(e => showToast(e.message, 'error')) }] });
     const draw = (j) => {
-        const pct = j.kind === 'wipe' && S.cache.wipeSize ? Math.min(100, Math.round((j.bytes || 0) * 100 / S.cache.wipeSize)) : null;
+        const pct = (j.kind === 'wipe' || j.kind === 'surface') && S.cache.wipeSize ? Math.min(100, Math.round((j.bytes || 0) * 100 / S.cache.wipeSize)) : null;
         dlg.setBody(`
             <div class="sp-job">
                 <div class="font-bold">${esc(j.running ? 'Working…' : j.success ? 'Done' : 'Not finished')}</div>
                 ${pct != null ? `<div class="progress-container mt-2"><div class="progress-bar" data-width="${pct}"></div></div>` : ''}
                 <div class="text-sm text-muted mt-2">${P.plural(j.files || 0, 'file', 'files')} · ${P.bytes(j.bytes || 0)} · ${P.humanSpan(j.elapsed_seconds || 0)}</div>
                 ${j.current && j.running ? `<div class="text-xs font-mono text-muted mt-2 truncate">${esc(j.current)}</div>` : ''}
-                ${!j.running ? `<p class="text-sm mt-4 ${j.success ? 'text-emerald' : 'text-red'}">${esc(j.message || '')}</p>` : ''}
-                ${!j.running && (j.result || []).length ? `<ul class="text-xs mt-2">${j.result.slice(0, 20).map(r => `<li>${esc(r.value || r.path || '')}</li>`).join('')}</ul>` : ''}
+                ${!j.running ? `<p class="text-sm mt-4 ${j.success ? 'text-emerald' : 'text-red'}">${esc(['mover', 'empty', 'move'].includes(j.kind) ? P.moveWords(j) : (j.message || ''))}</p>` : ''}
+                ${!j.running && (j.result || []).length ? `<ul class="text-xs mt-2">${j.result.slice(0, 20).map(r => `<li>${r.name && r.value ? `<span class="font-mono">${esc(r.name)}</span> — ${esc(r.value)}` : esc(r.value || r.path || '')}</li>`).join('')}</ul>${(j.result || []).length > 20 ? `<p class="text-xs text-muted">And ${j.result.length - 20} more.</p>` : ''}` : ''}
             </div>`);
     };
     try {
         const job = await waitJob(draw);
         draw(job);
-        dlg.setButtons([{ label: 'Close', cls: 'btn-primary', onClick: (d) => { d.close(); refresh(); } }]);
+        // what comes next is offered in the same window, under the result
+        const next = opts.next ? opts.next(job) : null;
+        if (next?.note) dlg.body.insertAdjacentHTML('beforeend', `<div class="sp-adv-note mt-4">${next.note}</div>`);
+        dlg.setButtons([
+            { label: 'Close', cls: next ? '' : 'btn-primary', onClick: (d) => { d.close(); refresh(); } },
+            ...(next ? [{ label: next.label, cls: 'btn-primary', onClick: async (d) => { d.close(); await next.run(); refresh(); } }] : [])
+        ]);
         return job;
     } catch (e) {
         dlg.setBody(`<p class="text-red">${esc(e.message)}</p>`);
@@ -325,6 +356,32 @@ const loadHome = async () => {
 
         ${tips.length ? section('Ideas', 'Not problems: things that could be better.', `<div class="sp-rows">${tips.map(finding).join('')}</div>`) : ''}
     `);
+
+    // the first visit starts with a short tour; never under a test driving the browser
+    let seen = true;
+    try { seen = localStorage.getItem('sp-tour-done') === '1'; } catch (ignore) { /* no storage: no tour */ }
+    if (!seen && !navigator.webdriver && !document.querySelector('.modal-overlay')) tour();
+};
+
+/** The short tour of the first visit. It can be seen again from Help. */
+const tour = (at = 0) => {
+    const done = () => { try { localStorage.setItem('sp-tour-done', '1'); } catch (ignore) { /* asked again next time */ } };
+    const dlg = dialog({ title: '', large: false, body: '', buttons: [] });
+    const show = (i) => {
+        const step = P.TOUR[i];
+        const last = i === P.TOUR.length - 1;
+        dlg.setTitle(step.title);
+        dlg.setBody(`
+            <p class="sp-tour-text">${esc(step.text)}</p>
+            <div class="sp-tour-dots">${P.TOUR.map((_, k) => `<span class="sp-tour-dot ${k === i ? 'on' : ''}"></span>`).join('')}</div>`);
+        dlg.setButtons([
+            { label: last ? 'Close' : 'Skip', onClick: (x) => { done(); x.close(); } },
+            ...(i > 0 ? [{ label: 'Back', onClick: () => show(i - 1) }] : []),
+            ...(last ? [{ label: 'Open Help', cls: 'btn-primary', onClick: (x) => { done(); x.close(); window.location.hash = '#/help'; } }]
+                : [{ label: 'Next', cls: 'btn-primary', onClick: () => show(i + 1) }])
+        ]);
+    };
+    show(at);
 };
 
 /* ------------------------------------------------------------------ */
@@ -397,7 +454,7 @@ const loadFiles = async () => {
 
     draw(`
         ${pools.length > 1 ? `<div class="sp-tabs">${pools.map(p => `<button class="sp-tab ${p.mountpoint === pool ? 'active' : ''}" data-sp="files-pool" data-pool="${escAttr(p.mountpoint)}">${esc(p.mountpoint)}</button>`).join('')}</div>` : ''}
-        ${section('My files', `Everything in <span class="font-mono">${esc(pool)}</span>, the folder that shows all the data disks together. Each file lives on one disk: you see which.`, `
+        ${section('My files', `Everything in <span class="font-mono">${esc(pool)}</span>, the folder that shows all the data disks together. Each file lives on one disk: you see which.`, advScope('files', `
             <div class="sp-crumbs">
                 <a href="#" data-sp="files-go" data-path="/">${icon('folder')} ${esc(pool)}</a>
                 ${crumbs.map((c, i) => `<span>/</span><a href="#" data-sp="files-go" data-path="/${escAttr(crumbs.slice(0, i + 1).join('/'))}">${esc(c)}</a>`).join('')}
@@ -418,14 +475,18 @@ const loadFiles = async () => {
                         <span class="sp-file-meta" data-tooltip="The disks holding it">${on.length ? `on ${esc(on.join(', '))}` : ''}${e.duplicate ? ' <span class="badge badge-orange" data-tooltip="The same file is on more disks: only one copy is shown">copies</span>' : ''}</span>
                         <span class="sp-file-actions">
                             <button class="btn btn-sm btn-secondary" data-sp="file-check" data-path="${escAttr(rel)}" data-dir="${e.dir ? 1 : 0}" data-tooltip="Compare with what the protection saved">Check</button>
-                            ${e.dir ? `<button class="btn btn-sm btn-secondary" data-sp="file-copy" data-path="${escAttr(full)}" data-dir="1" data-tooltip="Copy it to another disk">Copy to…</button>` : ''}
+                            <button class="btn btn-sm btn-secondary" data-sp="file-copy" data-path="${escAttr(full)}" data-dir="${e.dir ? 1 : 0}" data-tooltip="Copy it to another disk, like a USB disk">Copy to…</button>
+                            ${e.dir ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-usage" data-path="${escAttr(full)}" data-tooltip="How big it is, and how much of it is on each disk">Size…</button>
+                            <button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-move" data-rel="${escAttr(rel)}" data-on="${escAttr(JSON.stringify((e.on || []).map(i => list.branches[i])))}" data-tooltip="Bring the whole folder to one disk. Its place in ${escAttr(pool)} does not change.">Move to a disk…</button>` : ''}
                             <button class="btn btn-sm btn-secondary" data-sp="file-rename" data-path="${escAttr(full)}">Rename</button>
                             <button class="btn btn-sm btn-secondary sp-danger-text" data-sp="file-delete" data-path="${escAttr(full)}" data-rel="${escAttr(rel)}" data-dir="${e.dir ? 1 : 0}">Delete</button>
                         </span>
                     </div>`;
                 }).join('')}
-            </div>` : empty('This folder is empty.')}`)}
+            </div>` : empty('This folder is empty.')}
+            <div class="sp-adv-only sp-adv-note">Advanced is on: folders also show <b>Size…</b> (how much of it is on each disk) and <b>Move to a disk…</b> (keep a folder together on one disk, so only that disk wakes up).</div>`), advSwitch('files'))}
     `);
+    S.cache.filesList = list;
 };
 
 const fileCheck = async (rel, dir) => {
@@ -561,16 +622,83 @@ const fileCopy = (full, dir) => {
         title: `Copy ${name}`, large: false,
         body: `
             ${field('To', `<select class="form-control" id="sp-cp-to">${targets.map(t => `<option value="${escAttr(t.path)}">${esc(t.path)} — ${P.bytes(t.free)} free${t.pool ? ' (pool)' : ''}</option>`).join('')}</select>`, 'A disk or a pool of this machine, like a USB disk.')}
-            ${field('Into the folder', `<input class="form-control" id="sp-cp-dir" value="${escAttr(name)}">`, 'Created if missing. A copy already there is updated: only what changed is copied.')}
-            ${dir ? '' : '<p class="text-xs text-muted">Only folders can be copied from here: to copy a single file, copy its folder or use a share.</p>'}`,
+            ${field('Into the folder', `<input class="form-control" id="sp-cp-dir" value="${escAttr(dir ? name : 'Copies')}">`, dir ? 'Created if missing. A copy already there is updated: only what changed is copied.' : 'Created if missing. The file keeps its name.')}
+            `,
         buttons: [
             { label: 'Cancel', onClick: (x) => x.close() },
             {
                 label: 'Copy', cls: 'btn-primary', onClick: async (x) => {
                     const to = `${val('sp-cp-to').replace(/\/+$/, '')}/${val('sp-cp-dir').replace(/^\/+|\/+$/g, '')}`;
-                    if (!dir) return showToast('Choose a folder to copy', 'warning');
                     x.close();
                     if (await act(() => HostAPI.copy(full, to))) followJob(`Copying ${name}`);
+                }
+            }
+        ]
+    });
+};
+
+/** How big a folder is, and how much of it is on every disk. */
+const folderUsage = async (full) => {
+    const dlg = dialog({ title: `Size of ${full.split('/').pop()}`, large: false, body: '<div class="loading-spinner"></div><p class="text-sm text-muted mt-2">Counting the files…</p>', buttons: [{ label: 'Stop', onClick: () => StorageAPI.jobStop().catch(() => { }) }] });
+    try {
+        await HostAPI.usage(full);
+        const job = await waitJob((j) => dlg.setBody(`<div class="loading-spinner"></div><p class="text-sm text-muted mt-2">Counting: ${P.plural(j.files || 0, 'file', 'files')}, ${P.bytes(j.bytes || 0)} so far…</p>`));
+        const rows = P.usageRows(job);
+        const total = rows.reduce((a, r) => a + r.bytes, 0);
+        const model = S.cache.filesModel || S.cache.shareModel;
+        const diskName = (path) => (model?.data || []).find(x => x.path.replace(/\/+$/, '') === path)?.name || path.split('/').pop();
+        dlg.setBody(job.success ? `
+            <div class="sp-facts"><div><div class="sp-fact-label">In all</div><div class="sp-fact-value">${P.bytes(total)}</div></div>
+                <div><div class="sp-fact-label">Files</div><div class="sp-fact-value">${rows.reduce((a, r) => a + r.files, 0)}</div></div>
+                <div><div class="sp-fact-label">On</div><div class="sp-fact-value">${P.plural(rows.length, 'disk', 'disks')}</div></div></div>
+            <div class="sp-runs mt-4">${rows.map(r => `<div class="sp-run"><span class="sp-run-what"><b>${esc(diskName(r.path))}</b></span>
+                <span class="sp-run-bar"><span class="sp-run-fill sp-run-sync" data-width="${total ? Math.max(1, Math.round(r.bytes * 100 / total)) : 0}"></span></span>
+                <span class="sp-run-dur">${P.bytes(r.bytes)} · ${P.plural(r.files, 'file', 'files')}</span></div>`).join('') || '<p class="text-sm text-muted">The folder is empty.</p>'}</div>
+            <p class="text-xs text-muted mt-4 font-mono">${esc(full)}</p>` : `<p class="text-red">${esc(job.message || 'Not finished')}</p>`);
+        applyWidths(dlg.body);
+        dlg.setButtons([{ label: 'Close', cls: 'btn-primary', onClick: (x) => x.close() }]);
+    } catch (e) {
+        dlg.setBody(`<p class="text-red">${esc(e.message)}</p>`);
+        dlg.setButtons([{ label: 'Close', onClick: (x) => x.close() }]);
+    }
+};
+
+/** Bring a folder of the pool to one disk. */
+const fileMove = (rel, on) => {
+    const pool = S.cache.pool;
+    const list = S.cache.filesList;
+    const model = S.cache.filesModel;
+    const inv = S.cache.filesInv;
+    const branches = (inv?.pools || []).find(p => p.mountpoint === pool)?.branches || [];
+    const diskName = (path) => (model?.data || []).find(x => x.path.replace(/\/+$/, '') === path.replace(/\/+$/, ''))?.name || path.split('/').pop();
+    const targets = branches.filter(b => (b.mode || 'RW') === 'RW' && !(on.length === 1 && on[0] === b.path));
+    if (!list || !targets.length) return showToast('There is no other disk in this pool to move it to', 'warning');
+    dialog({
+        title: `Move ${rel.split('/').pop()} to one disk`, large: false,
+        body: `
+            <p class="text-sm mb-4">Now on: <b>${esc(on.map(diskName).join(', ') || '–')}</b>. Everybody keeps finding it at <span class="font-mono">${esc(pool + rel)}</span>: only the disk behind it changes.</p>
+            ${field('To the disk', `<select class="form-control" id="sp-mv-to">${targets.map(b => `<option value="${escAttr(b.path)}">${esc(diskName(b.path))} — ${P.bytes(b.free_bytes)} free${b.protected === false ? ' (not protected)' : ''}</option>`).join('')}</select>`)}
+            <div class="st-effects"><div class="st-effects-title">What happens</div><ul>
+                <li>The files of this folder on the other disks are moved to the chosen one.</li>
+                <li>For the protection, moved files are new on one disk and gone from another: it is updated at its next run.</li></ul></div>
+            <div class="st-effects st-effects-safe"><div class="st-effects-title">What does not change</div><ul>
+                <li>A file is removed from the old disk only after it was copied whole. No file is overwritten.</li></ul></div>`,
+        buttons: [
+            { label: 'Cancel', onClick: (x) => x.close() },
+            {
+                label: 'Move', cls: 'btn-primary', onClick: async (x) => {
+                    const to = val('sp-mv-to');
+                    const from = on.filter(b => b !== to);
+                    x.close();
+                    if (!from.length) return showToast('It is already all on that disk', 'info');
+                    if (await act(() => StorageAPI.move({ kind: 'move', pool, from: from.join(':'), path: rel, to })))
+                        followJob(`Moving ${rel.split('/').pop()}`, {
+                            next: (job) => (job.success && job.files ? {
+                                label: 'Update the protection now',
+                                note: 'The moved files are protected again once the protection is updated: now, or at its next automatic run.',
+                                run: () => protectNow()
+                            } : null)
+                        });
                 }
             }
         ]
@@ -655,6 +783,10 @@ const loadDrives = async () => {
     S.cache.bays = bays;
     const placing = S.cache.placing;
     const history = await HostAPI.history().catch(() => null);
+    const caches = d.host?.caches || [];
+    S.cache.caches = caches;
+    const poolOf = (mount) => (model?.pools || []).find(p => p.branches.some(b => b.path.replace(/\/+$/, '') === mount));
+    const isCache = (mount) => caches.some(c => c.branch === mount);
     const shortPlan = P.parseSchedule(d.host?.smart_tests?.short)[0];
     const longPlan = P.parseSchedule(d.host?.smart_tests?.long)[0];
 
@@ -691,7 +823,7 @@ const loadDrives = async () => {
                     : '<span class="text-sm text-muted">Every disk has its place. Click a disk in the picture to move it.</span>'}
             </div>`, `<span class="text-sm text-muted">Bays</span> <input class="form-control sp-num" type="number" min="1" max="12" id="sp-bay-rows" value="${bays.rows}" data-tooltip="Rows"> × <input class="form-control sp-num" type="number" min="1" max="12" id="sp-bay-cols" value="${bays.cols}" data-tooltip="Columns"> ${button('Set', 'bay-size')}`)}
 
-        ${section('Your disks', 'What each disk is for, and how it feels.', `
+        ${section('Your disks', 'What each disk is for, and how it feels.', advScope('drives', `
             <div class="sp-disks">
                 ${entries.map(e => {
                     const hw = healthWords(e);
@@ -702,7 +834,7 @@ const loadDrives = async () => {
                     <div class="sp-disk sp-disk-${roleCls(e)}">
                         <div class="sp-disk-head">
                             ${icon('disk', `sp-icon-${roleCls(e)}`)}
-                            <div class="sp-disk-title"><b>${esc(e.name)}</b> <span class="text-muted">· ${esc(ROLE_WORDS[e.role] || e.role)}${e.array ? ` in the array ${esc(e.array)}` : ''}</span>
+                            <div class="sp-disk-title"><b>${esc(e.name)}</b> <span class="text-muted">· ${esc(e.mount && isCache(e.mount) ? 'fast disk in front of the pool' : (ROLE_WORDS[e.role] || e.role))}${e.array ? ` in the array ${esc(e.array)}` : ''}</span>
                                 <div class="text-xs text-muted">${esc([e.model, e.transport, P.bytes(e.size), e.serial ? `serial ${e.serial}` : ''].filter(Boolean).join(' · '))}</div></div>
                             <span class="sp-pill sp-pill-${hw.level}">${esc(hw.text)}</span>
                         </div>
@@ -716,16 +848,45 @@ const loadDrives = async () => {
                         <div class="sp-disk-actions">
                             ${e.dev && !e.array ? `<button class="btn btn-sm btn-secondary" data-action="smart-details" data-node="${escAttr(e.node)}">Health details</button>` : ''}
                             ${e.dev || ['blank', 'mounted', 'unmounted'].includes(e.role) ? `<button class="btn btn-sm btn-secondary" data-sp="disk-test" data-node="${escAttr(e.node)}" data-name="${escAttr(e.name)}">Test…</button>` : ''}
-                            ${e.dev ? `<button class="btn btn-sm btn-secondary" data-sp="disk-power" data-id="${escAttr(e.id)}">Power…</button>` : ''}
-                            ${e.mount && e.role !== 'parity' ? `<button class="btn btn-sm btn-secondary" data-sp="disk-busy" data-path="${escAttr(e.mount)}">What uses it?</button>` : ''}
-                            ${e.role === 'data' && !e.array && e.mount ? `<button class="btn btn-sm btn-secondary" data-sp="file-copy" data-path="${escAttr(e.mount)}" data-dir="1" data-tooltip="Before replacing a disk that still reads: copy everything to the new one">Copy its files…</button>` : ''}
                             ${(e.role === 'data' || e.role === 'parity') && !e.array ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="replace" data-st-data="${escAttr(JSON.stringify({ kind: e.role, name: e.name }))}">Replace…</button>` : ''}
-                            ${['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="" data-st-tab="array">Use it…</button>` : ''}
-                            ${['blank', 'unmounted', 'unformatted', 'other'].includes(e.role) && !e.dev ? `<button class="btn btn-sm btn-danger" data-sp="disk-wipe" data-node="${escAttr(e.node)}" data-size="${e.size || 0}">Erase…</button>` : ''}
+                            ${['blank', 'mounted', 'unmounted', 'unformatted'].includes(e.role) && !(e.mount && isCache(e.mount)) ? `<button class="btn btn-sm btn-secondary" data-sp="storage" data-st-action="" data-st-tab="array">Use it…</button>` : ''}
+                            ${e.mount && e.role !== 'parity' ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-busy" data-path="${escAttr(e.mount)}" data-tooltip="The programs with files open on it">What uses it?</button>` : ''}
+                            ${e.dev ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-power" data-id="${escAttr(e.id)}" data-tooltip="Power saving, noise and write cache of this disk">Power…</button>` : ''}
+                            ${e.role === 'data' && !e.array && e.mount ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-copy" data-path="${escAttr(e.mount)}" data-dir="1" data-tooltip="Copy everything on it to another disk">Copy its files…</button>` : ''}
+                            ${e.mount && !e.array && poolOf(e.mount)?.branches.length > 1 && !isCache(e.mount) ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="disk-empty" data-path="${escAttr(e.mount)}" data-name="${escAttr(e.name)}" data-pool="${escAttr(poolOf(e.mount).mountpoint)}" data-tooltip="Move its files to the other disks of the pool, for example before taking it out">Empty it…</button>` : ''}
+                            ${e.role === 'parity' && !e.array ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="storage" data-st-action="parity-move" data-st-data="${escAttr(JSON.stringify({ name: e.disk?.name || '' }))}" data-tooltip="Copy the protection to a larger disk, to allow larger disks for files">Move to a larger disk…</button>` : ''}
+                            ${['blank', 'unmounted', 'unformatted', 'other'].includes(e.role) && !e.dev ? `<button class="btn btn-sm btn-danger sp-adv-only" data-sp="disk-wipe" data-node="${escAttr(e.node)}" data-size="${e.size || 0}">Erase…</button>` : ''}
                         </div>
                     </div>`;
                 }).join('')}
-            </div>`)}
+            </div>
+            <div class="sp-adv-only sp-adv-note">Advanced is on: each disk also offers what applies to it among <b>What uses it?</b>, <b>Power…</b>, <b>Copy its files…</b>, <b>Empty it…</b>, <b>Move to a larger disk…</b> and <b>Erase…</b>.</div>`), advSwitch('drives'))}
+
+        ${model?.pools?.length || caches.length ? section('Fast disk', `A ${term('fast disk')} (an SSD) in front of the big disks: copying to the server is quick and the big disks can sleep. Its files are moved to the big disks by the ${term('mover')}.`, caches.length ? `
+            <div class="sp-cards">
+                ${caches.map(c => {
+                    const waiting = P.cacheWaiting(c).files;
+                    const usedPct = c.total_bytes ? Math.round((c.total_bytes - c.free_bytes) * 100 / c.total_bytes) : 0;
+                    const next = c.enabled !== false && c.when ? P.nextRun(c.when) : null;
+                    const lastOk = c.last_status === 0;
+                    return `
+                    <div class="sp-card">
+                        <div class="sp-card-head">${icon('disk', 'sp-icon-spare')}<div><b>${esc(c.name)}</b><div class="text-xs text-muted"><span class="font-mono">${esc(c.branch)}</span> in front of <span class="font-mono">${esc(c.pool)}</span></div></div>
+                            <span class="sp-pill sp-pill-${waiting ? 'warn' : 'ok'}">${esc(P.cacheWaitingWords(c))}</span></div>
+                        ${c.total_bytes ? `<div class="progress-container"><div class="progress-bar ${usedPct >= 90 ? 'st-bar-red' : usedPct >= 75 ? 'st-bar-amber' : ''}" data-width="${usedPct}"></div></div>` : ''}
+                        <ul class="sp-card-facts">
+                            <li>${waiting ? '<b>The files waiting here are not protected yet</b>: they are once moved to the big disks and the protection is updated.' : 'Nothing is waiting: every file is on the big disks.'}</li>
+                            <li>${esc(P.cacheWords(c))}${next ? ` Next: ${esc(P.whenWords(next))}.` : ''}</li>
+                            <li>${c.last_time ? `<span class="${lastOk ? 'text-emerald' : 'text-red'}">${lastOk ? 'Last move worked' : 'Last move did not finish'}</span>, ${esc(P.humanSpan(Date.now() / 1000 - c.last_time))} ago: ${esc(c.last_message || '')}` : 'Never moved yet'}</li>
+                        </ul>
+                        <div class="sp-card-actions">
+                            ${button('Move now', 'cache-run', { name: c.name }, 'btn-primary')}
+                            ${button('Change', 'cache-edit', { name: c.name })}
+                            ${button('Stop using it', 'cache-remove', { name: c.name }, 'btn-danger')}
+                        </div>
+                    </div>`;
+                }).join('')}
+            </div>` : empty('No fast disk. With an SSD in front, new files are written at full speed and the big disks wake up only at night.', `<button class="btn btn-secondary" data-sp="storage" data-st-action="cache-create" data-st-tab="pool" data-st-data="{}">Add a fast disk…</button>`)) : ''}
 
         ${section('Automatic health tests', `Every disk can test itself with its ${term('smart', 'self-diagnosis')}. The short test takes minutes, the long one reads the whole disk and takes hours. Both run while the disks keep working.`, `
             <div class="sp-form">
@@ -759,20 +920,28 @@ const baySave = async (doc) => {
 };
 
 const diskTest = (node, name) => {
+    const canSmart = !!(S.cache.drives || []).find(x => x.node === node)?.dev;
     dialog({
         title: `Test ${name}`, large: false,
-        body: `
-            <p class="text-sm">The disk tests itself while it keeps working. The result shows here when it's done.</p>
+        body: advScope('disk-test', `
+            <p class="text-sm">${canSmart ? 'The disk tests itself while it keeps working. The result shows here when it\'s done.' : 'This disk is in no array, so its self-tests are not followed here. The server can read it whole instead.'}</p>
             <div class="sp-choices mt-4">
-                <label class="sp-choice"><input type="radio" name="sp-tk" value="short" checked><span><b>Short</b> — a few minutes. Finds most problems.</span></label>
-                <label class="sp-choice"><input type="radio" name="sp-tk" value="long"><span><b>Long</b> — reads the whole disk, hours for big disks. Finds the rest.</span></label>
-            </div>`,
+                <label class="sp-choice ${canSmart ? '' : 'hidden'}"><input type="radio" name="sp-tk" value="short" ${canSmart ? 'checked' : ''}><span><b>Short</b> — a few minutes. Finds most problems.</span></label>
+                <label class="sp-choice ${canSmart ? '' : 'hidden'}"><input type="radio" name="sp-tk" value="long"><span><b>Long</b> — reads the whole disk, hours for big disks. Finds the rest.</span></label>
+                <label class="sp-choice ${canSmart ? 'sp-adv-only' : ''}"><input type="radio" name="sp-tk" value="surface" ${canSmart ? '' : 'checked'}><span><b>Read every block</b> — the server itself reads the disk from the first to the last block and counts what cannot be read. For a new disk before you trust it, or one whose self-test is not available. Nothing is written. You can follow and stop it here.</span></label>
+            </div>
+            ${canSmart ? `<div class="mt-4">${advSwitch('disk-test', 'More tests')}</div>` : ''}`),
         buttons: [
             { label: 'Cancel', onClick: (x) => x.close() },
             {
                 label: 'Start the test', cls: 'btn-primary', onClick: async (x) => {
                     const kind = x.body.querySelector('input[name="sp-tk"]:checked').value;
                     x.close();
+                    if (kind === 'surface') {
+                        S.cache.wipeSize = Number((S.cache.drives || []).find(d => d.node === node)?.size) || 0;
+                        if (await act(() => HostAPI.surface(node))) followJob(`Reading every block of ${name}`);
+                        return;
+                    }
                     if (await act(() => HostAPI.smartTest(node, kind), `${kind === 'short' ? 'Short' : 'Long'} test started on ${name}`)) setTimeout(refresh, 1500);
                 }
             }
@@ -858,6 +1027,97 @@ const diskBusy = async (path) => {
     } catch (e) { showToast(e.message, 'error'); }
 };
 
+/** Move everything on a disk to the other disks of its pool. */
+const diskEmpty = async (path, name, pool) => {
+    const ok = await confirmDo({
+        title: `Empty ${name}`,
+        intro: `Every file on <span class="font-mono">${esc(path)}</span> is moved to the other disks of <span class="font-mono">${esc(pool)}</span>, to the one with most room each time.`,
+        effects: ['It can take hours. You can stop it: what was moved stays moved, the rest stays here.', 'For the protection, moved files are new on one disk and gone from another: update it when the move is done. Until then, do not take the disk away.'],
+        safe: [`Everybody keeps finding the files at the same place in ${esc(pool)}.`, 'A file is removed from this disk only after it was copied whole. No file is overwritten: files that do not fit, or that exist already on another disk, are left here and listed.'],
+        label: 'Empty it'
+    });
+    if (!ok) return;
+    if (!await act(() => StorageAPI.move({ kind: 'empty', pool, from: path }))) return;
+    // a disk that lost all its files makes the protection stop and ask: here the answer is known
+    await followJob(`Emptying ${name}`, {
+        next: (job) => (job.success && job.files ? {
+            label: 'Update the protection now',
+            note: `<b>One more step.</b> The protection has to be updated, and told that ${esc(name)} was emptied on purpose: without this, the next automatic update stops and asks, as it does when a disk fails to mount. No file is changed. After it, ${esc(name)} can be taken out of the array (Advanced → Storage → Remove).`,
+            run: () => act(() => API.schedule([{ command: 'sync', args: ['-E'] }]), 'Updating the protection: the progress is on Home')
+        } : null)
+    });
+};
+
+const cacheEdit = (name) => {
+    const c = (S.cache.caches || []).find(x => x.name === name);
+    if (!c) return;
+    const plan = P.parseSchedule(c.when)[0];
+    dialog({
+        title: `Fast disk ${name}`, large: false,
+        body: advScope('cache', `
+            <div class="sp-form-row">${toggle('sp-fc-on', c.enabled !== false, 'Move its files every day at')}
+                <input class="form-control sp-w-auto" type="time" id="sp-fc-time" value="${plan ? `${String(plan.hour).padStart(2, '0')}:${String(plan.minute).padStart(2, '0')}` : '03:00'}"></div>
+            <div class="sp-field-help">Best a little before the automatic protection, so the moved files are protected the same night.</div>
+            <div class="sp-adv-only">
+                <hr class="sp-hr">
+                <div class="sp-form-row"><span class="sp-field-label">Leave the files changed in the last</span><input class="form-control sp-num" type="number" min="0" max="8760" id="sp-fc-age" value="${Number(c.age_hours) || 0}"><span>hours</span></div>
+                <div class="sp-field-help">0: move everything. More: recent files stay on the fast disk, quick to open, and outside the protection for that long.</div>
+                <div class="sp-form-row mt-2"><span class="sp-field-label">Move at once when it is fuller than</span><input class="form-control sp-num" type="number" min="0" max="99" id="sp-fc-fill" value="${Number(c.fill) || 0}"><span>%</span></div>
+                <div class="sp-field-help">0: only at the set time. A full fast disk sends new files straight to the big disks.</div>
+                <div class="mt-2">${toggle('sp-fc-sync', c.sync !== false, 'Update the protection right after the move', 'Off: the moved files are protected at the next automatic update.')}</div>
+            </div>
+            <div class="mt-4">${advSwitch('cache')}</div>`),
+        buttons: [
+            { label: 'Cancel', onClick: (x) => x.close() },
+            {
+                label: 'Save', cls: 'btn-primary', onClick: async (x) => {
+                    const body = { name, pool: c.pool, branch: c.branch, age_hours: String(Math.max(0, Number(val('sp-fc-age')) || 0)), fill: String(Math.min(99, Math.max(0, Number(val('sp-fc-fill')) || 0))), when: val('sp-fc-time') || '03:00', sync: checked('sp-fc-sync'), enabled: checked('sp-fc-on') };
+                    if (c.policy) body.policy = c.policy;
+                    try {
+                        const r = await HostAPI.cacheSave(body);
+                        void r;
+                        x.close();
+                        const back = ((await HostAPI.status()).caches || []).find(k => k.name === name);
+                        showToast(back ? `Saved and checked: ${P.cacheWords(back)}${back.enabled !== false && back.when ? ` Next: ${P.whenWords(P.nextRun(back.when))}.` : ''}` : 'Saved', 'success');
+                        refresh();
+                    } catch (e) { showToast(e.message, 'error'); }
+                }
+            }
+        ]
+    });
+};
+
+/** Take a fast disk out: its files go to the big disks first. */
+const cacheRemove = async (name) => {
+    const c = (S.cache.caches || []).find(x => x.name === name);
+    if (!c) return;
+    const ok = await confirmDo({
+        title: `Stop using the fast disk ${name}`,
+        effects: ['Its files are moved to the big disks now, all of them.', `Then it is taken out of ${c.pool}: new files go to the big disks again, spread by free space.`],
+        safe: ['No file is lost: the disk leaves the pool only if it was emptied.', 'The disk stays connected and mounted: use it for something else, or erase it.'],
+        label: 'Stop using it', danger: true
+    });
+    if (!ok) return;
+    try {
+        // always, and as an emptying: whatever is left is named, and keeps the disk in the pool
+        await StorageAPI.move({ kind: 'empty', pool: c.pool, from: c.branch });
+        const job = await followJob(`Emptying the fast disk ${name}`);
+        const left = P.cacheWaiting(((await HostAPI.status()).caches || []).find(k => k.name === name)).files;
+        if (!job?.success || job.skipped || left)
+            return showToast(`${left ? P.plural(left, 'file is', 'files are') : 'Some files are'} still on the fast disk, so it stays in the pool: nothing was lost. Files changed in the last minutes are moved a little later: try again then.`, 'warning');
+        const inv = await API.getInventory();
+        const pool = (inv.pools || []).find(p => p.mountpoint === c.pool);
+        if (pool) {
+            const branches = pool.branches.filter(b => b.path.replace(/\/+$/, '') !== c.branch).map(b => `${b.path.replace(/\/+$/, '')}${b.mode && b.mode !== 'RW' ? `=${b.mode}` : ''}`);
+            if (branches.length !== pool.branches.length && branches.length)
+                await StorageAPI.pool(c.pool, branches, setOption(pool.fstab_options || '', 'category.create', c.policy || 'pfrd'));
+        }
+        await HostAPI.cacheDelete(name);
+        showToast(`The fast disk ${name} is out of the pool`, 'success');
+        refresh();
+    } catch (e) { showToast(e.message, 'error'); }
+};
+
 const smartSave = async () => {
     const t = (id) => val(id) || '03:00';
     const day3 = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -898,8 +1158,9 @@ const loadProtection = async () => {
     const form = scheduleForm(c.maintenance_schedule);
     const stopAt = d.host?.settings?.maintenance_stop_at || '';
     const conf = d.storage?.model?.conf || [];
-    const tempLimit = conf.find(e => e.type === 'option' && e.key === 'temp_limit')?.value || '';
+    const tempLimit = P.confTempLimit(conf);
     const k = d.storage?.model?.parity?.length || 0;
+    const ratio = Number(d.host?.settings?.sync_ratio) || 0;
     S.cache.protConf = conf;
     S.cache.protTemp = tempLimit;
     const pct = Number(c.scrub_percentage) || 0;
@@ -936,7 +1197,7 @@ const loadProtection = async () => {
                 <div><div class="sp-fact-label">Last check for damage</div><div class="sp-fact-value">${scrub ? esc(P.ago(scrub.finished_at, nowIso)) : '–'}</div></div>
             </div>`)}
 
-        ${section('Automatic protection', 'When the server updates the protection and checks your data by itself. Pick a time when nobody uses it: the disks work hard for a while.', `
+        ${section('Automatic protection', 'When the server updates the protection and checks your data by itself. Pick a time when nobody uses it: the disks work hard for a while.', advScope('protection', `
             <div class="sp-form">
                 <div class="sp-form-row">
                     <span class="sp-field-label">Update the protection</span>
@@ -973,12 +1234,23 @@ const loadProtection = async () => {
                     <input class="form-control sp-num" type="number" min="0" max="10000" id="sp-pr-upd" value="${Number(c.sync_threshold_updates) || 0}"> <span>changed</span>
                 </div>
                 <div class="sp-field-help">A disk that did not mount, or a virus encrypting files, looks like many files deleted or changed. Updating the protection then would make it forget the good versions. 0 means never ask.</div>
+                <div class="sp-adv-only">
+                    <div class="sp-form-row mt-2">
+                        ${toggle('sp-pr-ratio', ratio > 0, 'Do not ask after a big tidy up: go on when at least', 'Moving and renaming many files looks like many deleted and many more added. Only the limit of the deleted files is passed this way, never the one of the changed files.')}
+                        <input class="form-control sp-num" type="number" min="1" max="1000" id="sp-pr-ratio-v" value="${ratio || 2}"> <span>times more files were added than deleted</span>
+                    </div>
+                </div>
                 <div class="sp-form-row mt-2">
                     ${toggle('sp-pr-temp', !!tempLimit, 'Pause when a disk gets hot', 'The work waits for the disks to cool down.')}
                     <input class="form-control sp-num" type="number" min="40" max="70" id="sp-pr-temp-v" value="${esc(tempLimit || '50')}"> <span>°C</span>
                 </div>
+                <div class="sp-adv-only">
+                    <hr class="sp-hr">
+                    <div class="sp-form-row">${toggle('sp-pr-prehash', !!c.sync_prehash, 'Read new files twice before protecting them', 'Catches a file damaged while it was being copied to the server. The update takes longer.')}</div>
+                    <div class="sp-form-row mt-2">${toggle('sp-pr-trunc', !!c.sync_prevent_truncations, 'Stop if a file that was protected is now empty', 'A file cut to zero bytes is the mark of some crashes and of some failing disks. The update stops and waits for you.')}</div>
+                </div>
                 <div class="sp-form-foot">${button('Save', 'prot-save', {}, 'btn-primary')}<span class="sp-saved" id="sp-pr-saved"></span></div>
-            </div>`)}
+            </div>`), advSwitch('protection'))}
 
         ${section('Past runs', 'Each bar is one run: the longer, the more there was to do.', runs.length ? `
             <div class="sp-runs">
@@ -1027,16 +1299,21 @@ const protSave = async () => {
         scrub_percentage: Number(val('sp-pr-pct')),
         scrub_older_than: Number(val('sp-pr-older')) || 0,
         sync_threshold_deletes: Number(val('sp-pr-del')) || 0,
-        sync_threshold_updates: Number(val('sp-pr-upd')) || 0
+        sync_threshold_updates: Number(val('sp-pr-upd')) || 0,
+        sync_prehash: checked('sp-pr-prehash'),
+        sync_prevent_truncations: checked('sp-pr-trunc')
     };
     try {
         await API.updateConfig(patch);
-        await HostAPI.settings({ maintenance_stop_at: checked('sp-pr-stop') ? (val('sp-pr-stop-time') || '07:00') : '' });
+        await HostAPI.settings({
+            maintenance_stop_at: checked('sp-pr-stop') ? (val('sp-pr-stop-time') || '07:00') : '',
+            sync_ratio: checked('sp-pr-ratio') ? String(Math.max(1, Number(val('sp-pr-ratio-v')) || 2)) : '0'
+        });
 
         // the temperature limit is an option of SnapRAID itself
         const want = checked('sp-pr-temp') ? String(Number(val('sp-pr-temp-v')) || 50) : '';
         if (want !== (S.cache.protTemp || '')) {
-            const conf = (S.cache.protConf || []).filter(e => !(e.type === 'option' && e.key === 'temp_limit'));
+            const conf = (S.cache.protConf || []).filter(e => !P.isTempLimit(e));
             const { serializeConf, confInsert } = await import('./storage.js');
             if (want) confInsert(conf, { type: 'option', key: 'temp_limit', value: want });
             await StorageAPI.saveConf(serializeConf(conf));
@@ -1103,6 +1380,7 @@ const loadSharing = async () => {
                         </div>
                         <div class="sp-card-actions">
                             ${button('Change', 'share-edit', { name: s.name })}
+                            ${button('Size…', 'file-usage', { path: s.path })}
                             ${button('Fix permissions', 'share-perms', { path: s.path })}
                             ${button('Stop sharing', 'share-delete', { name: s.name }, 'btn-danger')}
                         </div>
@@ -1152,7 +1430,7 @@ const shareEdit = async (name) => {
             <div class="mt-4">${toggle('sp-sh-write', s.writable !== false, 'They can change and delete files', 'Off: they can only open and copy.')}</div>
             <div class="mt-2">${toggle('sp-sh-recycle', !!s.recycle, 'Keep deleted files for a while', 'Files deleted from another computer go to the folder .recycle first.')}
                 <div class="sp-form-row"><span class="text-sm">Keep them</span><input class="form-control sp-num" type="number" min="1" max="365" id="sp-sh-days" value="${s.recycle_days || 30}"><span class="text-sm">days</span></div></div>
-            <details class="sp-more mt-4"><summary>More options</summary>
+            <details class="sp-more mt-4" ${advOn('share') || s.nfs || s.hidden ? 'open' : ''}><summary>Advanced</summary>
                 <div class="mt-2">${toggle('sp-sh-nfs', !!s.nfs, 'Also share with NFS', 'For Linux computers and some TV boxes.')}</div>
                 ${field('NFS: which computers', `<input class="form-control" id="sp-sh-hosts" value="${escAttr(s.nfs_hosts || '')}" placeholder="192.168.1.0/24">`, 'Empty: all. Addresses or networks, separated by commas.')}
                 <div class="mt-2">${toggle('sp-sh-hidden', !!s.hidden, 'Hide it from the list of shares', 'It still opens when its name is typed.')}</div>
@@ -1261,13 +1539,15 @@ const backupEdit = async (name) => {
             ${field('To which disk', targets.length ? `<select class="form-control" id="sp-bk-dest">${targets.map(t => `<option value="${escAttr(t.uuid)}" ${t.uuid === b.dest_uuid ? 'selected' : ''}>${esc(t.label || t.device)} — ${esc(t.fstype)}${t.mount ? `, at ${t.mount}, ${P.bytes(t.free)} free` : ', not mounted'}</option>`).join('')}</select>`
                 : '<div class="text-sm text-amber">No disk outside your arrays was found. Plug in a USB disk with a filesystem, then reload.</div>', 'Disks of the arrays are not offered: a backup on the same disks would fail together with them.')}
             ${field('Into the folder', `<input class="form-control" id="sp-bk-dir" value="${escAttr(b.dest_dir || `Backups/${(b.source || folders[0] || 'files').split('/').pop()}`)}">`)}
-            ${field('Name', `<input class="form-control" id="sp-bk-name" value="${escAttr(b.name || P.shareNameOf(b.source || folders[0] || 'backup'))}" ${name ? 'disabled' : ''}>`)}
             <div class="sp-field-label mt-4">When</div>
             ${toggle('sp-bk-plug', b.plug !== false, 'As soon as the disk is plugged in', 'When it ends, the disk is released and can be unplugged.')}
             <div class="sp-form-row mt-2">${toggle('sp-bk-sched', !!plan, 'On a schedule')}
                 <select class="form-control sp-w-auto" id="sp-bk-day"><option value="-1">every day</option>${P.DAYS.map((x, i) => `<option value="${i}" ${plan && plan.day === i ? 'selected' : ''}>every ${x}</option>`).join('')}</select>
                 <input class="form-control sp-w-auto" type="time" id="sp-bk-time" value="${plan ? `${String(plan.hour).padStart(2, '0')}:${String(plan.minute).padStart(2, '0')}` : '05:00'}"></div>
-            <div class="mt-4">${toggle('sp-bk-mirror', !!b.mirror, 'Exact copy', 'Files deleted here are deleted from the copy too. Off is safer: nothing is ever removed from the copy.')}</div>`,
+            <details class="sp-more mt-4" ${b.mirror ? 'open' : ''}><summary>Advanced</summary>
+                <div class="mt-2">${field('Name', `<input class="form-control" id="sp-bk-name" value="${escAttr(b.name || P.shareNameOf(b.source || folders[0] || 'backup'))}" ${name ? 'disabled' : ''}>`, 'How this backup is called in the list.')}</div>
+                <div class="mt-2">${toggle('sp-bk-mirror', !!b.mirror, 'Exact copy', 'Files deleted here are deleted from the copy too. Off is safer: nothing is ever removed from the copy.')}</div>
+            </details>`,
         buttons: [
             { label: 'Cancel', onClick: (x) => x.close() },
             {
@@ -1385,7 +1665,7 @@ const loadSystem = async () => {
     header('');
 
     draw(`
-        ${section('Power', 'Save electricity when nobody uses the server.', `
+        ${section('Power', 'Save electricity when nobody uses the server.', advScope('system', `
             <div class="sp-form">
                 <div class="sp-form-row">
                     <span class="sp-field-label">Let the disks sleep after</span>
@@ -1394,6 +1674,11 @@ const loadSystem = async () => {
                 <div class="sp-field-help">0: never. A sleeping disk wakes up by itself when a file is opened, after a few seconds.</div>
                 <div class="sp-form-row mt-2">
                     ${toggle('sp-sy-dircache', s.dircache === '1', 'Keep the folder listings in memory', 'Browsing the folders then does not wake up the disks.')}
+                </div>
+                <div class="sp-adv-only">
+                    <div class="sp-form-row"><span class="sp-field-label">Read the listings again every</span><input class="form-control sp-num" type="number" min="1" max="1440" id="sp-sy-dircache-min" value="${Number(s.dircache_minutes) || 10}"> <span>minutes</span></div>
+                    <div class="sp-field-help">Shorter keeps them in memory more surely on a machine with little memory; it reads only what is already there, the disks stay asleep.</div>
+                    ${spin.length > 1 ? `<div class="sp-form-row mt-2"><span class="sp-field-label">Protection disks sleep after</span><input class="form-control sp-num" type="number" min="0" max="1440" id="sp-sy-spin-parity" value="${spin[1]}"> <span>minutes</span></div>` : `<div class="sp-form-row mt-2">${toggle('sp-sy-spin-split', false, 'A different time for the protection disks', 'They are used only during the updates, so they can sleep sooner.')}<input class="form-control sp-num" type="number" min="0" max="1440" id="sp-sy-spin-parity" value="${spin[0]}"> <span>minutes</span></div>`}
                 </div>
                 <hr class="sp-hr">
                 <div class="sp-form-row">
@@ -1409,9 +1694,12 @@ const loadSystem = async () => {
                 <div class="sp-form-row mt-2">
                     ${toggle('sp-sy-wol', s.wol === '1', 'Wake it up from the network (Wake-on-LAN)', 'Another computer or a phone app can switch it on again.')}
                 </div>
+                <div class="sp-adv-only">
+                    <div class="sp-form-row mt-2">${toggle('sp-sy-idle-net', s.idle_check_network !== '0', 'Network traffic counts as use', 'Off: a download or a stream in progress does not keep the server awake. Connections to the shares still do.')}</div>
+                </div>
                 ${phys.length ? `<div class="sp-field-help">Wake it with the address ${phys.map(i => `<span class="font-mono">${esc(i.mac)}</span> (${esc(i.name)}${i.wake_on ? `, now ${esc(i.wake_on === 'g' ? 'on' : 'off')}` : ''})`).join(', ')}. The BIOS must allow it too.</div>` : ''}
                 <div class="sp-form-foot">${button('Save', 'system-save', {}, 'btn-primary')}<span class="sp-saved" id="sp-sy-saved"></span></div>
-            </div>`)}
+            </div>`), advSwitch('system'))}
 
         ${section('Your settings', 'Keep a copy of every setting of this page and of the arrays. With it, a new system disk is set up again in minutes.', `
             <div class="sp-form-row">
@@ -1438,8 +1726,12 @@ const loadSystem = async () => {
 const systemSave = async () => {
     try {
         const minutes = Number(val('sp-sy-spin')) || 0;
-        await API.updateConfig({ spindown_idle_minutes: String(minutes) });
-        const r = await HostAPI.settings({ dircache: checked('sp-sy-dircache') ? '1' : '0', idle_action: val('sp-sy-idle'), idle_minutes: String(Math.max(10, Number(val('sp-sy-idle-min')) || 60)), wol: checked('sp-sy-wol') ? '1' : '0' });
+        // one time for all the disks, or a second one for the protection disks
+        const split = document.getElementById('sp-sy-spin-split');
+        const parityEl = document.getElementById('sp-sy-spin-parity');
+        const two = parityEl && (!split || split.checked) && Number(parityEl.value) !== minutes;
+        await API.updateConfig({ spindown_idle_minutes: two ? `${minutes},${Number(parityEl.value) || 0}` : String(minutes) });
+        const r = await HostAPI.settings({ dircache_minutes: String(Math.min(1440, Math.max(1, Number(val('sp-sy-dircache-min')) || 10))), idle_check_network: checked('sp-sy-idle-net') ? '1' : '0', dircache: checked('sp-sy-dircache') ? '1' : '0', idle_action: val('sp-sy-idle'), idle_minutes: String(Math.max(10, Number(val('sp-sy-idle-min')) || 60)), wol: checked('sp-sy-wol') ? '1' : '0' });
         if (r.warning) showToast(r.warning, 'warning');
         const back = r.idle || {};
         savedNote('sp-sy-saved', `Saved and checked: disks sleep ${minutes ? `after ${minutes} minutes` : 'never'}; when idle the server ${back.action === 'none' ? 'stays on' : back.action === 'suspend' ? `sleeps after ${back.minutes} minutes` : `switches off after ${back.minutes} minutes`}.`);
@@ -1498,6 +1790,9 @@ const GUIDES = [
     ['The protection waits for my OK', 'Many files were deleted or changed at once, so the server stopped to ask. On the Protection page, look at what was deleted: get the files back, or confirm it was on purpose.', 'protection'],
     ['Space is running out', 'Look at My files to see what takes space, delete what you don’t need, or add a disk on the Disks page. The protection disks must be at least as big as the biggest data disk.', 'files'],
     ['A computer cannot open a share', 'On Sharing, check the address shown under the share and who can open it. The person must use the name and password set on the Sharing page, not the one of this machine.', 'sharing'],
+    ['Copying to the server is slow, or the disks never sleep', 'Add a fast disk: an SSD that takes the new files first. Every night they are moved to the big disks, which can sleep the rest of the day. On Disks, see “Fast disk”. Files waiting on the fast disk are not protected until moved.', 'drives'],
+    ['I want to use bigger disks', 'The protection disk must be at least as big as the biggest disk for files. So the first bigger disk you buy becomes the protection disk: on Disks, turn on Advanced and use “Move to a larger disk…” on the protection disk. The old one is then free for files.', 'drives'],
+    ['I want to take a disk out', 'On Disks, turn on Advanced and use “Empty it…”: its files move to the other disks, at the same place in your folders. Then update the protection, and remove the disk from the array.', 'drives'],
     ['I want messages on my phone', 'On Alerts, pick “Phone notification (ntfy)”, choose a secret topic, and subscribe to it in the ntfy app.', 'alerts']
 ];
 
@@ -1510,6 +1805,7 @@ const loadHelp = async () => {
     header(button('Download the diagnostics', 'diagnostics'));
     draw(`
         ${section('Health check', 'Everything this program looks at, with what to do. The same as on Home, plus the small things.', `<div class="sp-rows">${findings.length ? findings.map(finding).join('') : empty('Nothing to report.')}</div>`)}
+        ${section('New here?', 'A one-minute tour of how these pages work.', `<div class="sp-form-row">${button('Show the tour', 'tour', {}, 'btn-primary')}</div>`)}
         ${section('What to do when…', '', `<div class="sp-guides">${GUIDES.map(([q, a, go]) => `<details class="sp-guide"><summary>${esc(q)}</summary><p>${esc(a)}</p>${button('Go there', 'go', { act: go })}</details>`).join('')}</div>`)}
         ${section('Words used here', '', `<dl class="sp-glossary">${Object.entries(P.GLOSSARY).map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('')}</dl>`)}
         ${section('More', '', `<p class="text-sm">The manual of SnapRAID: <a class="sp-link" href="https://www.snapraid.it/manual" target="_blank" rel="noopener noreferrer">snapraid.it/manual</a> · Every detail of this machine: the pages under <b>Advanced</b> in the menu.</p>`)}
@@ -1580,6 +1876,14 @@ export const initSimple = () => {
         const ds = el.dataset;
         switch (ds.sp) {
             case 'go': goTo(ds.act); break;
+            case 'adv': advToggle(ds.id); break;
+            case 'tour': tour(); break;
+            case 'file-usage': folderUsage(ds.path); break;
+            case 'file-move': { let on = []; try { on = JSON.parse(ds.on || '[]'); } catch (ignore) { /* none */ } fileMove(ds.rel, on); break; }
+            case 'disk-empty': diskEmpty(ds.path, ds.name, ds.pool); break;
+            case 'cache-edit': cacheEdit(ds.name); break;
+            case 'cache-run': if (await act(() => HostAPI.cacheRun(ds.name))) followJob(`Moving the files of the fast disk ${ds.name}`); break;
+            case 'cache-remove': cacheRemove(ds.name); break;
             case 'stop': if (await confirmDo({ title: 'Stop the work', effects: ['The running work stops. The next run continues from where it stopped.'], label: 'Stop' })) act(() => API.stopTask(), 'Stopping'); break;
             case 'storage': {
                 let data = {};

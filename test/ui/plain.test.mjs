@@ -241,3 +241,63 @@ test('home: the deleted files are back, only the update is missing', () => {
     assert.equal(P.taskWords(tasks.history[0]).title, 'Protection update paused');
     assert.match(P.taskWords({ command: 'fix', status: 'terminated', exit_code: 1, messages: [{ level: 'fatal', text: 'DANGER! Unrecoverable errors detected!' }] }).detail, /could not be rebuilt/);
 });
+
+/* ------------------------------------------------------------------ */
+/* fast disks, moves, sizes, the temperature limit and the tour        */
+/* ------------------------------------------------------------------ */
+
+test('fast disk: what waits on it, and what it does in words', () => {
+    // counted by the daemon: the space a filesystem takes for itself is not files waiting
+    assert.deepEqual(P.cacheWaiting({ total_bytes: 250e9, used_bytes: 60e6, waiting_files: 0, waiting_bytes: 0 }), { files: 0, bytes: 0, more: false });
+    assert.deepEqual(P.cacheWaiting(null), { files: 0, bytes: 0, more: false });
+    assert.equal(P.cacheWaitingWords({ waiting_files: 0 }), 'empty');
+    assert.match(P.cacheWaitingWords({ waiting_files: 1, waiting_bytes: 5e6 }), /^1 file \(.*\) waiting$/);
+    assert.match(P.cacheWaitingWords({ waiting_files: 6, waiting_bytes: 54e6 }), /^6 files \(.*\) waiting$/);
+    assert.equal(P.cacheWaitingWords({ waiting_files: 2000, waiting_bytes: 1e9, waiting_more: true }), 'more than 2000 files waiting');
+    assert.equal(P.cacheWords({ when: '03:00', age_hours: 0, fill: 70, sync: true }),
+        'Every day at 03:00, every file is moved to the other disks; at once when it is more than 70% full. Then the protection is updated.');
+    assert.match(P.cacheWords({ when: '03:00', age_hours: 24, fill: 0, sync: false }), /files not changed for 24 hours is moved to the other disks\.$/);
+    assert.match(P.cacheWords({ when: '', fill: 0 }), /^Files are moved only when you press Move now/);
+});
+
+test('fast disk: what the home page tells', () => {
+    const ok = { name: 'cache', when: '03:00', fill: 70, enabled: true, total_bytes: 100, free_bytes: 90, last_status: 0 };
+    assert.deepEqual(P.cacheFindings({ caches: [ok] }), []);
+    assert.equal(P.cacheFindings({ caches: [{ ...ok, last_status: 500, last_message: 'rsync failed' }] })[0].level, 'bad');
+    // stopped by the person: not a failure
+    assert.deepEqual(P.cacheFindings({ caches: [{ ...ok, last_status: 499 }] }), []);
+    assert.match(P.cacheFindings({ caches: [{ ...ok, free_bytes: 2 }] })[0].title, /is full/);
+    assert.match(P.cacheFindings({ caches: [{ ...ok, when: '', fill: 0 }] })[0].title, /never emptied/);
+    assert.match(P.cacheFindings({ caches: [{ ...ok, enabled: false }] })[0].title, /never emptied/);
+    assert.deepEqual(P.cacheFindings({}), []);
+    // and they reach the list of the home page
+    assert.ok(P.machineFindings({ host: { caches: [{ ...ok, free_bytes: 2 }], facts: {} }, config: { notify_result: 'x' }, disks: {} }).some(f => /fast disk/.test(f.title)));
+});
+
+test('moves and sizes: the result of the jobs in words', () => {
+    assert.equal(P.moveWords({ success: true, files: 0, bytes: 0, skipped: 0 }), 'There was nothing to move.');
+    assert.match(P.moveWords({ success: true, files: 12, bytes: 3e9, skipped: 0 }), /^12 files moved \(/);
+    assert.match(P.moveWords({ success: true, files: 12, bytes: 3e9, skipped: 1 }), /1 file was left where it was/);
+    assert.match(P.moveWords({ success: true, files: 1, bytes: 10, skipped: 3 }), /3 files were left where they were/);
+    assert.equal(P.moveWords({ success: false, message: 'Stopped on request after 4 files.' }), 'Stopped on request after 4 files.');
+    assert.deepEqual(P.usageRows({ result: [{ name: '/mnt/d1', value: '100 2' }, { name: '/mnt/d2', value: '900 7' }] }),
+        [{ path: '/mnt/d2', bytes: 900, files: 7 }, { path: '/mnt/d1', bytes: 100, files: 2 }]);
+    assert.deepEqual(P.usageRows(null), []);
+});
+
+test('temperature limit: found however the configuration was parsed', () => {
+    assert.equal(P.confTempLimit([{ type: 'raw', raw: 'temp_limit 55' }]), '55');
+    assert.equal(P.confTempLimit([{ type: 'raw', raw: '  temp_limit\t48  ' }]), '48');
+    assert.equal(P.confTempLimit([{ type: 'option', key: 'temp_limit', value: '50' }]), '50');
+    assert.equal(P.confTempLimit([{ type: 'raw', raw: '# temp_limit 55' }, { type: 'raw', raw: 'temp_sleep 3' }]), '');
+    assert.equal(P.confTempLimit(null), '');
+    // saving a new limit removes the old line, whichever form it had
+    const conf = [{ type: 'raw', raw: 'temp_limit 55' }, { type: 'raw', raw: 'temp_sleep 3' }, { type: 'option', key: 'temp_limit', value: '50' }];
+    assert.deepEqual(conf.filter(e => !P.isTempLimit(e)), [{ type: 'raw', raw: 'temp_sleep 3' }]);
+});
+
+test('tour and glossary: the new words are explained', () => {
+    assert.ok(P.TOUR.length >= 4 && P.TOUR.every(s => s.title && s.text));
+    assert.ok(P.TOUR.some(s => /Advanced/.test(s.title)));
+    assert.ok(P.GLOSSARY['fast disk'] && P.GLOSSARY.mover);
+});

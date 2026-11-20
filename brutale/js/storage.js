@@ -274,8 +274,25 @@ export const StorageAPI = {
     recover: (disks, check, accept = false, forceUuid = false) => call('/recover', 'POST', { disks: disks.join(','), check, accept, force_uuid: forceUuid }),
     balance: (mountpoint, maxBytes, spread) => call('/balance', 'POST', { mountpoint, max_bytes: String(Math.round(maxBytes)), spread: String(spread) }),
     duplicates: (mountpoint) => call('/duplicates', 'POST', { mountpoint }),
+    // files moved among the disks of a pool: 'mover', 'empty' or 'move'
+    move: (o) => call('/move', 'POST', { kind: o.kind || 'move', mountpoint: o.pool, from: o.from, path: o.path || '', to: o.to || '', age_minutes: String(o.ageMinutes || 0), sync: !!o.sync }),
+    parityMove: async (parity, target) => {
+        await call('/parity_move', 'POST', { parity, target });
+        const job = await waitJob();
+        if (!job.success) throw new Error(job.message);
+        return job;
+    },
     jobStop: () => call('/job_stop', 'POST', {}),
     browse: (pool, path) => call(`/browse?pool=${encodeURIComponent(pool)}&path=${encodeURIComponent(path)}`, 'GET')
+};
+
+/** A request to the settings of the machine. */
+const hostPost = async (action, body) => {
+    const response = await fetch(`/snapraid/v1/host/${action}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    let json = null;
+    try { json = await response.json(); } catch (ignore) { /* not json */ }
+    if (!response.ok) throw new Error(json?.message || `Request failed with status ${response.status}`);
+    return json;
 };
 
 /* ------------------------------------------------------------------ */
@@ -337,7 +354,7 @@ const EXT4_FILE_MAX = 16 * 1024 ** 4;
 const defaultPoolOptions = (policy, minfree) =>
     `cache.files=off,category.create=${policy},func.getattr=newest,dropcacheonclose=false,minfreespace=${minfree},moveonenospc=true,fsname=mergerfs,allow_other`;
 
-const setOption = (options, key, value) => {
+export const setOption = (options, key, value) => {
     const list = options.split(',').filter(o => o && o !== key && !o.startsWith(key + '='));
     list.push(`${key}=${value}`);
     return list.join(',');
@@ -444,7 +461,8 @@ const renderArrayCard = (m) => {
             `${i === 0 && p.ok && p.total < largestData * 0.9 ? badge('smaller than a data disk', 'red') : ''}
              ${p.files.length > 1
                 ? `<span class="text-xs text-muted" data-tooltip="A split parity file is replaced by mounting the new disk at the same place and running Recover">split</span>`
-                : `<button class="btn btn-secondary btn-sm" data-st="replace" data-kind="parity" data-name="${escAttr(p.key)}" data-tooltip="Move this parity to another disk and rebuild it">Replace</button>`}`))),
+                : `<button class="btn btn-secondary btn-sm" data-st="parity-move" data-name="${escAttr(p.key)}" data-tooltip="Copy this parity to a larger disk, keeping the protection all the time. The old disk can then hold files.">Move to a larger disk</button>
+                   <button class="btn btn-secondary btn-sm" data-st="replace" data-kind="parity" data-name="${escAttr(p.key)}" data-tooltip="Move this parity to another disk and rebuild it">Replace</button>`}`))),
         ...m.data.map(d => row(badge('data', 'green'), d.name, d.path, d, d.removing
             ? `${badge('removing', 'orange')} <button class="btn btn-primary btn-sm" data-st="remove-finish" data-name="${escAttr(d.name)}" data-tooltip="Once the sync has completed, drop the disk from the configuration">Finish removal</button>`
             : `<button class="btn btn-secondary btn-sm" data-st="replace" data-kind="data" data-name="${escAttr(d.name)}" data-tooltip="Rebuild the content of this disk on another one">Replace</button>
@@ -982,6 +1000,12 @@ const advise = (m) => {
             'The daemon has no schedule for this array: sync and scrub run only when you start them, from here, from the command line or from your own scheduled jobs. '
             + 'To let the daemon do it, set a Maintenance Schedule in the Settings page, and remove your own jobs.');
 
+    const smallestParity = m.parity.filter(p => p.ok && p.total && p.files.length === 1).sort((a, b) => a.total - b.total)[0];
+    const bigger = smallestParity ? candidates(m).filter(c => !(c.kind === 'fs' && c.fs.mount)).find(c => usableSize(c) > smallestParity.total * 1.05) : null;
+    if (bigger)
+        add('tip', `${bigger.title} is larger than your parity disk`,
+            `A data disk larger than the parity (${size(smallestParity.total)}) cannot be protected in full. Make ${bigger.title} (${size(bigger.size)}) the new parity instead: the parity is copied over while the protection stays in place, and the old parity disk becomes free for files.`,
+            { label: 'Make it the parity', st: 'parity-move', data: { name: smallestParity.key, disk: bigger.id } });
     if (blank.length) add('tip', `${plural(blank.length, 'blank disk', 'blank disks')} available`, 'Use them to grow the array, as extra parity, or keep them as spares ready for a replacement.', { label: 'Add disks', st: 'wizard' });
     if (!m.inv.admin) add('tip', 'Read-only mode', `This page can show everything but change nothing. ${m.inv.admin_reason || ''}`);
 
@@ -1115,6 +1139,8 @@ export const loadStorage = async (view) => {
             case 'replace': replaceDisk(open.data.kind, open.data.name); break;
             case 'remove': removeDisk(open.data.name); break;
             case 'pool-create': poolCreate(); break;
+            case 'parity-move': parityMove(open.data.name, open.data.disk); break;
+            case 'cache-create': cacheCreate(); break;
         }
     }
 };
@@ -1879,6 +1905,8 @@ const replaceDisk = (kind, name) => {
     const cands = candidates(m).filter(c => !(c.kind === 'fs' && c.fs.mount));
     const fss = fsChoices(m.inv.tools || {});
     const verdict = (c, fstype) => replaceCheck(m, kind, name, c, fstype);
+    // a data disk that is still mounted in its place can be copied instead of rebuilt
+    const canCopy = kind === 'data' && entry.ok && entry.mount.target === oldPath;
 
     if (!cands.length) {
         dialog({
@@ -1906,6 +1934,31 @@ const replaceDisk = (kind, name) => {
         const check = dl.body.querySelector('#r-check').checked;
         const steps = [];
         const label = kind === 'data' ? name.slice(0, 12) : `parity${PARITY_KEYS.indexOf(name) + 1}`;
+        const copy = canCopy && dl.body.querySelector('input[name="r-how"]:checked')?.value === 'copy';
+        if (copy) {
+            // the old disk still reads: its files go straight to the new one, the parity is not needed
+            const temp = `${oldPath}-new`;
+            const newFs = c.kind === 'blank' ? fstype : c.fs.fstype;
+            if (c.kind === 'blank')
+                steps.push({
+                    title: `Format ${c.id} as ${fstype}`, detail: `${size(c.size)} · label ${label}`, danger: true,
+                    run: async () => { const res = await StorageAPI.format(c.id, fstype, label, kind, false); c.uuid = res.uuid; c.partition = res.partition; }
+                });
+            const source = () => (c.kind === 'blank' ? (c.uuid ? `UUID=${c.uuid}` : c.partition) : (c.fs.uuid ? `UUID=${c.fs.uuid}` : c.id));
+            steps.push({ title: `Mount the new disk at ${temp}, for the copy`, run: () => StorageAPI.mount(source(), temp, newFs, mountOptions(), false) });
+            steps.push({
+                title: `Copy every file from ${oldPath} to the new disk`, detail: 'rsync, owners and dates kept · the old disk is only read',
+                run: async () => {
+                    await hostPost('copy', { source: oldPath, target: temp, mirror: true });
+                    const job = await waitJob();
+                    if (!job.success) throw new Error(job.message);
+                }
+            });
+            steps.push({ title: 'Take both disks off', detail: `${temp}, ${oldPath}`, run: async () => { await StorageAPI.unmount(temp, true); await StorageAPI.unmount(oldPath, true); } });
+            steps.push({ title: `Mount the new disk at ${oldPath}, in place of the old one`, run: () => StorageAPI.mount(source(), oldPath, newFs, mountOptions()) });
+            steps.push({ title: `Record the new disk in the array`, detail: 'sync, taking the files as they are', run: () => StorageAPI.recover([name], false, true) });
+            return { steps, c, copy, ...verdict(c, fstype) };
+        }
         if (entry.ok && entry.mount.target === oldPath)
             steps.push({ title: `Unmount the old disk from ${oldPath}`, detail: entry.mount.source, run: () => StorageAPI.unmount(oldPath, true) });
         else
@@ -1930,10 +1983,21 @@ const replaceDisk = (kind, name) => {
     const dlg = dialog({
         title: `Replace ${kind === 'data' ? 'data disk' : ''} ${name}`,
         body: `
-            <p class="text-sm text-muted mb-4">
+            ${canCopy ? `
+            <div class="sp-choices mb-4">
+                <label class="sp-choice"><input type="radio" name="r-how" value="rebuild" checked><span><b>Rebuild from the parity</b> — works even when the old disk is dead. Gives back the files as they were at the last sync.</span></label>
+                <label class="sp-choice"><input type="radio" name="r-how" value="copy"><span><b>Copy from the old disk</b> — the old disk must still read. Faster, the array stays protected meanwhile, and files changed after the last sync come along too.</span></label>
+            </div>` : ''}
+            <p class="text-sm text-muted mb-4" id="r-intro-rebuild">
                 The new disk takes the place of the old one at <span class="font-mono">${escHtml(oldPath)}</span>, and SnapRAID rebuilds
                 what was on it from the other disks. Nothing changes in the configuration${entry.inPool ? ' or in the pool' : ''}.
                 If the old disk still works, leave it connected: it is only unmounted, not erased.
+            </p>
+            <p class="text-sm text-muted mb-4 hidden" id="r-intro-copy">
+                The files are copied from the old disk to the new one, then the new disk takes the place of the old one at
+                <span class="font-mono">${escHtml(oldPath)}</span>. Nothing changes in the configuration${entry.inPool ? ' or in the pool' : ''}.
+                The old disk is only read and unmounted, not erased: keep it aside until the sync at the end is done.
+                Avoid changing the files of this disk during the copy.
             </p>
             <div class="form-row">
                 <div class="form-group"><label for="r-new">New disk</label>
@@ -1943,7 +2007,7 @@ const replaceDisk = (kind, name) => {
                 <div class="form-group"><label for="r-fstype">Filesystem</label>
                     <select class="form-control" id="r-fstype">${fss.map(f => `<option>${f}</option>`).join('')}</select></div>
             </div>
-            <div class="flex items-center gap-4 ${kind === 'data' ? '' : 'hidden'}">
+            <div class="flex items-center gap-4 ${kind === 'data' ? '' : 'hidden'}" id="r-check-row">
                 <label class="switch"><input type="checkbox" id="r-check" checked><span class="slider"></span></label>
                 <label for="r-check" class="mb-0 cursor-pointer font-bold">Verify the rebuilt files before syncing</label>
             </div>
@@ -1954,7 +2018,8 @@ const replaceDisk = (kind, name) => {
                 label: 'Replace', cls: 'btn-danger', onClick: (dl) => {
                     const p = plan(dl);
                     if (!eraseOk(dl, p.steps)) { showToast('Type ERASE to confirm', 'warning'); return; }
-                    runSteps(dl, p.steps, 'The rebuild is running: follow it in Tasks. Files that cannot be recovered get the .unrecoverable extension.');
+                    runSteps(dl, p.steps, p.copy ? 'The files are on the new disk and the array is recording it: follow the sync in Tasks. The old disk was not changed: keep it aside until the sync is done.'
+                        : 'The rebuild is running: follow it in Tasks. Files that cannot be recovered get the .unrecoverable extension.');
                 }
             }
         ]
@@ -1962,8 +2027,297 @@ const replaceDisk = (kind, name) => {
     const draw = () => {
         const p = plan(dlg);
         dlg.body.querySelector('#r-plan').innerHTML = p.warnings.map(w => `<div class="text-sm text-amber mb-4">${escHtml(w)}</div>`).join('') + stepList(p.steps) + eraseConfirm(p.steps);
+        // what is said and asked follows the way chosen
+        dlg.body.querySelector('#r-intro-rebuild').classList.toggle('hidden', !!p.copy);
+        dlg.body.querySelector('#r-intro-copy').classList.toggle('hidden', !p.copy);
+        dlg.body.querySelector('#r-check-row').classList.toggle('hidden', !!p.copy || kind !== 'data');
+    };
+    dlg.body.querySelectorAll('select, input[type=checkbox], input[type=radio]').forEach(el => el.addEventListener('change', draw));
+    draw();
+};
+
+/* --- move of the parity to a larger disk --- */
+
+/**
+ * A larger disk becomes the parity, and the old parity disk is freed for
+ * files. The parity is copied, not computed again: the array is protected
+ * all the time, and the old parity is not touched until the copy is checked.
+ */
+const parityMove = (key, preferred = null) => {
+    if (!adminGuard()) return;
+    const m = state.model;
+    const single = m.parity.filter(p => p.files.length === 1 && p.ok);
+    const entry = single.find(p => p.key === key) || single[0];
+    const title = 'Move the parity to a larger disk';
+    if (!entry) {
+        dialog({ title, large: false, body: 'There is no parity made of one file on a mounted disk. A split parity is moved by mounting the new disk in place of the old one and running Recover.', buttons: [{ label: 'Close', onClick: (d) => d.close() }] });
+        return;
+    }
+    const cands = candidates(m).filter(c => !(c.kind === 'fs' && c.fs.mount));
+    const fss = fsChoices(m.inv.tools || {});
+    const fileSize = (p) => Math.max(0, (p.total || 0) - (p.free || 0));
+    const fits = (c, p) => usableSize(c) >= fileSize(p) * 1.02;
+    if (!cands.some(c => fits(c, entry))) {
+        dialog({
+            title, large: false,
+            body: cands.length ? `None of the free disks can hold the parity file (${size(fileSize(entry))}): ${cands.map(c => `${escHtml(c.title)} has ${size(c.size)}`).join(', ')}. Connect a larger disk.`
+                : 'There is no blank disk and no unmounted filesystem to move the parity to. Connect the new disk first.',
+            buttons: [{ label: 'Close', onClick: (d) => d.close() }]
+        });
+        return;
+    }
+
+    const plan = (dl) => {
+        const p = single.find(x => x.key === dl.body.querySelector('#pm-level').value) || entry;
+        const c = cands.find(x => x.id === dl.body.querySelector('#pm-new').value);
+        const fstype = dl.body.querySelector('#pm-fstype')?.value || fss[0];
+        const reuse = dl.body.querySelector('#pm-reuse').checked;
+        const oldMount = p.files[0].mount.target;
+        const oldFile = p.paths[0];
+        const level = PARITY_KEYS.indexOf(p.key) + 1;
+        const used = new Set([...m.mounts.map(x => x.target), ...(m.inv.fstab || []).map(x => x.target)]);
+        let target = `${oldMount}-2`;
+        for (let i = 3; used.has(target); ++i) target = `${oldMount}-${i}`;
+        const newFs = c.kind === 'blank' ? fstype : c.fs.fstype;
+        const warnings = [];
+        const steps = [];
+        if (!fits(c, p)) return { steps, warnings, blocked: `${c.title} is too small for the parity file of ${size(fileSize(p))}` };
+        if (c.size > EXT4_FILE_MAX && newFs === 'ext4') warnings.push('This disk is larger than 16 TiB and ext4 cannot hold a parity file that big: the space beyond is wasted. Choose xfs.');
+        if (usableSize(c) < (p.total || 0)) warnings.push(`This disk is smaller than the present parity disk (${size(usableSize(c))} against ${size(p.total)}). The parity file fits today, but it limits how much the data disks can grow.`);
+
+        if (c.kind === 'blank')
+            steps.push({
+                title: `Format ${c.id} as ${fstype} for the parity`, detail: `${size(c.size)} · label parity${level}`, danger: true,
+                run: async () => { const res = await StorageAPI.format(c.id, fstype, `parity${level}`, 'parity', false); c.uuid = res.uuid; c.partition = res.partition; }
+            });
+        steps.push({
+            title: `Mount it at ${target}, now and at every boot`,
+            run: () => StorageAPI.mount(c.kind === 'blank' ? (c.uuid ? `UUID=${c.uuid}` : c.partition) : (c.fs.uuid ? `UUID=${c.fs.uuid}` : c.id), target, newFs, mountOptions())
+        });
+        steps.push({
+            title: `Copy the parity (${size(fileSize(p))}), check the copy, then switch the array to it`,
+            detail: `${oldFile} → ${target}/ · sync and scrub wait meanwhile · the old file is not touched`,
+            run: () => StorageAPI.parityMove(p.key, target)
+        });
+        // a parity on another disk is a changed disk for the array: it's told that nothing was lost
+        steps.push({ title: 'Record the new parity disk in the array', detail: 'sync, taking the disks as they are · continues in the background', run: () => StorageAPI.recover([], false, true) });
+
+        if (reuse) {
+            // the old parity disk becomes a data disk, like in the guided setup
+            const dev = p.files[0].mount.source;
+            const names = new Set(m.data.map(d => d.name));
+            const name = nextName(names, 'disk');
+            const base = m.data.length ? dirname(m.data[0].path) : dirname(oldMount);
+            let dataTarget = `${base}/${name}`;
+            for (let i = 2; used.has(dataTarget); ++i) dataTarget = `${base}/${name}-${i}`;
+            const oldDisk = m.disks.find(d => d.filesystems.some(f => f.path === dev));
+            const whole = oldDisk && oldDisk.filesystems.length === 1 ? oldDisk.path : null;
+            const made = {};
+            if (!whole) return { steps, warnings, blocked: 'The old parity disk holds more than one filesystem, so it is not erased from here. Turn off “Then use the old parity disk for files”.' };
+            steps.push({ title: `Take the old parity disk off ${oldMount}`, detail: dev, run: () => StorageAPI.unmount(oldMount, true) });
+            steps.push({
+                title: `Format the old parity disk ${whole} as ${fstype} for data disk ${name}`, detail: 'the old parity file is erased: the array uses the new one', danger: true,
+                run: async () => { const res = await StorageAPI.format(whole, fstype, name, 'data', true); made.uuid = res.uuid; made.partition = res.partition; }
+            });
+            steps.push({ title: `Mount it at ${dataTarget}, now and at every boot`, run: () => StorageAPI.mount(made.uuid ? `UUID=${made.uuid}` : made.partition, dataTarget, fstype, mountOptions()) });
+            steps.push({
+                title: `Add ${name} to the array${m.pool ? ` and to the pool ${m.pool.mountpoint}` : ''}`, detail: m.inv.engine_conf.path,
+                run: async () => {
+                    // the configuration was changed by the copy: read it again
+                    const inv = await StorageAPI.get();
+                    const conf = parseConf(inv.engine_conf?.text || '');
+                    confInsert(conf, { type: 'data', key: 'data', name, path: dataTarget });
+                    await StorageAPI.saveConf(serializeConf(conf));
+                    if (m.pool) {
+                        const pool = (inv.pools || []).find(x => x.mountpoint === m.pool.mountpoint);
+                        const branches = (pool || m.pool).branches.map(b => `${stripSlash(b.path)}${b.mode && b.mode !== 'RW' ? `=${b.mode}` : ''}`);
+                        if (!branches.includes(dataTarget)) branches.push(dataTarget);
+                        await StorageAPI.pool(m.pool.mountpoint, branches, (pool || m.pool).fstab_options || defaultPoolOptions('pfrd', '20G'));
+                    }
+                }
+            });
+            steps.push({ title: 'Start the sync', detail: 'sync · continues in the background, follow it in Tasks', run: () => API.schedule([{ command: 'probe' }, { command: 'sync' }]) });
+        }
+        return { steps, warnings, blocked: null, reuse };
+    };
+
+    const firstFit = Math.max(0, cands.findIndex(c => (preferred ? c.id === preferred : true) && fits(c, entry)));
+    const dlg = dialog({
+        title,
+        body: `
+            <p class="text-sm text-muted mb-4">
+                The parity must be at least as large as the largest data disk. To use larger data disks, first give the parity a larger disk.
+                Here the parity is <b>copied</b> to the new disk and checked byte by byte; only then the array switches to it.
+                The protection stays in place all the time, and nothing is computed again.
+            </p>
+            <div class="form-row">
+                <div class="form-group ${single.length > 1 ? '' : 'hidden'}"><label for="pm-level">Parity</label>
+                    <select class="form-control" id="pm-level">${single.map(p => `<option value="${escAttr(p.key)}" ${p === entry ? 'selected' : ''}>${escHtml(p.key)} · ${size(p.total)} · ${escHtml(p.files[0].mount.target)}</option>`).join('')}</select></div>
+                <div class="form-group"><label for="pm-new">New disk for the parity</label>
+                    <select class="form-control" id="pm-new">
+                        ${cands.map((c, i) => `<option value="${escAttr(c.id)}" ${fits(c, entry) ? '' : 'disabled'} ${i === firstFit ? 'selected' : ''}>${escHtml(c.title)} · ${size(c.size)} · ${c.kind === 'blank' ? 'blank' : escHtml(c.sub)}${fits(c, entry) ? '' : ' (too small)'}</option>`).join('')}
+                    </select></div>
+                <div class="form-group"><label for="pm-fstype">Filesystem</label>
+                    <select class="form-control" id="pm-fstype">${fss.map(f => `<option>${f}</option>`).join('')}</select></div>
+            </div>
+            <div class="flex items-center gap-4">
+                <label class="switch"><input type="checkbox" id="pm-reuse" checked><span class="slider"></span></label>
+                <label for="pm-reuse" class="mb-0 cursor-pointer font-bold">Then use the old parity disk for files</label>
+            </div>
+            <div class="text-xs text-muted mt-1">It is formatted and added as a data disk, after the copy is checked. Off: the old disk is left as it is, with the old parity file on it.</div>
+            <div id="pm-plan" class="mt-4"></div>`,
+        buttons: [
+            { label: 'Cancel', onClick: (dl) => dl.close() },
+            {
+                label: 'Move the parity', cls: 'btn-danger', onClick: (dl) => {
+                    const p = plan(dl);
+                    if (p.blocked) { showToast(p.blocked, 'warning'); return; }
+                    if (!eraseOk(dl, p.steps)) { showToast('Type ERASE to confirm', 'warning'); return; }
+                    runSteps(dl, p.steps, p.reuse ? 'The array uses the new parity disk, and the old one is a data disk now: the sync is recording it, follow it in Tasks.'
+                        : 'The array uses the new parity disk. The old one was left as it is, unmounted or not: it can be erased and reused when you want.');
+                }
+            }
+        ]
+    });
+    const draw = () => {
+        const p = plan(dlg);
+        dlg.body.querySelector('#pm-plan').innerHTML = (p.blocked ? `<div class="text-sm text-red mb-4">${escHtml(p.blocked)}</div>` : '')
+            + p.warnings.map(w => `<div class="text-sm text-amber mb-4">${escHtml(w)}</div>`).join('')
+            + `<div class="st-effects-title">What is going to be done, in this order</div>` + stepList(p.steps) + eraseConfirm(p.steps);
     };
     dlg.body.querySelectorAll('select, input[type=checkbox]').forEach(el => el.addEventListener('change', draw));
+    draw();
+};
+
+/* --- fast disk in front of the pool --- */
+
+/**
+ * An SSD in front of the pool: new files land on it, and a mover brings
+ * them to the disks of the array later. Writing is fast and the big disks
+ * can sleep; the price is that a new file is protected only once moved.
+ */
+const cacheCreate = () => {
+    if (!adminGuard()) return;
+    const m = state.model;
+    const title = 'Add a fast disk in front of the pool';
+    const pools = m.pools.filter(p => p.branches.length);
+    // a disk already in a pool or in an array is not free
+    const pooled = new Set(m.pools.flatMap(p => p.branches.map(b => stripSlash(b.path))));
+    const cands = candidates(m).filter(c => !(c.kind === 'fs' && c.fs.mount && (c.fs.roles.length || pooled.has(stripSlash(c.fs.mount.target)))));
+    if (!pools.length || !cands.length) {
+        dialog({
+            title, large: false,
+            body: !pools.length ? 'A fast disk works in front of a pool, the folder that shows all the data disks together. Create the pool first.'
+                : 'There is no free disk to use. Connect an SSD first: it must not be part of an array.',
+            buttons: [{ label: 'Close', onClick: (d) => d.close() }]
+        });
+        return;
+    }
+    const fss = fsChoices(m.inv.tools || {});
+    // an SSD is the natural choice
+    const firstFit = Math.max(0, cands.findIndex(c => !c.disk.rotational));
+
+    const plan = (dl) => {
+        const q = (id) => dl.body.querySelector(id);
+        const c = cands.find(x => x.id === q('#fc-disk').value);
+        const pool = pools.find(x => x.mountpoint === q('#fc-pool').value);
+        const fstype = q('#fc-fstype')?.value || fss[0];
+        const hours = Math.max(0, Number(q('#fc-age').value) || 0);
+        const fill = Math.min(99, Math.max(0, Number(q('#fc-fill').value) || 0));
+        const time = q('#fc-time').value || '03:00';
+        const sync = q('#fc-sync').checked;
+        const steps = [];
+        const warnings = [];
+        const used = new Set([...m.mounts.map(x => x.target), ...(m.inv.fstab || []).map(x => x.target)]);
+        const base = m.data.length ? dirname(m.data[0].path) : '/mnt';
+        let target = c.kind === 'fs' && c.fs.mount ? c.fs.mount.target : `${base}/cache`;
+        if (!(c.kind === 'fs' && c.fs.mount)) for (let i = 2; used.has(target); ++i) target = `${base}/cache-${i}`;
+        const name = target.split('/').pop().replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 32) || 'cache';
+        if (c.disk.rotational) warnings.push('This is a spinning disk, not an SSD: it works, but it is not faster than the disks of the pool.');
+        if (c.disk.transport === 'usb') warnings.push('USB disks can disconnect under load: files waiting on it would be out of reach until it is back.');
+        if (pool.branches.some(b => stripSlash(b.path) === target)) return { steps, warnings, blocked: `${target} is already a disk of this pool` };
+
+        if (c.kind === 'blank')
+            steps.push({
+                title: `Format ${c.id} as ${fstype}`, detail: `${size(c.size)} · label ${name}`, danger: true,
+                run: async () => { const res = await StorageAPI.format(c.id, fstype, name, 'data', false); c.uuid = res.uuid; c.partition = res.partition; }
+            });
+        if (!(c.kind === 'fs' && c.fs.mount))
+            steps.push({
+                title: `Mount it at ${target}, now and at every boot`,
+                run: () => StorageAPI.mount(c.kind === 'blank' ? (c.uuid ? `UUID=${c.uuid}` : c.partition) : (c.fs.uuid ? `UUID=${c.fs.uuid}` : c.id), target, c.kind === 'blank' ? fstype : c.fs.fstype, mountOptions())
+            });
+        const before = pool.options?.['category.create'] || getOption(pool.fstab_options || '', 'category.create') || 'pfrd';
+        const branches = [target, ...pool.branches.map(b => `${stripSlash(b.path)}${b.mode && b.mode !== 'RW' ? `=${b.mode}` : ''}`)];
+        const options = setOption(pool.fstab_options || defaultPoolOptions('ff', '20G'), 'category.create', 'ff');
+        steps.push({
+            title: `Put it first in the pool ${pool.mountpoint}`, detail: `new files go to the first disk with room (policy ff, it was ${before})`,
+            run: () => StorageAPI.pool(pool.mountpoint, branches, options)
+        });
+        steps.push({
+            title: `Move its files to the other disks every day at ${time}`,
+            detail: `${hours ? `files not changed for ${hours} hours` : 'every file'}${fill ? ` · at once when ${fill}% full` : ''}${sync ? ' · then update the protection' : ''}`,
+            run: () => hostPost('cache_save', { name, pool: pool.mountpoint, branch: target, age_hours: String(hours), fill: String(fill), when: time, sync, enabled: true, policy: /^[A-Za-z0-9_-]+$/.test(before) ? before : 'pfrd' })
+        });
+        return { steps, warnings, blocked: null };
+    };
+
+    const dlg = dialog({
+        title,
+        body: `
+            <p class="text-sm text-muted mb-4">
+                New files are written to the fast disk first, so copying to the server is quick and the big disks can stay asleep.
+                Every night the files are moved to the disks of the array, at the same place in the pool: nobody using the pool sees a difference.
+            </p>
+            <div class="restricted-banner mb-4"><div class="restricted-banner-title">Good to know</div>
+                A file waiting on the fast disk is <b>not protected by the parity</b> until it is moved. If the fast disk fails before, the files still on it are lost.</div>
+            <div class="form-row">
+                <div class="form-group"><label for="fc-disk">Fast disk</label>
+                    <select class="form-control" id="fc-disk">${cands.map((c, i) => `<option value="${escAttr(c.id)}" ${i === firstFit ? 'selected' : ''}>${escHtml(c.title)} · ${size(c.size)} · ${c.disk.rotational ? 'spinning disk' : 'SSD'} · ${c.kind === 'blank' ? 'blank' : escHtml(c.sub)}</option>`).join('')}</select></div>
+                <div class="form-group"><label for="fc-pool">In front of the pool</label>
+                    <select class="form-control" id="fc-pool">${pools.map(p => `<option value="${escAttr(p.mountpoint)}" ${p === m.pool ? 'selected' : ''}>${escHtml(p.mountpoint)}</option>`).join('')}</select></div>
+            </div>
+            <div class="form-row">
+                <div class="form-group"><label for="fc-time">Move the files every day at</label>
+                    <input class="form-control" type="time" id="fc-time" value="03:00">
+                    <div class="text-xs text-muted mt-1">Best a little before the automatic protection, so the moved files are protected the same night.</div></div>
+            </div>
+            <details class="sp-more"><summary>Advanced</summary>
+                <div class="form-row mt-2">
+                    <div class="form-group"><label for="fc-age">Leave the files changed in the last</label>
+                        <div class="flex items-center gap-2"><input class="form-control" type="number" min="0" max="8760" id="fc-age" value="0"> <span>hours</span></div>
+                        <div class="text-xs text-muted mt-1">0: move everything. More: recent files stay on the fast disk, quick to open.</div></div>
+                    <div class="form-group"><label for="fc-fill">Move at once when it is fuller than</label>
+                        <div class="flex items-center gap-2"><input class="form-control" type="number" min="0" max="99" id="fc-fill" value="70"> <span>%</span></div>
+                        <div class="text-xs text-muted mt-1">0: only at the set time. When the fast disk is full, new files go straight to the other disks.</div></div>
+                    <div class="form-group"><label for="fc-fstype">Filesystem</label>
+                        <select class="form-control" id="fc-fstype">${fss.map(f => `<option>${f}</option>`).join('')}</select></div>
+                </div>
+                <div class="flex items-center gap-4">
+                    <label class="switch"><input type="checkbox" id="fc-sync" checked><span class="slider"></span></label>
+                    <label for="fc-sync" class="mb-0 cursor-pointer font-bold">Update the protection right after the move</label>
+                </div>
+            </details>
+            <div id="fc-plan" class="mt-4"></div>`,
+        buttons: [
+            { label: 'Cancel', onClick: (dl) => dl.close() },
+            {
+                label: 'Add the fast disk', cls: 'btn-primary', onClick: (dl) => {
+                    const p = plan(dl);
+                    if (p.blocked) { showToast(p.blocked, 'warning'); return; }
+                    if (!eraseOk(dl, p.steps)) { showToast('Type ERASE to confirm', 'warning'); return; }
+                    runSteps(dl, p.steps, 'Done. New files of the pool now land on the fast disk, and are moved to the array at the time you set. See it in Disks.');
+                }
+            }
+        ]
+    });
+    const draw = () => {
+        const p = plan(dlg);
+        dlg.body.querySelector('#fc-plan').innerHTML = (p.blocked ? `<div class="text-sm text-red mb-4">${escHtml(p.blocked)}</div>` : '')
+            + p.warnings.map(w => `<div class="text-sm text-amber mb-4">${escHtml(w)}</div>`).join('')
+            + `<div class="st-effects-title">What is going to be done, in this order</div>` + stepList(p.steps) + eraseConfirm(p.steps);
+    };
+    dlg.body.querySelectorAll('select, input').forEach(el => el.addEventListener('change', draw));
     draw();
 };
 
@@ -2428,6 +2782,7 @@ export const initStorage = () => {
             case 'mount': mountFs(ds.device); break;
             case 'unmount': unmountFs(ds.target); break;
             case 'replace': replaceDisk(ds.kind, ds.name); break;
+            case 'parity-move': parityMove(ds.name); break;
             case 'remove': removeDisk(ds.name); break;
             case 'remove-finish': removeFinish(ds.name); break;
             case 'pool-create': poolCreate(); break;
