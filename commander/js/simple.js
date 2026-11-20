@@ -56,6 +56,9 @@ export const HostAPI = {
     cacheRun: (name) => hostCall('/cache_run', 'POST', { name }),
     usage: (path) => hostCall('/usage', 'POST', { path }),
     surface: (device) => hostCall('/surface', 'POST', { device }),
+    keepSave: (k) => hostCall('/keep_save', 'POST', k),
+    keepDelete: (name) => hostCall('/keep_delete', 'POST', { name }),
+    keepRun: (name) => hostCall('/keep_run', 'POST', { name }),
     wol: () => hostCall('/wol', 'POST', {}),
     restore: (path, text) => hostCall('/restore', 'POST', { path, text })
 };
@@ -442,6 +445,9 @@ const loadFiles = async () => {
         return;
     }
 
+    S.cache.keeps = (await HostAPI.status().catch(() => null))?.keeps || [];
+    const keepsHere = S.cache.keeps.filter(k => k.pool === pool);
+    const diskNameOf = (path) => (model?.data || []).find(x => x.path.replace(/\/+$/, '') === path)?.name || path.split('/').pop();
     const diskOf = (i) => {
         const b = list.branches[i];
         const data = (model?.data || []).find(x => x.path && b && (x.path.replace(/\/+$/, '') === b.replace(/\/+$/, '')));
@@ -477,14 +483,19 @@ const loadFiles = async () => {
                             <button class="btn btn-sm btn-secondary" data-sp="file-check" data-path="${escAttr(rel)}" data-dir="${e.dir ? 1 : 0}" data-tooltip="Compare with what the protection saved">Check</button>
                             <button class="btn btn-sm btn-secondary" data-sp="file-copy" data-path="${escAttr(full)}" data-dir="${e.dir ? 1 : 0}" data-tooltip="Copy it to another disk, like a USB disk">Copy to…</button>
                             ${e.dir ? `<button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-usage" data-path="${escAttr(full)}" data-tooltip="How big it is, and how much of it is on each disk">Size…</button>
-                            <button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-move" data-rel="${escAttr(rel)}" data-on="${escAttr(JSON.stringify((e.on || []).map(i => list.branches[i])))}" data-tooltip="Bring the whole folder to one disk. Its place in ${escAttr(pool)} does not change.">Move to a disk…</button>` : ''}
+                            <button class="btn btn-sm btn-secondary sp-adv-only" data-sp="file-move" data-rel="${escAttr(rel)}" data-on="${escAttr(JSON.stringify((e.on || []).map(i => list.branches[i])))}" data-tooltip="Choose the disks this folder lives on, now and for the files to come. Its place in ${escAttr(pool)} does not change.">Disks…</button>` : ''}
                             <button class="btn btn-sm btn-secondary" data-sp="file-rename" data-path="${escAttr(full)}">Rename</button>
                             <button class="btn btn-sm btn-secondary sp-danger-text" data-sp="file-delete" data-path="${escAttr(full)}" data-rel="${escAttr(rel)}" data-dir="${e.dir ? 1 : 0}">Delete</button>
                         </span>
                     </div>`;
                 }).join('')}
             </div>` : empty('This folder is empty.')}
-            <div class="sp-adv-only sp-adv-note">Advanced is on: folders also show <b>Size…</b> (how much of it is on each disk) and <b>Move to a disk…</b> (keep a folder together on one disk, so only that disk wakes up).</div>`), advSwitch('files'))}
+            <div class="sp-adv-only sp-adv-note">Advanced is on: folders also show <b>Size…</b> (how much of it is on each disk) and <b>Disks…</b> (choose the disks a folder lives on, and keep it there).</div>
+            ${keepsHere.length ? `<div class="sp-adv-only mt-4"><div class="sp-field-label">Folders kept on chosen disks</div>
+                <div class="sp-rows">${keepsHere.map(k => `
+                    <div class="sp-row"><div class="sp-row-main"><div class="sp-row-title font-mono">${esc(k.path)}</div>
+                        <div class="sp-row-text">${esc(P.keepWords(k, diskNameOf))}${k.last_time ? ` Last time, ${esc(P.humanSpan(Date.now() / 1000 - k.last_time))} ago: ${esc(k.last_message || '')}` : ''}</div></div>
+                        <div class="flex gap-2">${button('Tidy now', 'keep-run', { name: k.name })}${button('Change', 'file-move', { rel: k.path, on: '[]', pool })}${button('Stop keeping', 'keep-delete', { name: k.name })}</div></div>`).join('')}</div></div>` : ''}`), advSwitch('files'))}
     `);
     S.cache.filesList = list;
 };
@@ -663,36 +674,63 @@ const folderUsage = async (full) => {
     }
 };
 
-/** Bring a folder of the pool to one disk. */
-const fileMove = (rel, on) => {
-    const pool = S.cache.pool;
-    const list = S.cache.filesList;
+/** The disks behind a folder of a pool: where it is, where it should be, and if it stays there. */
+const fileMove = async (rel, on, pool = S.cache.pool) => {
     const model = S.cache.filesModel;
     const inv = S.cache.filesInv;
-    const branches = (inv?.pools || []).find(p => p.mountpoint === pool)?.branches || [];
+    const branches = ((inv?.pools || []).find(p => p.mountpoint === pool)?.branches || []).map(b => ({ ...b, path: b.path.replace(/\/+$/, '') }));
     const diskName = (path) => (model?.data || []).find(x => x.path.replace(/\/+$/, '') === path.replace(/\/+$/, ''))?.name || path.split('/').pop();
-    const targets = branches.filter(b => (b.mode || 'RW') === 'RW' && !(on.length === 1 && on[0] === b.path));
-    if (!list || !targets.length) return showToast('There is no other disk in this pool to move it to', 'warning');
+    const fast = new Set(((await HostAPI.status().catch(() => null))?.caches || []).map(c => c.branch));
+    const targets = branches.filter(b => (b.mode || 'RW') === 'RW' && !fast.has(b.path));
+    if (targets.length < 2) return showToast('This pool has one disk only: there is nothing to choose', 'warning');
+    const keeps = S.cache.keeps || [];
+    const kept = P.keepOf(keeps, pool, rel);
+    const chosenNow = kept ? String(kept.disks).split(':') : (on.length === 1 ? on : []);
+    const plan = kept ? P.parseSchedule(kept.when)[0] : null;
+    const short = rel.split('/').pop();
     dialog({
-        title: `Move ${rel.split('/').pop()} to one disk`, large: false,
-        body: `
-            <p class="text-sm mb-4">Now on: <b>${esc(on.map(diskName).join(', ') || '–')}</b>. Everybody keeps finding it at <span class="font-mono">${esc(pool + rel)}</span>: only the disk behind it changes.</p>
-            ${field('To the disk', `<select class="form-control" id="sp-mv-to">${targets.map(b => `<option value="${escAttr(b.path)}">${esc(diskName(b.path))} — ${P.bytes(b.free_bytes)} free${b.protected === false ? ' (not protected)' : ''}</option>`).join('')}</select>`)}
-            <div class="st-effects"><div class="st-effects-title">What happens</div><ul>
-                <li>The files of this folder on the other disks are moved to the chosen one.</li>
+        title: `Disks for ${short}`, large: false,
+        body: advScope('keep', `
+            <p class="text-sm mb-4">Now on: <b>${esc(on.map(diskName).join(', ') || '–')}</b>. Everybody keeps finding it at <span class="font-mono">${esc(pool + rel)}</span>: only the disks behind it change.</p>
+            <div class="sp-field-label">It should live on</div>
+            <div class="sp-choices">
+                ${targets.map(b => `<label class="sp-choice"><input type="checkbox" name="sp-mv-to" value="${escAttr(b.path)}" ${chosenNow.includes(b.path) ? 'checked' : ''}><span><b>${esc(diskName(b.path))}</b> — ${P.bytes(b.free_bytes)} free${b.protected === false ? ' · not protected' : ''}${on.includes(b.path) ? ' · has some of it now' : ''}</span></label>`).join('')}
+            </div>
+            <div class="sp-field-help">One disk keeps it together, so only that disk wakes up. More disks give it more room.</div>
+            <div class="mt-4">${toggle('sp-mv-keep', !!kept, 'Keep it there from now on', 'New files can land on another disk at first: every night they are brought back to the chosen disks. Off: only what is there now is moved.')}</div>
+            <div class="sp-adv-only">
+                <div class="sp-form-row mt-2"><span class="sp-field-label">Bring new files back every day at</span><input class="form-control sp-w-auto" type="time" id="sp-mv-time" value="${plan ? `${String(plan.hour).padStart(2, '0')}:${String(plan.minute).padStart(2, '0')}` : '04:00'}"></div>
+                <div class="sp-field-help">A little before the automatic protection is best, so what was moved is protected the same night.</div>
+            </div>
+            <div class="st-effects mt-4"><div class="st-effects-title">What happens</div><ul>
+                <li>What of this folder is on the other disks is moved to the chosen ones.</li>
                 <li>For the protection, moved files are new on one disk and gone from another: it is updated at its next run.</li></ul></div>
             <div class="st-effects st-effects-safe"><div class="st-effects-title">What does not change</div><ul>
-                <li>A file is removed from the old disk only after it was copied whole. No file is overwritten.</li></ul></div>`,
+                <li>A file is removed from the old disk only after it was copied whole. No file is overwritten.</li></ul></div>
+            <div class="mt-4">${advSwitch('keep')}</div>`),
         buttons: [
             { label: 'Cancel', onClick: (x) => x.close() },
             {
-                label: 'Move', cls: 'btn-primary', onClick: async (x) => {
-                    const to = val('sp-mv-to');
-                    const from = on.filter(b => b !== to);
+                label: 'Save', cls: 'btn-primary', onClick: async (x) => {
+                    const to = [...x.body.querySelectorAll('input[name="sp-mv-to"]:checked')].map(i => i.value);
+                    const keep = checked('sp-mv-keep');
+                    if (!to.length) return showToast('Choose at least one disk', 'warning');
+                    if (to.length === targets.length && keep) return showToast('With every disk chosen there is nothing to keep: choose fewer, or turn off “Keep it there”', 'warning');
+                    const from = on.filter(b => !to.includes(b));
+                    try {
+                        if (keep)
+                            await HostAPI.keepSave({ name: kept?.name || P.keepName(rel, keeps.map(k => k.name)), pool, path: rel, disks: to.join(':'), when: val('sp-mv-time') || '04:00', enabled: true });
+                        else if (kept)
+                            await HostAPI.keepDelete(kept.name);
+                    } catch (e) { return showToast(e.message, 'error'); }
                     x.close();
-                    if (!from.length) return showToast('It is already all on that disk', 'info');
-                    if (await act(() => StorageAPI.move({ kind: 'move', pool, from: from.join(':'), path: rel, to })))
-                        followJob(`Moving ${rel.split('/').pop()}`, {
+                    if (keep) {
+                        const back = P.keepOf((await HostAPI.status()).keeps, pool, rel);
+                        if (back) showToast(`Saved and checked: ${P.keepWords(back, diskName)}`, 'success');
+                    }
+                    if (!from.length) { if (!keep) showToast(kept ? 'It is no longer kept on chosen disks. Nothing was moved.' : 'It is already all on the chosen disks', 'info'); refresh(); return; }
+                    if (await act(() => StorageAPI.move({ kind: 'move', pool, from: from.join(':'), path: rel, to: to.join(':') })))
+                        followJob(`Moving ${short}`, {
                             next: (job) => (job.success && job.files ? {
                                 label: 'Update the protection now',
                                 note: 'The moved files are protected again once the protection is updated: now, or at its next automatic run.',
@@ -703,6 +741,20 @@ const fileMove = (rel, on) => {
             }
         ]
     });
+};
+
+/** The same for a folder given with its whole path, as a share: find its pool and where it is now. */
+const folderDisks = async (full) => {
+    const pools = (S.cache.filesInv?.pools || []).map(p => p.mountpoint).sort((a, b) => b.length - a.length);
+    const pool = pools.find(p => full.startsWith(p + '/'));
+    if (!pool) return showToast('This folder is not in a pool: it lives on one disk already', 'info');
+    const rel = full.slice(pool.length);
+    try {
+        const parent = rel.slice(0, rel.lastIndexOf('/')) || '/';
+        const list = await StorageAPI.browse(pool, parent);
+        const e = (list.entries || []).find(x => x.name === rel.split('/').pop());
+        fileMove(rel, (e?.on || []).map(i => list.branches[i].replace(/\/+$/, '')), pool);
+    } catch (e) { showToast(e.message, 'error'); }
 };
 
 /* ------------------------------------------------------------------ */
@@ -877,6 +929,7 @@ const loadDrives = async () => {
                         <ul class="sp-card-facts">
                             <li>${waiting ? '<b>The files waiting here are not protected yet</b>: they are once moved to the big disks and the protection is updated.' : 'Nothing is waiting: every file is on the big disks.'}</li>
                             <li>${esc(P.cacheWords(c))}${next ? ` Next: ${esc(P.whenWords(next))}.` : ''}</li>
+                            ${c.stay ? `<li>Never moved, and never protected: <span class="font-mono">${esc(String(c.stay).split(':').join(', '))}</span></li>` : ''}
                             <li>${c.last_time ? `<span class="${lastOk ? 'text-emerald' : 'text-red'}">${lastOk ? 'Last move worked' : 'Last move did not finish'}</span>, ${esc(P.humanSpan(Date.now() / 1000 - c.last_time))} ago: ${esc(c.last_message || '')}` : 'Never moved yet'}</li>
                         </ul>
                         <div class="sp-card-actions">
@@ -1027,24 +1080,51 @@ const diskBusy = async (path) => {
     } catch (e) { showToast(e.message, 'error'); }
 };
 
-/** Move everything on a disk to the other disks of its pool. */
-const diskEmpty = async (path, name, pool) => {
-    const ok = await confirmDo({
-        title: `Empty ${name}`,
-        intro: `Every file on <span class="font-mono">${esc(path)}</span> is moved to the other disks of <span class="font-mono">${esc(pool)}</span>, to the one with most room each time.`,
-        effects: ['It can take hours. You can stop it: what was moved stays moved, the rest stays here.', 'For the protection, moved files are new on one disk and gone from another: update it when the move is done. Until then, do not take the disk away.'],
-        safe: [`Everybody keeps finding the files at the same place in ${esc(pool)}.`, 'A file is removed from this disk only after it was copied whole. No file is overwritten: files that do not fit, or that exist already on another disk, are left here and listed.'],
-        label: 'Empty it'
-    });
-    if (!ok) return;
-    if (!await act(() => StorageAPI.move({ kind: 'empty', pool, from: path }))) return;
-    // a disk that lost all its files makes the protection stop and ask: here the answer is known
-    await followJob(`Emptying ${name}`, {
-        next: (job) => (job.success && job.files ? {
-            label: 'Update the protection now',
-            note: `<b>One more step.</b> The protection has to be updated, and told that ${esc(name)} was emptied on purpose: without this, the next automatic update stops and asks, as it does when a disk fails to mount. No file is changed. After it, ${esc(name)} can be taken out of the array (Advanced → Storage → Remove).`,
-            run: () => act(() => API.schedule([{ command: 'sync', args: ['-E'] }]), 'Updating the protection: the progress is on Home')
-        } : null)
+/** Move everything on a disk to the other disks of its pool, and if asked take it out of the array. */
+const diskEmpty = (path, name, pool) => {
+    dialog({
+        title: `Empty ${name}`, large: false,
+        body: `
+            <p class="text-sm mb-4">Every file on <span class="font-mono">${esc(path)}</span> is moved to the other disks of <span class="font-mono">${esc(pool)}</span>, to the one with most room each time.</p>
+            <div class="sp-field-label">And then</div>
+            <div class="sp-choices">
+                <label class="sp-choice"><input type="radio" name="sp-em-then" value="out" checked><span><b>Take it out of the array</b> — to unplug it, or use it for something else. You confirm once more when it is empty.</span></label>
+                <label class="sp-choice"><input type="radio" name="sp-em-then" value="stay"><span><b>Leave it in the array, empty</b> — it fills up again with new files.</span></label>
+            </div>
+            <div class="st-effects mt-4"><div class="st-effects-title">What happens</div><ul>
+                <li>It can take hours. You can stop it: what was moved stays moved, the rest stays here.</li>
+                <li>Until the protection is updated at the end, do not take the disk away.</li></ul></div>
+            <div class="st-effects st-effects-safe"><div class="st-effects-title">What does not change</div><ul>
+                <li>Everybody keeps finding the files at the same place in ${esc(pool)}.</li>
+                <li>A file is removed from this disk only after it was copied whole. No file is overwritten: files that do not fit, or that exist already on another disk, are left here and listed.</li></ul></div>`,
+        buttons: [
+            { label: 'Cancel', onClick: (x) => x.close() },
+            {
+                label: 'Empty it', cls: 'btn-primary', onClick: async (x) => {
+                    const out = x.body.querySelector('input[name="sp-em-then"]:checked').value === 'out';
+                    x.close();
+                    if (!await act(() => StorageAPI.move({ kind: 'empty', pool, from: path }))) return;
+                    await followJob(`Emptying ${name}`, {
+                        next: (job) => {
+                            if (!job.success) return null;
+                            if (out && !job.skipped)
+                                return {
+                                    label: 'Take it out of the array',
+                                    note: `<b>${esc(name)} is empty.</b> Next it leaves the pool and the array: the protection is updated so it forgets the disk, then the disk is deleted from the configuration. Nothing is erased, and the other disks are not touched.`,
+                                    run: async () => storageOpen('array', 'remove-emptied', { name })
+                                };
+                            const twins = (job.result || []).some(r => /already on another disk/.test(r.value || ''));
+                            // a disk that lost its files makes the protection stop and ask: here the answer is known
+                            return job.files ? {
+                                label: 'Update the protection now',
+                                note: `${out ? `<b>${esc(name)} is not empty yet</b>, so it stays in the array: see above what was left and why, then empty it again. ${twins ? 'A file “already on another disk” exists twice with the same name: decide which copy to keep (Advanced → Storage → Pool → Find duplicates), delete the other, and empty the disk again. ' : ''}` : '<b>One more step.</b> '}The protection has to be updated, and told that ${esc(name)} was emptied on purpose: without this, the next automatic update stops and asks, as it does when a disk fails to mount. No file is changed.`,
+                                run: () => act(() => API.schedule([{ command: 'sync', args: ['-E'] }]), 'Updating the protection: the progress is on Home')
+                            } : null;
+                        }
+                    });
+                }
+            }
+        ]
     });
 };
 
@@ -1065,6 +1145,9 @@ const cacheEdit = (name) => {
                 <div class="sp-form-row mt-2"><span class="sp-field-label">Move at once when it is fuller than</span><input class="form-control sp-num" type="number" min="0" max="99" id="sp-fc-fill" value="${Number(c.fill) || 0}"><span>%</span></div>
                 <div class="sp-field-help">0: only at the set time. A full fast disk sends new files straight to the big disks.</div>
                 <div class="mt-2">${toggle('sp-fc-sync', c.sync !== false, 'Update the protection right after the move', 'Off: the moved files are protected at the next automatic update.')}</div>
+                <div class="mt-4"><div class="sp-field-label">Folders that stay on the fast disk</div>
+                    <textarea class="form-control font-mono" id="sp-fc-stay" rows="3" placeholder="/Downloads/in-progress">${esc(String(c.stay || '').split(':').filter(Boolean).join('\n'))}</textarea>
+                    <div class="sp-field-help">One for each line, as seen inside <span class="font-mono">${esc(c.pool)}</span>. Their files are never moved to the big disks, so they are <b>never protected</b>: only for things you can lose, like downloads in progress.</div></div>
             </div>
             <div class="mt-4">${advSwitch('cache')}</div>`),
         buttons: [
@@ -1073,6 +1156,9 @@ const cacheEdit = (name) => {
                 label: 'Save', cls: 'btn-primary', onClick: async (x) => {
                     const body = { name, pool: c.pool, branch: c.branch, age_hours: String(Math.max(0, Number(val('sp-fc-age')) || 0)), fill: String(Math.min(99, Math.max(0, Number(val('sp-fc-fill')) || 0))), when: val('sp-fc-time') || '03:00', sync: checked('sp-fc-sync'), enabled: checked('sp-fc-on') };
                     if (c.policy) body.policy = c.policy;
+                    const stay = val('sp-fc-stay').split('\n').map(l => l.trim().replace(/\/+$/, '')).filter(Boolean);
+                    if (stay.some(l => !l.startsWith('/') || l.includes(':'))) return showToast('A folder that stays starts with / and has no colon, like /Downloads', 'warning');
+                    body.stay = stay.join(':');
                     try {
                         const r = await HostAPI.cacheSave(body);
                         void r;
@@ -1359,7 +1445,7 @@ const loadSharing = async () => {
     header(button('Share a folder', 'share-edit', {}, 'btn-primary'));
 
     draw(`
-        ${smbMissing ? `<div class="restricted-banner"><div class="restricted-banner-title">Samba is not installed</div>Shares can be set up here, but other computers can open them only once the samba package is installed on this machine.</div>` : ''}
+        ${smbMissing ? `<div class="restricted-banner"><div class="restricted-banner-title">Samba is not installed</div>Shares can be set up here, but other computers can open them only once Samba is installed on this machine. On the server, run: <span class="font-mono">sudo apt install samba</span> — then reload this page.</div>` : ''}
 
         ${section('Shared folders', `A ${term('share')} is a folder the other computers of your home can open, like a disk of their own.`, shares.length ? `
             <div class="sp-cards">
@@ -1381,6 +1467,7 @@ const loadSharing = async () => {
                         <div class="sp-card-actions">
                             ${button('Change', 'share-edit', { name: s.name })}
                             ${button('Size…', 'file-usage', { path: s.path })}
+                            ${button('Disks…', 'folder-disks', { path: s.path })}
                             ${button('Fix permissions', 'share-perms', { path: s.path })}
                             ${button('Stop sharing', 'share-delete', { name: s.name }, 'btn-danger')}
                         </div>
@@ -1792,7 +1879,8 @@ const GUIDES = [
     ['A computer cannot open a share', 'On Sharing, check the address shown under the share and who can open it. The person must use the name and password set on the Sharing page, not the one of this machine.', 'sharing'],
     ['Copying to the server is slow, or the disks never sleep', 'Add a fast disk: an SSD that takes the new files first. Every night they are moved to the big disks, which can sleep the rest of the day. On Disks, see “Fast disk”. Files waiting on the fast disk are not protected until moved.', 'drives'],
     ['I want to use bigger disks', 'The protection disk must be at least as big as the biggest disk for files. So the first bigger disk you buy becomes the protection disk: on Disks, turn on Advanced and use “Move to a larger disk…” on the protection disk. The old one is then free for files.', 'drives'],
-    ['I want to take a disk out', 'On Disks, turn on Advanced and use “Empty it…”: its files move to the other disks, at the same place in your folders. Then update the protection, and remove the disk from the array.', 'drives'],
+    ['I want to take a disk out', 'On Disks, turn on Advanced and use “Empty it…”: its files move to the other disks, at the same place in your folders. When it is empty, one more click takes it out of the array. Nothing on the disk is erased.', 'drives'],
+    ['I want a folder to stay on one disk', 'For example your photos on a single disk, so only that disk wakes up when you look at them. On My files, turn on Advanced and use “Disks…” on the folder: choose the disk and turn on “Keep it there from now on”. New files that land elsewhere are brought back every night. Shares have the same button.', 'files'],
     ['I want messages on my phone', 'On Alerts, pick “Phone notification (ntfy)”, choose a secret topic, and subscribe to it in the ntfy app.', 'alerts']
 ];
 
@@ -1879,7 +1967,18 @@ export const initSimple = () => {
             case 'adv': advToggle(ds.id); break;
             case 'tour': tour(); break;
             case 'file-usage': folderUsage(ds.path); break;
-            case 'file-move': { let on = []; try { on = JSON.parse(ds.on || '[]'); } catch (ignore) { /* none */ } fileMove(ds.rel, on); break; }
+            case 'file-move': {
+                let on = [];
+                try { on = JSON.parse(ds.on || '[]'); } catch (ignore) { /* none */ }
+                if (ds.pool) folderDisks(ds.pool + ds.rel); else fileMove(ds.rel, on.map(b => b.replace(/\/+$/, '')));
+                break;
+            }
+            case 'folder-disks': folderDisks(ds.path); break;
+            case 'keep-run': if (await act(() => HostAPI.keepRun(ds.name))) followJob('Bringing the files back to their disks'); break;
+            case 'keep-delete':
+                if (await confirmDo({ title: 'Stop keeping this folder on chosen disks', effects: ['New files stay on whatever disk they land on.'], safe: ['No file is moved or deleted.'], label: 'Stop keeping' })
+                    && await act(() => HostAPI.keepDelete(ds.name), 'No longer kept on chosen disks')) refresh();
+                break;
             case 'disk-empty': diskEmpty(ds.path, ds.name, ds.pool); break;
             case 'cache-edit': cacheEdit(ds.name); break;
             case 'cache-run': if (await act(() => HostAPI.cacheRun(ds.name))) followJob(`Moving the files of the fast disk ${ds.name}`); break;

@@ -383,6 +383,30 @@ export const cacheFindings = (host) => {
     return out;
 };
 
+/* ------------------------------------------------------------------ */
+/* folders kept on chosen disks                                        */
+/* ------------------------------------------------------------------ */
+
+/** A name for the setting of a folder kept on chosen disks, not yet taken. */
+export const keepName = (rel, taken = []) => {
+    const base = (String(rel || '').split('/').filter(Boolean).pop() || 'folder').replace(/[^A-Za-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 28) || 'folder';
+    let name = base;
+    for (let i = 2; taken.includes(name); ++i) name = `${base}-${i}`;
+    return name;
+};
+
+/** The setting of a folder, if it has one: same pool and same path. */
+export const keepOf = (keeps, pool, rel) => (keeps || []).find(k => k.pool === pool && k.path === rel) || null;
+
+/** What keeping a folder on its disks means, in one sentence. */
+export const keepWords = (k, diskName = (p) => p.split('/').pop()) => {
+    const disks = String(k.disks || '').split(':').filter(Boolean).map(diskName);
+    const list = disks.length > 1 ? `${disks.slice(0, -1).join(', ')} and ${disks[disks.length - 1]}` : disks[0] || '–';
+    if (k.enabled === false || !k.when) return `Chosen: ${list}. Nothing is brought back by itself: use Tidy now.`;
+    const when = describeSchedule(k.when);
+    return `Kept on ${list}. New files that land on another disk are brought back ${when.charAt(0).toLowerCase()}${when.slice(1)}.`;
+};
+
 /** How a folder is spread over the disks, from the result of the 'usage' job. */
 export const usageRows = (job) => (job?.result || []).map(r => {
     const [b, f] = String(r.value || '').split(' ');

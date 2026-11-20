@@ -276,8 +276,8 @@ export const StorageAPI = {
     duplicates: (mountpoint) => call('/duplicates', 'POST', { mountpoint }),
     // files moved among the disks of a pool: 'mover', 'empty' or 'move'
     move: (o) => call('/move', 'POST', { kind: o.kind || 'move', mountpoint: o.pool, from: o.from, path: o.path || '', to: o.to || '', age_minutes: String(o.ageMinutes || 0), sync: !!o.sync }),
-    parityMove: async (parity, target) => {
-        await call('/parity_move', 'POST', { parity, target });
+    parityMove: async (parity, target, part = 0) => {
+        await call('/parity_move', 'POST', { parity, target, part: String(part) });
         const job = await waitJob();
         if (!job.success) throw new Error(job.message);
         return job;
@@ -459,10 +459,10 @@ const renderArrayCard = (m) => {
     const rows = [
         ...m.parity.flatMap(p => p.files.map((f, i) => row(badge('parity', 'purple'), p.files.length > 1 ? `${p.key} ${i + 1}/${p.files.length}` : p.key, f.path, f,
             `${i === 0 && p.ok && p.total < largestData * 0.9 ? badge('smaller than a data disk', 'red') : ''}
-             ${p.files.length > 1
-                ? `<span class="text-xs text-muted" data-tooltip="A split parity file is replaced by mounting the new disk at the same place and running Recover">split</span>`
-                : `<button class="btn btn-secondary btn-sm" data-st="parity-move" data-name="${escAttr(p.key)}" data-tooltip="Copy this parity to a larger disk, keeping the protection all the time. The old disk can then hold files.">Move to a larger disk</button>
-                   <button class="btn btn-secondary btn-sm" data-st="replace" data-kind="parity" data-name="${escAttr(p.key)}" data-tooltip="Move this parity to another disk and rebuild it">Replace</button>`}`))),
+             ${`<button class="btn btn-secondary btn-sm" data-st="parity-move" data-name="${escAttr(p.key)}" data-part="${p.files.length > 1 ? i + 1 : 0}" data-tooltip="Copy this parity to a larger disk, keeping the protection all the time. The old disk can then hold files.">Move to a larger disk</button>
+                   ${p.files.length > 1
+                ? `<span class="text-xs text-muted" data-tooltip="A lost file of a split parity is replaced by mounting the new disk at the same place and running Recover">split</span>`
+                : `<button class="btn btn-secondary btn-sm" data-st="replace" data-kind="parity" data-name="${escAttr(p.key)}" data-tooltip="Move this parity to another disk and rebuild it">Replace</button>`}`}`))),
         ...m.data.map(d => row(badge('data', 'green'), d.name, d.path, d, d.removing
             ? `${badge('removing', 'orange')} <button class="btn btn-primary btn-sm" data-st="remove-finish" data-name="${escAttr(d.name)}" data-tooltip="Once the sync has completed, drop the disk from the configuration">Finish removal</button>`
             : `<button class="btn btn-secondary btn-sm" data-st="replace" data-kind="data" data-name="${escAttr(d.name)}" data-tooltip="Rebuild the content of this disk on another one">Replace</button>
@@ -1141,6 +1141,7 @@ export const loadStorage = async (view) => {
             case 'pool-create': poolCreate(); break;
             case 'parity-move': parityMove(open.data.name, open.data.disk); break;
             case 'cache-create': cacheCreate(); break;
+            case 'remove-emptied': removeEmptied(open.data.name); break;
         }
     }
 };
@@ -1643,15 +1644,33 @@ const openWizard = () => {
     // the candidates of a big machine do not fit: let the list scroll
     
 
+    // a new data disk larger than the parity is better used as the parity
+    const smallestParity = adding ? m.parity.filter(p => p.ok && p.total && p.files.length === 1).sort((a, b) => a.total - b.total)[0] : null;
+    const showParityTip = (dlg) => {
+        dlg.body.querySelector('#st-wizard-tip')?.remove();
+        const big = smallestParity ? cands.filter(c => w.roles[c.id] === 'data' && !(c.kind === 'fs' && c.fs.mount) && usableSize(c) > smallestParity.total * 1.05).sort((a, b) => b.size - a.size)[0] : null;
+        const box = dlg.body.querySelector('#st-wizard-errors');
+        if (!big || !box) return;
+        box.insertAdjacentHTML('afterend', `
+            <div class="st-finding st-finding-tip mt-4" id="st-wizard-tip">
+                <div><b>${escHtml(big.title)} (${size(big.size)}) is larger than your parity disk (${size(smallestParity.total)})</b>
+                <div class="text-sm mt-1">As a data disk only its first ${size(smallestParity.total)} can be protected. Better: make it the new parity. The parity is copied over while the protection stays in place, and the old parity disk becomes a data disk, so you gain the same space and can use larger disks from now on.</div></div>
+                <button class="btn btn-primary btn-sm" id="st-wizard-tip-go">Make it the parity instead</button>
+            </div>`);
+        dlg.body.querySelector('#st-wizard-tip-go').addEventListener('click', () => { dlg.close(); parityMove(smallestParity.key, big.id); });
+    };
+
     const go = (dlg) => {
         if (w.step === 0) {
             dlg.setBody(stepDisks());
             showErrors(dlg, roleErrors());
             drawSummary(dlg);
+            showParityTip(dlg);
             dlg.body.querySelectorAll('[data-role-for]').forEach(sel => sel.addEventListener('change', () => {
                 w.roles[sel.dataset.roleFor] = sel.value;
                 showErrors(dlg, roleErrors());
                 drawSummary(dlg);
+                showParityTip(dlg);
             }));
             dlg.setButtons([
                 { label: 'Cancel', onClick: (d) => d.close() },
@@ -2043,14 +2062,18 @@ const replaceDisk = (kind, name) => {
  * files. The parity is copied, not computed again: the array is protected
  * all the time, and the old parity is not touched until the copy is checked.
  */
-const parityMove = (key, preferred = null) => {
+const parityMove = (key, preferred = null, part = 0) => {
     if (!adminGuard()) return;
     const m = state.model;
-    const single = m.parity.filter(p => p.files.length === 1 && p.ok);
-    const entry = single.find(p => p.key === key) || single[0];
+    // every parity file can be moved: the one of a level, or each file of a split one
+    const single = m.parity.filter(p => p.ok).flatMap(p => p.files.map((f, i) => ({
+        id: `${p.key}#${i}`, key: p.key, part: p.files.length > 1 ? i + 1 : 0, of: p.files.length,
+        path: f.path, mountTarget: f.mount.target, source: f.mount.source, total: f.total || 0, free: f.free || 0
+    })));
+    const entry = single.find(p => p.key === key && (!part || p.part === part)) || single[0];
     const title = 'Move the parity to a larger disk';
     if (!entry) {
-        dialog({ title, large: false, body: 'There is no parity made of one file on a mounted disk. A split parity is moved by mounting the new disk in place of the old one and running Recover.', buttons: [{ label: 'Close', onClick: (d) => d.close() }] });
+        dialog({ title, large: false, body: 'There is no parity on a mounted disk. Mount the parity disks first, or use Recover if one is lost.', buttons: [{ label: 'Close', onClick: (d) => d.close() }] });
         return;
     }
     const cands = candidates(m).filter(c => !(c.kind === 'fs' && c.fs.mount));
@@ -2068,12 +2091,12 @@ const parityMove = (key, preferred = null) => {
     }
 
     const plan = (dl) => {
-        const p = single.find(x => x.key === dl.body.querySelector('#pm-level').value) || entry;
+        const p = single.find(x => x.id === dl.body.querySelector('#pm-level').value) || entry;
         const c = cands.find(x => x.id === dl.body.querySelector('#pm-new').value);
         const fstype = dl.body.querySelector('#pm-fstype')?.value || fss[0];
         const reuse = dl.body.querySelector('#pm-reuse').checked;
-        const oldMount = p.files[0].mount.target;
-        const oldFile = p.paths[0];
+        const oldMount = p.mountTarget;
+        const oldFile = p.path;
         const level = PARITY_KEYS.indexOf(p.key) + 1;
         const used = new Set([...m.mounts.map(x => x.target), ...(m.inv.fstab || []).map(x => x.target)]);
         let target = `${oldMount}-2`;
@@ -2097,14 +2120,14 @@ const parityMove = (key, preferred = null) => {
         steps.push({
             title: `Copy the parity (${size(fileSize(p))}), check the copy, then switch the array to it`,
             detail: `${oldFile} → ${target}/ · sync and scrub wait meanwhile · the old file is not touched`,
-            run: () => StorageAPI.parityMove(p.key, target)
+            run: () => StorageAPI.parityMove(p.key, target, p.part)
         });
         // a parity on another disk is a changed disk for the array: it's told that nothing was lost
         steps.push({ title: 'Record the new parity disk in the array', detail: 'sync, taking the disks as they are · continues in the background', run: () => StorageAPI.recover([], false, true) });
 
         if (reuse) {
             // the old parity disk becomes a data disk, like in the guided setup
-            const dev = p.files[0].mount.source;
+            const dev = p.source;
             const names = new Set(m.data.map(d => d.name));
             const name = nextName(names, 'disk');
             const base = m.data.length ? dirname(m.data[0].path) : dirname(oldMount);
@@ -2152,7 +2175,7 @@ const parityMove = (key, preferred = null) => {
             </p>
             <div class="form-row">
                 <div class="form-group ${single.length > 1 ? '' : 'hidden'}"><label for="pm-level">Parity</label>
-                    <select class="form-control" id="pm-level">${single.map(p => `<option value="${escAttr(p.key)}" ${p === entry ? 'selected' : ''}>${escHtml(p.key)} · ${size(p.total)} · ${escHtml(p.files[0].mount.target)}</option>`).join('')}</select></div>
+                    <select class="form-control" id="pm-level">${single.map(p => `<option value="${escAttr(p.id)}" ${p === entry ? 'selected' : ''}>${escHtml(p.key)}${p.part ? ` · file ${p.part} of ${p.of}` : ''} · ${size(p.total)} · ${escHtml(p.mountTarget)}</option>`).join('')}</select></div>
                 <div class="form-group"><label for="pm-new">New disk for the parity</label>
                     <select class="form-control" id="pm-new">
                         ${cands.map((c, i) => `<option value="${escAttr(c.id)}" ${fits(c, entry) ? '' : 'disabled'} ${i === firstFit ? 'selected' : ''}>${escHtml(c.title)} · ${size(c.size)} · ${c.kind === 'blank' ? 'blank' : escHtml(c.sub)}${fits(c, entry) ? '' : ' (too small)'}</option>`).join('')}
@@ -2642,6 +2665,60 @@ const removeDisk = (name) => {
     });
 };
 
+/**
+ * Take out of the array a data disk that was just emptied: out of the pool,
+ * a sync that makes the parity forget it, then out of the configuration.
+ * The two steps of Remove in one go, because here nothing is left to decide.
+ */
+const removeEmptied = async (name) => {
+    const m = state.model;
+    const d = m.data.find(x => x.name === name);
+    if (!d) { showToast(`${name} is not a data disk of this array`, 'warning'); return; }
+    const pool = m.pools.find(p => p.branches.some(b => stripSlash(b.path) === stripSlash(d.path)));
+    const contentLeft = m.content.filter(c => !isUnder(c, d.path)).length;
+    if (contentLeft < 1) {
+        dialog({ title: `Taking ${name} out of the array`, large: false, body: `The only content file of the array is on ${escHtml(name)}. Add a content file on another disk first (Storage → Configuration), then remove the disk from Storage.`, buttons: [{ label: 'Close', onClick: (x) => x.close() }] });
+        return;
+    }
+    const steps = [];
+    // the disk is empty and still in its place: no stand-in folder is needed
+    steps.push({
+        title: 'Update the protection, so it forgets the files the disk had', detail: 'sync --force-empty · this step waits for it to end',
+        run: async () => {
+            await API.schedule([{ command: 'probe' }, { command: 'sync', args: ['-E'] }]);
+            await sleep(3000);
+            for (;;) {
+                const tasks = await API.getTasks();
+                if (!(tasks.active || []).length && !(tasks.pending || []).length) {
+                    const last = (tasks.history || []).find(t => t.command === 'sync');
+                    if (!last || last.exit_code !== 0) throw new Error('The update of the protection did not complete: see Tasks for the reason. Nothing was changed: the disk is still in the array and in the pool.');
+                    return;
+                }
+                await sleep(2000);
+            }
+        }
+    });
+    if (pool) {
+        const idx = m.pools.indexOf(pool);
+        const rest = pool.branches.map(b => stripSlash(b.path)).filter(p => p !== stripSlash(d.path));
+        if (rest.length)
+            steps.push({ title: `Take ${d.path} out of the pool ${pool.mountpoint}`, run: () => StorageAPI.pool(pool.mountpoint, rest, poolOptionsFrom(pool, idx)) });
+    }
+    steps.push({
+        title: `Delete ${name} from the configuration`, detail: m.inv.engine_conf.path,
+        run: async () => {
+            await StorageAPI.saveConf(serializeConf(m.conf.filter(e => !(e.type === 'data' && e.name === name) && !(e.type === 'content' && isUnder(e.path, d.path)))));
+            await afterConfChange();
+        }
+    });
+    const dlg = dialog({
+        title: `Taking ${name} out of the array`,
+        body: `<p class="text-sm mb-4">${escHtml(name)} is empty. It leaves the array and the pool now; the other disks and their files are not touched.</p>${stepList(steps)}`,
+        buttons: []
+    });
+    runSteps(dlg, steps, `${name} is out of the array. The disk itself was not erased: it can be unplugged, or used for something else from Disks.`);
+};
+
 const removeFinish = async (name) => {
     if (!adminGuard()) return;
     const m = state.model;
@@ -2782,7 +2859,7 @@ export const initStorage = () => {
             case 'mount': mountFs(ds.device); break;
             case 'unmount': unmountFs(ds.target); break;
             case 'replace': replaceDisk(ds.kind, ds.name); break;
-            case 'parity-move': parityMove(ds.name); break;
+            case 'parity-move': parityMove(ds.name, null, Number(ds.part) || 0); break;
             case 'remove': removeDisk(ds.name); break;
             case 'remove-finish': removeFinish(ds.name); break;
             case 'pool-create': poolCreate(); break;

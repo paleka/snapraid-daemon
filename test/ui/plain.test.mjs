@@ -301,3 +301,19 @@ test('tour and glossary: the new words are explained', () => {
     assert.ok(P.TOUR.some(s => /Advanced/.test(s.title)));
     assert.ok(P.GLOSSARY['fast disk'] && P.GLOSSARY.mover);
 });
+
+test('folders kept on chosen disks: name and words', () => {
+    assert.equal(P.keepName('/Photos'), 'Photos');
+    assert.equal(P.keepName('/Media/My Films (HD)'), 'My-Films-HD');
+    assert.equal(P.keepName('/Photos', ['Photos', 'Photos-2']), 'Photos-3');
+    assert.equal(P.keepName('/'), 'folder');
+    assert.ok(/^[A-Za-z0-9_-]{1,32}$/.test(P.keepName('/x/' + 'é'.repeat(10) + 'a'.repeat(60))));
+    const keeps = [{ name: 'Photos', pool: '/mnt/storage', path: '/Photos', disks: '/mnt/d1', when: '04:00', enabled: true }];
+    assert.equal(P.keepOf(keeps, '/mnt/storage', '/Photos').name, 'Photos');
+    assert.equal(P.keepOf(keeps, '/mnt/other', '/Photos'), null);
+    assert.equal(P.keepOf(null, '/mnt/storage', '/Photos'), null);
+    assert.equal(P.keepWords(keeps[0]), 'Kept on d1. New files that land on another disk are brought back every day at 04:00.');
+    assert.match(P.keepWords({ disks: '/mnt/d1:/mnt/d2:/mnt/d3', when: '04:00' }, (p) => p.slice(5).toUpperCase()), /^Kept on D1, D2 and D3\./);
+    assert.match(P.keepWords({ disks: '/mnt/d1', when: '', enabled: true }), /use Tidy now/);
+    assert.match(P.keepWords({ disks: '/mnt/d1', when: '04:00', enabled: false }), /use Tidy now/);
+});
