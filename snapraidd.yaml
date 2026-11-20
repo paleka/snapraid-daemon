@@ -1275,14 +1275,20 @@ paths:
         checks, the newest first, with the errors found, repaired and lost,
         and the totals), ups_detect (the UPS units known to upsc and
         apcaccess), alerts (the places of the alerts script, needs the
-        storage administration rights).
+        storage administration rights), events?limit=N (what happened on the
+        machine beside the runs: power cuts, backups, ended jobs, USB disks,
+        idle sleep; the newest first, at most 500), space?days=N (the used
+        and total space of the data disks of every array, one sample a day
+        kept for 400 days, the growth a day over the last 90 days and the
+        days left before it is full, by array and for all of them; no
+        forecast before 7 days of samples).
       parameters:
         - name: what
           in: path
           required: true
           schema:
             type: string
-            enum: [history, network, share_users, smart, openfiles, diagnostics, settings_backup, runs, ups_detect, alerts]
+            enum: [history, network, share_users, smart, openfiles, diagnostics, settings_backup, runs, ups_detect, alerts, events, space]
         - name: device
           in: query
           required: false
@@ -1299,6 +1305,11 @@ paths:
           schema:
             type: string
         - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+        - name: days
           in: query
           required: false
           schema:

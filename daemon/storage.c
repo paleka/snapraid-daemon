@@ -279,6 +279,10 @@ void job_finish(int status, const char* message)
 
 	log_msg(status == 0 ? LVL_INFO : LVL_WARNING, "storage: %s of %s ended: %s", job.kind, job.target, message);
 
+	/* what changed the disks or the files goes in the events; a backup is told there by its name */
+	if (strcmp(job.kind, "usage") != 0 && strcmp(job.kind, "duplicates") != 0 && strcmp(job.kind, "backup") != 0)
+		host_event(status == 0 ? "ok" : status == 499 ? "warn" : "bad", job.kind, job.target, message);
+
 	/* the arrays that were waiting for the job can go on */
 	arrays_wake();
 }

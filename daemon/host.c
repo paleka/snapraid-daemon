@@ -1337,8 +1337,10 @@ static void* copy_thread(void* arg)
 		snprintf(msg, sizeof(msg), "The copy failed (rsync exit code %d). %.200s", ret, hjob.last_error);
 	}
 
-	if (hjob.backup_name[0])
+	if (hjob.backup_name[0]) {
 		backup_record(hjob.backup_name, status, msg);
+		host_event(status == 0 ? "ok" : status == 499 || status == 207 ? "warn" : "bad", "backup", hjob.backup_name, msg);
+	}
 	job_finish(status == 207 ? 0 : status, msg);
 
 	return 0;
@@ -3267,10 +3269,12 @@ static void idle_tick(const struct tm* tm)
 	idle_since = now;
 	if (host_dryrun) {
 		log_msg(LVL_WARNING, "host: idle for %d minutes, would %s (dry run)", minutes, action);
+		host_event("info", "idle", action, "Idle: would go to sleep (dry run)");
 		return;
 	}
 
 	log_msg(LVL_WARNING, "host: idle for %d minutes, going to %s", minutes, action);
+	host_event("info", "idle", action, strcmp(action, "suspend") == 0 ? "Nothing to do: went to sleep" : "Nothing to do: turned off");
 	const char* args[] = { strcmp(action, "suspend") == 0 ? "suspend" : "poweroff", 0 };
 	if (tool_run("systemctl", args, 0, 0, 60) != 0) {
 		const char* sh[] = { "-h", "now", 0 };
@@ -3878,6 +3882,461 @@ static void host_side_path(const char* name, char* out, size_t out_size)
 }
 
 /****************************************************************************/
+/* events of the machine: what happened beside the runs of the arrays */
+
+#define EVENTS_NAME "snapraidd-events.log"
+#define EVENTS_KEEP 400 /**< Lines kept when the log is trimmed */
+#define EVENTS_MAX 500 /**< Lines over which the log is trimmed */
+
+static pthread_mutex_t events_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int events_lines = -1; /**< Lines in the file, -1 until counted */
+
+/** Copy a field of an event line: no tabs, no new lines, never empty. */
+static void event_field(char* out, size_t out_size, const char* in)
+{
+	size_t n = 0;
+
+	for (const char* p = in ? in : ""; *p && n + 1 < out_size; ++p)
+		out[n++] = (*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p;
+	if (n == 0 && out_size > 1)
+		out[n++] = '-';
+	out[n] = 0;
+}
+
+void host_event(const char* level, const char* kind, const char* target, const char* text)
+{
+	char path[PATH_MAX];
+	char f_level[16], f_kind[32], f_target[PATH_MAX], f_text[MSG_MAX];
+
+	event_field(f_level, sizeof(f_level), level);
+	event_field(f_kind, sizeof(f_kind), kind);
+	event_field(f_target, sizeof(f_target), target);
+	event_field(f_text, sizeof(f_text), text);
+
+	host_side_path(EVENTS_NAME, path, sizeof(path));
+
+	pthread_mutex_lock(&events_mutex);
+
+	if (events_lines < 0) {
+		ss_t s;
+		ss_init(&s, 16384);
+		events_lines = 0;
+		if (file_read(path, &s) == 0) {
+			for (ssize_t i = 0; i < ss_len(&s); ++i)
+				events_lines += ss_ptr(&s)[i] == '\n';
+		}
+		ss_done(&s);
+	}
+
+	char line[MSG_MAX + PATH_MAX + 128];
+	int len = snprintf(line, sizeof(line), "%" PRIi64 "\t%s\t%s\t%s\t%s\n", (int64_t)time(0), f_level, f_kind, f_target, f_text);
+	if (len > (int)sizeof(line) - 1) {
+		len = sizeof(line) - 1;
+		line[len - 1] = '\n';
+	}
+	/* the folder of the settings is written with the privileges of the daemon */
+	priv_enter();
+	int f = open(path, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+	priv_leave();
+	if (f >= 0) {
+		if (write(f, line, len) == len)
+			++events_lines;
+		close(f);
+	} else {
+		log_msg(LVL_ERROR, "host: cannot write %s, errno=%s(%d)", path, strerror(errno), errno);
+	}
+
+	/* trimmed now and then, not at every line */
+	if (events_lines > EVENTS_MAX) {
+		ss_t s;
+		ss_init(&s, 65536);
+		if (file_read(path, &s) == 0) {
+			ss_write(&s, "", 1);
+			char* p = ss_ptr(&s);
+			int skip = events_lines - EVENTS_KEEP;
+			while (skip > 0 && *p) {
+				char* nl = strchr(p, '\n');
+				if (!nl)
+					break;
+				p = nl + 1;
+				--skip;
+			}
+			if (file_replace(path, p, 0, 0644) == 0)
+				events_lines = EVENTS_KEEP;
+		}
+		ss_done(&s);
+	}
+
+	pthread_mutex_unlock(&events_mutex);
+}
+
+/** The events for the pages, the newest first. */
+static void events_json(ss_t* s, int level, int limit)
+{
+	char path[PATH_MAX];
+	ss_t text;
+
+	host_side_path(EVENTS_NAME, path, sizeof(path));
+	ss_init(&text, 65536);
+	pthread_mutex_lock(&events_mutex);
+	int ok = file_read(path, &text) == 0;
+	pthread_mutex_unlock(&events_mutex);
+
+	ss_json_array_open(s, &level, "events");
+	if (ok) {
+		ss_write(&text, "", 1);
+		char* base = ss_ptr(&text);
+		/* walk the lines from the end */
+		char* end = base + strlen(base);
+		while (end > base && limit > 0) {
+			char* stop = end;
+			if (stop > base && stop[-1] == '\n')
+				--stop;
+			char* start = stop;
+			while (start > base && start[-1] != '\n')
+				--start;
+			end = start;
+			*stop = 0;
+			char* f[5];
+			unsigned n = 0;
+			char* save = 0;
+			for (char* tok = strtok_r(start, "\t", &save); tok && n < 5; tok = strtok_r(0, "\t", &save))
+				f[n++] = tok;
+			if (n != 5 || start[0] == '#')
+				continue;
+			int64_t at = strtoll(f[0], 0, 10);
+			if (at <= 0)
+				continue;
+			ss_json_open(s, &level);
+			ss_json_pair_iso8601(s, level, "at", (time_t)at);
+			ss_json_str(s, level, "level", f[1]);
+			ss_json_str(s, level, "kind", f[2]);
+			ss_json_str(s, level, "target", strcmp(f[3], "-") == 0 ? "" : f[3]);
+			ss_json_str(s, level, "text", strcmp(f[4], "-") == 0 ? "" : f[4]);
+			ss_json_close(s, &level);
+			--limit;
+		}
+	}
+	ss_json_array_close(s, &level);
+	ss_done(&text);
+}
+
+/****************************************************************************/
+/* space used by every array, one sample a day, and when it gets full */
+
+#define SPACE_NAME "snapraidd-space.log"
+#define SPACE_DAYS_KEPT 400 /**< Samples older than this are dropped */
+#define SPACE_DAYS_FIT 90 /**< Days looked at for the forecast */
+#define SPACE_FIT_MIN 7 /**< Days of samples needed before a forecast */
+#define SPACE_ARRAYS 64
+
+struct space_sample {
+	int64_t day; /**< Days since 1970, local time of the machine */
+	char array[ARRAY_NAME_MAX];
+	uint64_t used;
+	uint64_t total;
+};
+
+static pthread_mutex_t space_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int64_t space_day = -1; /**< Day of space_done, -1 until read */
+static char space_done[SPACE_ARRAYS][ARRAY_NAME_MAX]; /**< Arrays measured that day */
+static unsigned space_done_count;
+
+static int space_is_done(const char* array)
+{
+	for (unsigned i = 0; i < space_done_count; ++i) {
+		if (strcmp(space_done[i], array) == 0)
+			return 1;
+	}
+	return 0;
+}
+
+static int64_t space_today(time_t now)
+{
+	struct tm tm;
+	localtime_r(&now, &tm);
+	/* the local day, without the zone moving it at midnight */
+	return (int64_t)(now + tm.tm_gmtoff) / SECONDS_IN_A_DAY;
+}
+
+/**
+ * Growth in bytes a day: least squares line of the samples.
+ * \return 0 with the slope, -1 if the samples are too few or too close in time.
+ */
+int space_fit(const int64_t* day, const double* used, unsigned n, double* slope)
+{
+	if (n < 2)
+		return -1;
+	int64_t first = day[0], last = day[0];
+	double mx = 0, my = 0;
+	for (unsigned i = 0; i < n; ++i) {
+		if (day[i] < first)
+			first = day[i];
+		if (day[i] > last)
+			last = day[i];
+		mx += (double)day[i];
+		my += used[i];
+	}
+	if (last - first + 1 < SPACE_FIT_MIN)
+		return -1;
+	mx /= n;
+	my /= n;
+	double sxy = 0, sxx = 0;
+	for (unsigned i = 0; i < n; ++i) {
+		sxy += ((double)day[i] - mx) * (used[i] - my);
+		sxx += ((double)day[i] - mx) * ((double)day[i] - mx);
+	}
+	if (sxx <= 0)
+		return -1;
+	*slope = sxy / sxx;
+	return 0;
+}
+
+static unsigned space_read(struct space_sample** out)
+{
+	char path[PATH_MAX];
+	ss_t s;
+	unsigned n = 0, cap = 256;
+	struct space_sample* list = malloc_nofail(sizeof(*list) * cap);
+
+	host_side_path(SPACE_NAME, path, sizeof(path));
+	ss_init(&s, 65536);
+	if (file_read(path, &s) == 0) {
+		ss_write(&s, "", 1);
+		char* save = 0;
+		for (char* line = strtok_r(ss_ptr(&s), "\n", &save); line; line = strtok_r(0, "\n", &save)) {
+			struct space_sample x;
+			char name[ARRAY_NAME_MAX + 1];
+			long long d;
+			unsigned long long u, t;
+			if (line[0] == '#' || sscanf(line, "%lld\t%64[^\t]\t%llu\t%llu", &d, name, &u, &t) != 4)
+				continue;
+			x.day = d;
+			sncpy(x.array, sizeof(x.array), name);
+			x.used = u;
+			x.total = t;
+			if (n == cap) {
+				cap *= 2;
+				list = realloc(list, sizeof(*list) * cap);
+				if (!list)
+					abort();
+			}
+			list[n++] = x;
+		}
+	}
+	ss_done(&s);
+	*out = list;
+	return n;
+}
+
+/** Once a day: the used and total space of the data disks of every array. An array added during the day is measured as soon as it's there. */
+static void space_tick(void)
+{
+	int64_t today = space_today(time(0));
+
+	pthread_mutex_lock(&space_mutex);
+	if (space_day != today) {
+		/* the arrays already measured today, also by a daemon running before this one */
+		struct space_sample* list;
+		unsigned n = space_read(&list);
+		space_done_count = 0;
+		for (unsigned i = 0; i < n; ++i) {
+			if (list[i].day == today && !space_is_done(list[i].array) && space_done_count < SPACE_ARRAYS)
+				sncpy(space_done[space_done_count++], sizeof(space_done[0]), list[i].array);
+		}
+		space_day = today;
+		free(list);
+	}
+	pthread_mutex_unlock(&space_mutex);
+
+	/* the mount points are copied under the lock, measured without it */
+	struct {
+		char array[ARRAY_NAME_MAX];
+		char dir[PATH_MAX];
+	}* dirs = malloc_nofail(sizeof(*dirs) * 512);
+	unsigned dir_count = 0;
+	state_lock();
+	pthread_mutex_lock(&space_mutex);
+	for (tommy_node* i = tommy_list_head(&host_ptr()->state_list); i; i = i->next) {
+		struct snapraid_state* state = i->data;
+		if (space_is_done(state->name))
+			continue;
+		for (tommy_node* j = tommy_list_head(&state->array.disk_list); j && dir_count < 512; j = j->next) {
+			struct snapraid_disk* disk = j->data;
+			if (disk->kind != DISK_DATA)
+				continue;
+			tommy_node* k = tommy_list_head(&disk->split_list);
+			if (!k)
+				continue;
+			struct snapraid_split* split = k->data;
+			if (!split->path[0])
+				continue;
+			sncpy(dirs[dir_count].array, sizeof(dirs[dir_count].array), state->name);
+			sncpy(dirs[dir_count].dir, sizeof(dirs[dir_count].dir), split->path);
+			++dir_count;
+		}
+	}
+	pthread_mutex_unlock(&space_mutex);
+	state_unlock();
+	if (dir_count == 0) {
+		free(dirs);
+		return;
+	}
+
+	struct space_sample fresh[SPACE_ARRAYS];
+	unsigned fresh_count = 0;
+	for (unsigned i = 0; i < dir_count; ++i) {
+		struct statvfs vfs;
+		/* the counters of the filesystem: no read of the disk, a sleeping disk stays asleep */
+		if (statvfs(dirs[i].dir, &vfs) != 0 || vfs.f_blocks == 0)
+			continue;
+		uint64_t total = (uint64_t)vfs.f_blocks * vfs.f_frsize;
+		uint64_t free_bytes = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+		struct space_sample* x = 0;
+		for (unsigned k = 0; k < fresh_count; ++k) {
+			if (strcmp(fresh[k].array, dirs[i].array) == 0)
+				x = &fresh[k];
+		}
+		if (!x) {
+			if (fresh_count == SPACE_ARRAYS)
+				continue;
+			x = &fresh[fresh_count++];
+			memset(x, 0, sizeof(*x));
+			x->day = today;
+			sncpy(x->array, sizeof(x->array), dirs[i].array);
+		}
+		x->total += total;
+		x->used += total > free_bytes ? total - free_bytes : 0;
+	}
+	free(dirs);
+	if (fresh_count == 0)
+		return;
+
+	pthread_mutex_lock(&space_mutex);
+	struct space_sample* list;
+	unsigned n = space_read(&list);
+	char path[PATH_MAX];
+	ss_t s;
+	ss_init(&s, 65536);
+	ss_prints(&s, "# Space of the arrays of the SnapRAID Daemon, one line a day: day (days since 1970), array, used bytes, total bytes of the data disks.\n");
+	for (unsigned i = 0; i < n; ++i) {
+		if (list[i].day < today - SPACE_DAYS_KEPT || list[i].day > today)
+			continue;
+		int again = 0;
+		for (unsigned k = 0; k < fresh_count; ++k)
+			again |= list[i].day == today && strcmp(list[i].array, fresh[k].array) == 0;
+		if (again)
+			continue;
+		ss_printf(&s, "%" PRIi64 "\t%s\t%" PRIu64 "\t%" PRIu64 "\n", list[i].day, list[i].array, list[i].used, list[i].total);
+	}
+	for (unsigned i = 0; i < fresh_count; ++i)
+		ss_printf(&s, "%" PRIi64 "\t%s\t%" PRIu64 "\t%" PRIu64 "\n", fresh[i].day, fresh[i].array, fresh[i].used, fresh[i].total);
+	ss_write(&s, "", 1);
+	host_side_path(SPACE_NAME, path, sizeof(path));
+	if (file_replace(path, ss_ptr(&s), 0, 0644) != 0)
+		log_msg(LVL_ERROR, "host: cannot write %s, errno=%s(%d)", path, strerror(errno), errno);
+	for (unsigned i = 0; i < fresh_count; ++i) {
+		if (!space_is_done(fresh[i].array) && space_done_count < SPACE_ARRAYS)
+			sncpy(space_done[space_done_count++], sizeof(space_done[0]), fresh[i].array);
+	}
+	ss_done(&s);
+	free(list);
+	pthread_mutex_unlock(&space_mutex);
+}
+
+static void space_forecast_json(ss_t* s, int level, double slope_sum, int have, uint64_t used, uint64_t total)
+{
+	if (!have) {
+		ss_json_bool(s, level, "forecast", 0);
+		return;
+	}
+	ss_json_bool(s, level, "forecast", 1);
+	ss_json_double(s, level, "growth_bytes_per_day", slope_sum);
+	if (slope_sum > 0 && total > used)
+		ss_json_i64(s, level, "days_to_full", (int64_t)((double)(total - used) / slope_sum));
+}
+
+/** Samples of the last days and the forecast, by array and for all of them. */
+static void space_json(ss_t* s, int level, int days)
+{
+	int64_t today = space_today(time(0));
+	struct space_sample* list;
+
+	pthread_mutex_lock(&space_mutex);
+	unsigned n = space_read(&list);
+	pthread_mutex_unlock(&space_mutex);
+
+	char names[SPACE_ARRAYS][ARRAY_NAME_MAX];
+	unsigned name_count = 0;
+	for (unsigned i = 0; i < n; ++i) {
+		unsigned k;
+		for (k = 0; k < name_count && strcmp(names[k], list[i].array) != 0; ++k)
+			;
+		if (k == name_count && name_count < SPACE_ARRAYS)
+			sncpy(names[name_count++], sizeof(names[0]), list[i].array);
+	}
+
+	int64_t* xd = malloc_nofail(sizeof(int64_t) * (n + 1));
+	double* yu = malloc_nofail(sizeof(double) * (n + 1));
+	double slope_sum = 0;
+	int all_have = name_count > 0;
+	uint64_t all_used = 0, all_total = 0;
+
+	ss_json_i64(s, level, "fit_days", SPACE_DAYS_FIT);
+	ss_json_array_open(s, &level, "arrays");
+	for (unsigned k = 0; k < name_count; ++k) {
+		unsigned m = 0;
+		const struct space_sample* latest = 0;
+		for (unsigned i = 0; i < n; ++i) {
+			if (strcmp(list[i].array, names[k]) != 0)
+				continue;
+			if (!latest || list[i].day >= latest->day)
+				latest = &list[i];
+			if (list[i].day >= today - SPACE_DAYS_FIT) {
+				xd[m] = list[i].day;
+				yu[m] = (double)list[i].used;
+				++m;
+			}
+		}
+		/* an array not measured lately is gone */
+		if (!latest || latest->day < today - 7)
+			continue;
+		double slope = 0;
+		int have = space_fit(xd, yu, m, &slope) == 0;
+		ss_json_open(s, &level);
+		ss_json_str(s, level, "array", names[k]);
+		ss_json_u64(s, level, "used_bytes", latest->used);
+		ss_json_u64(s, level, "total_bytes", latest->total);
+		space_forecast_json(s, level, slope, have, latest->used, latest->total);
+		ss_json_array_open(s, &level, "days");
+		for (unsigned i = 0; i < n; ++i) {
+			if (strcmp(list[i].array, names[k]) != 0 || list[i].day < today - days)
+				continue;
+			ss_jsonf(s, level, "{ \"day\": %" PRIi64 ", \"used\": %" PRIu64 " },\n", list[i].day, list[i].used);
+		}
+		ss_json_array_close(s, &level);
+		ss_json_close(s, &level);
+		all_used += latest->used;
+		all_total += latest->total;
+		if (have)
+			slope_sum += slope;
+		else
+			all_have = 0;
+	}
+	ss_json_array_close(s, &level);
+
+	ss_json_object_open(s, &level, "all");
+	ss_json_u64(s, level, "used_bytes", all_used);
+	ss_json_u64(s, level, "total_bytes", all_total);
+	space_forecast_json(s, level, slope_sum, all_have, all_used, all_total);
+	ss_json_close(s, &level);
+
+	free(xd);
+	free(yu);
+	free(list);
+}
+
+/****************************************************************************/
 /* record of the runs: what every sync, scrub, check and fix found */
 
 #define RUNS_NAME "snapraidd-runs.log"
@@ -4464,9 +4923,21 @@ static void ups_tick(void)
 		ups.shutdown_done = 0;
 		log_msg(LVL_WARNING, "host: power cut, the machine runs on the battery of the UPS (%d%%). The update of the protection and the check for damage wait for the power.", charge);
 	}
-	if (!on_battery && was)
-		log_msg(LVL_WARNING, "host: the power is back after %d minutes on battery", (int)((time(0) - ups.since) / 60));
+	int back_minutes = !on_battery && was ? (int)((time(0) - ups.since) / 60) : -1;
+	if (back_minutes >= 0)
+		log_msg(LVL_WARNING, "host: the power is back after %d minutes on battery", back_minutes);
 	pthread_mutex_unlock(&ups_mutex);
+
+	if (on_battery && !was) {
+		char text[128];
+		snprintf(text, sizeof(text), "Running on the battery of the UPS, %d%% charged", charge);
+		host_event("warn", "power_cut", source, text);
+	}
+	if (back_minutes >= 0) {
+		char text[128];
+		snprintf(text, sizeof(text), "Power back after %d minutes on battery", back_minutes);
+		host_event("ok", "power_back", source, text);
+	}
 
 	if (!on_battery)
 		return;
@@ -4514,9 +4985,11 @@ static void ups_tick(void)
 
 	if (host_dryrun) {
 		log_msg(LVL_WARNING, "host: the battery of the UPS is running out (%d%%, %d seconds left), would shut down (dry run)", charge, runtime);
+		host_event("bad", "power_shutdown", source, "Battery running out: would shut down (dry run)");
 		return;
 	}
 	log_msg(LVL_CRITICAL, "host: the battery of the UPS is running out (%d%%, %d seconds left): shutting down", charge, runtime);
+	host_event("bad", "power_shutdown", source, "Battery running out: shutting down");
 	sync();
 	const char* args[] = { "poweroff", 0 };
 	if (tool_run("systemctl", args, 0, 0, 60) != 0) {
@@ -4874,6 +5347,7 @@ static int usb_mount(const char* device, ss_t* s, int level, char* msg, size_t m
 
 	ss_json_str(s, level, "target", target);
 	log_msg(LVL_INFO, "host: %s mounted in %s until it's ejected", device, target);
+	host_event("info", "usb_open", device, target);
 	return 0;
 }
 
@@ -4952,6 +5426,7 @@ static int usb_eject(const char* device, ss_t* s, int level, char* msg, size_t m
 	ss_json_uint(s, level, "unmounted", n);
 	ss_json_str(s, level, "note", off ? "The disk is off: it can be unplugged now" : "Nothing of the disk is in use any more: it can be unplugged now");
 	log_msg(LVL_INFO, "host: /dev/%s ejected, %u filesystems unmounted%s", disk, n, off ? ", powered off" : "");
+	host_event("info", "usb_eject", disk, off ? "Ejected and turned off: it can be unplugged" : "Ejected: it can be unplugged");
 
 	return 0;
 }
@@ -5492,6 +5967,17 @@ int host_get(const char* what, const struct host_args* query, ss_t* s, int level
 		ups_detect_json(s, level);
 		return 0;
 	}
+	if (strcmp(what, "events") == 0) {
+		const char* limit = host_arg(query, "limit");
+		events_json(s, level, limit && valid_int(limit, 1, EVENTS_MAX) ? atoi(limit) : 50);
+		return 0;
+	}
+	if (strcmp(what, "space") == 0) {
+		const char* days = host_arg(query, "days");
+		space_tick();
+		space_json(s, level, days && valid_int(days, 1, SPACE_DAYS_KEPT) ? atoi(days) : SPACE_DAYS_FIT);
+		return 0;
+	}
 	if (strcmp(what, "alerts") == 0) {
 		alerts_json(s, level);
 		return 0;
@@ -5833,6 +6319,7 @@ static void* host_thread(void* arg)
 			ratio_tick();
 			changes_tick();
 			runs_tick();
+			space_tick();
 			idle_tick(&tm);
 			first = 0;
 		}
@@ -6112,10 +6599,59 @@ int host_selftest(void)
 	HCHECK(diskstats_get(stats, "sda", &rd, &wr) == 0 && rd == 2000 && wr == 4000);
 	HCHECK(diskstats_get(stats, "sdb", &rd, &wr) != 0);
 
+	/* growth of the used space */
+	{
+		int64_t d[10];
+		double u[10];
+		double slope = 0;
+		for (int i = 0; i < 10; ++i) {
+			d[i] = 20000 + i;
+			u[i] = 1000.0 + 50.0 * i;
+		}
+		HCHECK(space_fit(d, u, 10, &slope) == 0 && slope > 49.99 && slope < 50.01);
+		/* six days are too few for a forecast */
+		HCHECK(space_fit(d, u, 6, &slope) != 0);
+		/* a missing day does not matter, a shrinking array grows less than zero */
+		d[3] = 20012;
+		for (int i = 0; i < 10; ++i)
+			u[i] = 5000.0 - 10.0 * (double)(d[i] - 20000);
+		HCHECK(space_fit(d, u, 10, &slope) == 0 && slope < -9.99 && slope > -10.01);
+		/* all on the same day: no line */
+		for (int i = 0; i < 10; ++i)
+			d[i] = 20000;
+		HCHECK(space_fit(d, u, 10, &slope) != 0);
+		HCHECK(space_fit(d, u, 1, &slope) != 0);
+	}
+
+	/* fields of an event line */
+	event_field(buf, sizeof(buf), "a\tb\nc");
+	HCHECK(strcmp(buf, "a b c") == 0);
+	event_field(buf, sizeof(buf), "");
+	HCHECK(strcmp(buf, "-") == 0);
+	event_field(buf, sizeof(buf), 0);
+	HCHECK(strcmp(buf, "-") == 0);
+
 	return 0;
 }
 
 #else
+
+void host_event(const char* level, const char* kind, const char* target, const char* text)
+{
+	(void)level;
+	(void)kind;
+	(void)target;
+	(void)text;
+}
+
+int space_fit(const int64_t* day, const double* used, unsigned n, double* slope)
+{
+	(void)day;
+	(void)used;
+	(void)n;
+	(void)slope;
+	return -1;
+}
 
 void host_init(void)
 {

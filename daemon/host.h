@@ -38,6 +38,20 @@ struct host_args {
 const char* host_arg(const struct host_args* args, const char* key);
 
 /**
+ * Add a line to the events of the machine (snapraidd-events.log next to the settings).
+ * \param level One of ok, info, warn, bad.
+ * \param kind What happened: power_cut, backup, wipe, usb_eject...
+ * \param target What it happened to: a disk, a backup name, a folder. Can be empty.
+ */
+void host_event(const char* level, const char* kind, const char* target, const char* text);
+
+/**
+ * Growth a day of the used space, from samples of (day, used).
+ * \return 0 with the slope, -1 if the samples are too few or too close in time.
+ */
+int space_fit(const int64_t* day, const double* used, unsigned n, double* slope);
+
+/**
  * Load the settings of the machine and apply them. Called after the arrays are loaded.
  */
 void host_init(void);
