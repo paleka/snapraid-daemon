@@ -9,7 +9,9 @@ additions. Files that already existed keep the copyright of their author.
 The new files (daemon/storage.c, daemon/storage.h, daemon/storage_int.h,
 daemon/arrays.c, daemon/arrays.h, daemon/host.c, daemon/host.h,
 js/storage.js, js/arrays.js, js/simple.js, js/plain.js and css/simple.css of
-both UIs, test/ui/, installer.sh) are copyright of Robert Paleka.
+the UIs, the Quiet UI except the files it shares with Commander, test/ui/,
+installer.sh) are copyright of Robert Paleka. The fonts of Quiet (Inter,
+JetBrains Mono) are under the SIL Open Font License, quiet/css/fonts/OFL-*.
 
 The additions were written with the help of an AI coding assistant (Claude).
 The AGENTS.md file of the original project asks agents to never commit to
@@ -267,6 +269,38 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
 
 * The thread of the machine looks again right after a setting is saved.
 
+* A third UI, Quiet (quiet.zip), the default of new installations: calm
+  tiles of different sizes on a grid, one blue accent, the status always in
+  words, Inter and JetBrains Mono bundled. Light or dark follows the
+  computer until the switch of the top bar is used. It shares the scripts
+  and css/simple.css of Commander and Brutale, and the layout of Commander
+  (css/style.css), and adds css/quiet.css. Installations that already exist
+  keep the UI their snapraidd.conf names.
+
+* Home as tiles: the status with its one action and the facts behind it,
+  the last 14 days of runs of every array, space by array with when it gets
+  full, the disks of every array as small bays, how much was checked for
+  damage, what comes next, backups, shares, power, fast disk, what happened
+  and where the alerts go. Disks: a click on a bay shows that disk with its
+  facts, temperature of the day and actions ("Change its bay" moves it).
+  Protection: the rules in plain words beside a chart of how long ago each
+  part of the data was checked, and the past runs as a table. Every theme
+  gets the new layout, in its own colours.
+
+* Search of pages, disks, shares, backups, settings and actions with Ctrl K
+  (Cmd K), in the browser, from the data the pages already read.
+
+* Space of every array, one sample a day kept for 400 days in
+  snapraidd-space.log next to the settings; the growth over the last 90
+  days gives the days left before it is full. GET /host/space. The sizes
+  are the counters of the filesystems (statvfs): a sleeping disk is not
+  woken up.
+
+* Events of the machine beside the runs (power cut and back, shutdown on
+  battery, backups, the end of the long jobs, USB disks opened and ejected,
+  sleep when idle) in snapraidd-events.log next to the settings, at most 500
+  lines. GET /host/events.
+
 
 Changes to existing files
 -------------------------
@@ -282,7 +316,10 @@ Changes to existing files
     daemon/state.h             content_reread_unixtime
     daemon/scheduler.c/.h      schedule_recover()
     daemon/selftest.c          call of storage_selftest()
-    commander/, brutale/       index.html, css/style.css, js/app.js, js/utils.js
+    commander/, brutale/       index.html, css/style.css, js/app.js, js/utils.js,
+                               js/init.js (light or dark of the computer when
+                               the page asks for it)
+    snapraidd.conf.example     net_web_root = quiet.zip
 
 For more arrays:
 
