@@ -153,6 +153,53 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
   the machine (wipe, copy, backup, permissions): one at a time, with the same
   progress and stop.
 
+* Files moved among the disks of a pool, keeping their path inside it, with
+  rsync and one file at a time (POST /storage/move): a folder brought to a
+  chosen disk, a disk emptied to the others, and the mover of a fast disk.
+  A file is removed from its disk only after it was copied whole; a file
+  changed in the last five minutes, a file with a twin of the same name on a
+  destination, a hard link, or a file that fits nowhere is left where it is
+  and listed. A folder behind a link leading out of its disk is refused. Like the balance, the
+  move keeps away from a sync, scrub or recovery of the same disks.
+
+* A fast disk (an SSD) in front of a pool: it goes first in the pool with
+  the 'ff' policy, so new files are written to it, and a mover brings them
+  to the other disks every day at a set time, at once when the disk passes
+  a fill level, or on request; then the maintenance of the arrays getting
+  the files is run. Files changed in the last hours can be left on it. The
+  pages say how many files wait on the fast disk, counted by the daemon,
+  and that they are not protected by the parity until moved. A fast disk
+  leaves the pool only once emptied. Settings 'cache.NAME' of the machine.
+
+* The parity moved to a larger disk (POST /storage/parity_move): the parity
+  file is copied to the new disk, read back and compared byte by byte, and
+  only then the SnapRAID configuration is pointed to it, while the array is
+  kept from syncing. The old file is not touched. The dialog can then make
+  the old parity disk a data disk. A split parity is refused.
+
+* Replace of a data disk that still reads: its files can be copied to the
+  new disk instead of rebuilt from the parity.
+
+* Size of a folder and how much of it is on every disk of its pool; a
+  reading test of a whole disk, block by block, that writes nothing; copy
+  of a single file.
+
+* 'sync_ratio' setting of the machine: a maintenance sync stopped only by
+  the limit of the deleted files is run again without the limit when the
+  files added are at least that many times the deleted ones.
+
+* Advanced mode in the pages for everyday use: every page and dialog shows
+  the everyday choices, and a switch remembered page by page shows the
+  finer controls (on Protection: the ratio above, prehash, the stop on
+  files become empty; on Disks: what uses a disk, its power settings, copy,
+  empty, move of the parity, erase; on My files: size and move of a folder;
+  on System: folder cache interval, a sleep time for the parity disks,
+  network traffic in the idle check). A short tour at the first visit, also
+  in Help.
+
+* The Protection page reads the temperature limit of an existing SnapRAID
+  configuration, and replaces its line in place of adding a second one.
+
 
 Changes to existing files
 -------------------------
@@ -215,6 +262,11 @@ For the pages for everyday use and the settings of the machine:
                                js/utils.js (icons)
     Makefile.am                new sources, UI files and tests
     snapraidd.yaml             OpenAPI description of the new endpoints
+
+For the moves of files, the fast disk and the move of the parity:
+
+    daemon/rest.c              /snapraid/v1/storage/move and parity_move
+    snapraidd.yaml, doc/       description of the new requests and settings
 
 
 How it is tested

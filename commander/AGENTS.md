@@ -64,6 +64,12 @@ tasks, viewing history, and configuring system settings.
 > System, Help) are in `js/simple.js`, their logic without page in `js/plain.js` (tested by
 > `test/ui/plain.test.mjs`), their style in `css/simple.css`. The pages below are under
 > "Advanced" in the menu; the Dashboard is at `#/dashboard`.
+>
+> Advanced mode of those pages: a page or a dialog shows the everyday choices only. What fine
+> tunes them gets the class `sp-adv-only` inside an `advScope(id, html)`, and is shown by the
+> `advSwitch(id)` of that page, remembered in `localStorage` as `sp-adv-<id>`. A new option
+> goes in the everyday part only if most people have to decide it; otherwise it gets a good
+> default and goes in the advanced part.
 
 ### 1. Dashboard (`#/`)
 The central hub for monitoring current system status.

@@ -1054,6 +1054,86 @@ paths:
           description: Server error, or a required tool is missing (501).
           $ref: '#/components/responses/CommandResult'
 
+  /snapraid/v1/storage/move:
+    post:
+      summary: Move files among the branches of a pool
+      description: >
+        Moves files with rsync from some branches of the pool to other ones, in background, keeping their path inside the pool. A file is removed from its branch only after it was copied whole; files changed in the last five minutes, hard links, files with a twin of the same path on a destination and files that fit nowhere are left, counted in "skipped" and listed in the result of /storage/job. Refused while an array of the pool runs a sync, scrub or recovery. Requires net_storage_admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - mountpoint
+                - from
+              properties:
+                mountpoint:
+                  type: string
+                  description: 'Pool mount point.'
+                from:
+                  type: string
+                  description: 'Branches to take the files from, separated by colons.'
+                path:
+                  type: string
+                  description: 'Folder inside the pool, starting with /. Empty: everything.'
+                to:
+                  type: string
+                  description: 'Branch getting the files. Empty: for every file the other writable branch with most room.'
+                kind:
+                  type: string
+                  enum: [move, empty, mover]
+                  description: 'What the job is called: a folder to a chosen disk, a disk emptied, a fast disk emptied to the array.'
+                age_minutes:
+                  type: string
+                  description: 'Leave the files changed in the last minutes.'
+                sync:
+                  type: boolean
+                  description: 'Run the maintenance of the arrays getting the files at the end.'
+      responses:
+        '200':
+          description: Started.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, storage administration not allowed (403), folder not found (404), or another operation or an array running (409).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error, or rsync is missing (501).
+          $ref: '#/components/responses/CommandResult'
+
+  /snapraid/v1/storage/parity_move:
+    post:
+      summary: Move a parity file to another disk
+      description: >
+        Copies the file of a parity level to the disk mounted at "target", reads it back and compares it byte by byte with the original, and only then rewrites the SnapRAID configuration with the new place, in background. The array cannot sync or scrub meanwhile; the old file is never touched, and on any error the copy is deleted. Then run /storage/recover with "accept" to record the new disk. A split parity is refused. Requires net_storage_admin.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - parity
+                - target
+              properties:
+                parity:
+                  type: string
+                  description: 'Parity level: parity, 2-parity, ... 6-parity.'
+                target:
+                  type: string
+                  description: 'Mount point of the new disk: in no array, in no pool, with room for the file.'
+      responses:
+        '200':
+          description: Started.
+          $ref: '#/components/responses/CommandResult'
+        '4XX':
+          description: Client error, storage administration not allowed (403), no such parity (404), or split parity, disk too small or in use, another operation or the array running (409).
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+
   /snapraid/v1/storage/duplicates:
     post:
       summary: Find files present in more than one branch
@@ -1224,7 +1304,7 @@ paths:
         settings: simple settings and documents (maintenance_stop_at,
         smart_short, smart_long, dircache, dircache_minutes, idle_action
         none|suspend|shutdown, idle_minutes, idle_check_network, wol,
-        doc.NAME); an empty value removes the setting. Answers with the
+        sync_ratio, doc.NAME); an empty value removes the setting. Answers with the
         state, as GET /host.
 
         share_save {name, path, smb, nfs, writable, guest, users, recycle,
@@ -1236,6 +1316,12 @@ paths:
         backup_save {name, source, dest_uuid or dest_path, dest_dir, when,
         plug, mirror, enabled}, backup_delete {name}, backup_run {name}
         (background job).
+
+        cache_save {name, pool, branch, when, age_hours, fill, sync,
+        enabled, policy}, cache_delete {name}, cache_run {name} (background
+        job): a fast disk in front of a pool and its mover. usage {path}
+        (background job): size of a folder, disk by disk. surface {device}
+        (background job): a whole disk read block by block.
 
         power_save {disk (serial or device name), apm, aam, wcache}: saved
         and applied with hdparm; "applied" tells if the disk took them.

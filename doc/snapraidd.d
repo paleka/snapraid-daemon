@@ -1424,6 +1424,42 @@ REST API
 	a `sync` after balancing. The request is refused while a SnapRAID task is
 	running.
 
+    /snapraid/v1/storage/move
+	POST starts in background the move of files from some branches of the pool
+	`mountpoint` to other ones, keeping their path inside the pool. `from` has
+	the branches to take the files from, separated by colons; `path` a folder
+	inside the pool, or nothing for everything; `to` the branch getting the
+	files, or nothing for the emptiest of the others, file by file. `kind` is
+	`move` (a folder brought to a chosen disk), `empty` (a disk emptied before
+	it is taken out) or `mover` (a fast disk emptied to the array). With
+	`age_minutes` the files changed more recently are left. With `sync` the
+	maintenance of the arrays getting the files runs at the end.
+
+	A file is removed from its branch only after rsync copied it whole. A file
+	changed in the last five minutes is never moved, as it may still be open.
+	That file, a hard linked file, a file that exists with the same path on a
+	destination, and a file that fits on no destination within the
+	`minfreespace` of the pool are left where they are, counted in `skipped` and
+	listed in the `result` of the job with the reason; the mover leaves the
+	recent files for its next run without listing them. The folders left empty
+	are removed. A folder reached through a link leading out of its disk is
+	refused. The request is refused while an array of the pool runs a sync, a
+	scrub or a recovery, and the arrays wait for the move to end.
+
+    /snapraid/v1/storage/parity_move
+	POST starts in background the move of the parity level `parity` (`parity`,
+	`2-parity`, ...) to the disk mounted at `target`: a disk that is in no
+	array and in no pool, with room for the parity file. The file is copied,
+	then read back and compared byte by byte with the original. Only if they
+	are the same the SnapRAID configuration is rewritten with the new place,
+	keeping the previous one as .snapraidd.bak. The array cannot sync or scrub
+	meanwhile, and the old parity file is never touched: on any error, or if
+	the job is stopped, the copy is deleted and the array goes on as before.
+
+	For the array the parity is then on a changed disk: run
+	/snapraid/v1/storage/recover with `accept` to record it. A parity split in
+	more files is refused.
+
     /snapraid/v1/storage/duplicates
 	POST starts in background the search of files present with the same path in
 	more than one branch of the pool `mountpoint`. The first 500 are listed in
@@ -1482,14 +1518,33 @@ REST API
 	`wol`: Wake-on-LAN on the network cards, with ethtool, also at every
 	start.
 
+	`sync_ratio`: a number N. A sync of a scheduled or requested maintenance
+	stopped only by `sync_threshold_deletes` is run again without the limit
+	when the files added are at least N times the deleted ones, as after
+	moving or renaming many files. A sync stopped by `sync_threshold_updates`
+	always waits. 0 or nothing turns it off.
+
 	The other requests: `share_save`, `share_delete`, `share_user_set`,
 	`share_user_delete`, `permissions` (SMB and NFS shares), `backup_save`,
 	`backup_delete`, `backup_run` (copies of a folder with rsync to a disk
 	given by UUID, on a schedule, when the disk is plugged in, or on request),
 	`power_save` (APM, AAM and write cache with hdparm, also at every start),
-	`smart_test`, `wipe`, `copy`, `file_rename`, `file_delete`, `wol` and
-	`restore`. Wipe, copy, backup and permissions run as the background job
-	of /snapraid/v1/storage/job. The OpenAPI description has every field.
+	`smart_test`, `wipe`, `copy` (a folder or a single file), `usage` (the
+	size of a folder, and how much of it is on every disk of its pool),
+	`surface` (a whole disk read block by block, writing nothing),
+	`file_rename`, `file_delete`, `wol` and `restore`. Wipe, copy, backup,
+	usage, surface and permissions run as the background job of
+	/snapraid/v1/storage/job. The OpenAPI description has every field.
+
+	`cache_save`, `cache_delete` and `cache_run` handle a fast disk in front
+	of a pool: a branch of the pool `pool`, mounted at `branch`, that is in no
+	array and comes first with the `ff` create policy, so that new files are
+	written to it. Its files are moved to the other branches by
+	/snapraid/v1/storage/move at the times of `when`, leaving the ones changed
+	in the last `age_hours`, and at once, all of them, when the disk is more
+	than `fill` percent full; `sync` runs the maintenance after. A file on the
+	fast disk is not protected by the parity until it is moved: GET
+	/snapraid/v1/host tells how many files wait on every fast disk.
 
 	SMB shares are written in /etc/samba/snapraidd-shares.conf, included by
 	one line added at the end of /etc/samba/smb.conf, whose previous version
