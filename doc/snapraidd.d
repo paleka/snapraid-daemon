@@ -1442,6 +1442,71 @@ REST API
 	string, telling for every entry in which branches it is present, and whether
 	a file exists in more than one.
 
+    /snapraid/v1/host
+	The settings of the machine, beside the arrays, are kept in
+	snapraidd-host.conf next to the main configuration file, and a thread of
+	the daemon acts on them once a minute. Linux only. Reading them is free;
+	every change, and reading the diagnostics, the open files and the backup
+	of the settings, requires the `net_storage_admin` option, like the storage
+	endpoints. The Web UI sets all of them from its pages for everyday use.
+
+	GET returns the settings, the shares, the backups with their last result,
+	the power settings of the disks, the schedule of the SMART self-tests, the
+	idle action and why the machine is busy, the folder cache, the documents of
+	the UI, the tools installed, and some facts for health checks.
+
+	POST /snapraid/v1/host/settings sets simple settings, an empty value
+	removes one:
+
+	`maintenance_stop_at`: a time, like 07:00. A sync or a scrub of a scheduled
+	maintenance still running then is stopped; the next maintenance goes on
+	from there.
+
+	`smart_short`, `smart_long`: schedules of the SMART self-tests of every disk
+	of the arrays, like the maintenance schedule, plus DAY#N for the N-th of
+	that day in the month: `Sat#1 04:30` is the first Saturday.
+
+	`dircache`, `dircache_minutes`: keep the folder listings of the data disks
+	in memory, reading them again every few minutes, and lower
+	vfs_cache_pressure, so browsing does not spin the disks up. A disk in
+	standby is never woken for it.
+
+	`idle_action` (none, suspend, shutdown), `idle_minutes`,
+	`idle_check_network`: suspend or power off the machine when no task or
+	storage job runs, nobody is connected to a share or with SSH, the disks of
+	the arrays are not read or written, the network moves less than 100 KB/s,
+	and no maintenance is due in the next 30 minutes. Never in the first 20
+	minutes after the start. With SNAPRAIDD_HOST_DRYRUN=1 in the environment
+	the action is only logged.
+
+	`wol`: Wake-on-LAN on the network cards, with ethtool, also at every
+	start.
+
+	The other requests: `share_save`, `share_delete`, `share_user_set`,
+	`share_user_delete`, `permissions` (SMB and NFS shares), `backup_save`,
+	`backup_delete`, `backup_run` (copies of a folder with rsync to a disk
+	given by UUID, on a schedule, when the disk is plugged in, or on request),
+	`power_save` (APM, AAM and write cache with hdparm, also at every start),
+	`smart_test`, `wipe`, `copy`, `file_rename`, `file_delete`, `wol` and
+	`restore`. Wipe, copy, backup and permissions run as the background job
+	of /snapraid/v1/storage/job. The OpenAPI description has every field.
+
+	SMB shares are written in /etc/samba/snapraidd-shares.conf, included by
+	one line added at the end of /etc/samba/smb.conf, whose previous version
+	is kept as smb.conf.snapraidd.bak. NFS exports are written in
+	/etc/exports.d/snapraidd.exports.
+
+    /snapraid/v1/host/WHAT
+	GET `history`: read and written KB of the disks of the arrays every 5
+	minutes, for a day. `network`: the network cards and their Wake-on-LAN
+	state. `share_users`: the users of the SMB shares. `smart?device=DEV`: the
+	self-test log of a disk. `openfiles?path=DIR`: the programs keeping a mount
+	busy. `diagnostics`: one text file for a request of help, without serial
+	numbers, the name of the machine, credentials, access lists and the
+	commands of hooks and notifications. `settings_backup`: the configuration
+	files of the daemon, of the arrays, of the machine and fstab, as JSON, for
+	`restore`.
+
     /snapraid/v1/arrays
 	More than one array can be handled by the same daemon. The array of the main
 	configuration file is named `default` and always exists. Every other array has
@@ -1639,6 +1704,11 @@ Files
 	The primary system data directory. This is the first location
 	searched for the web dashboard ZIP file (e.g., commander.zip or brutale.zip).
 	If not found here, the daemon falls back to `/usr/share/snapraidd`.
+
+    /etc/snapraidd-host.conf
+	The settings of the machine: shares, backups, power, schedules of the SMART
+	self-tests and the documents of the Web UI. Written by the daemon, next to
+	the main configuration file.
 
     /etc/snapraidd.conf
 	The secondary/system-wide configuration file location, used if

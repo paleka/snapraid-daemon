@@ -1157,6 +1157,120 @@ paths:
           description: Server error.
           $ref: '#/components/responses/CommandResult'
 
+  /snapraid/v1/host:
+    get:
+      summary: Settings and state of the machine
+      description: >
+        The settings of the machine kept beside the arrays, in
+        snapraidd-host.conf next to the main configuration: shares, backups
+        and their last result, disk power settings, SMART self-test schedule,
+        idle action and its current state, folder cache, documents of the UI,
+        the tools installed, and some facts for health checks (free space of
+        the system disk and of the log directory, clock synchronization,
+        Samba ready). Linux only.
+      responses:
+        '200':
+          description: Retrieved successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+
+  /snapraid/v1/host/{what}:
+    get:
+      summary: Information of the machine
+      description: >
+        history (read and written KB of the disks of the arrays, every 5
+        minutes for a day), network (network cards and their Wake-on-LAN
+        state), share_users (users of the SMB shares), smart?device=DEV (the
+        self-test log of a disk, as smartctl prints it). Needing the storage
+        administration rights: openfiles?path=DIR (the programs keeping a
+        mount busy), diagnostics (one text file without serial numbers, name
+        of the machine, credentials, access lists and commands of hooks and
+        notifications), settings_backup (the configuration files, as JSON).
+      parameters:
+        - name: what
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [history, network, share_users, smart, openfiles, diagnostics, settings_backup]
+        - name: device
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: path
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Retrieved successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+        '4XX':
+          description: Client error.
+          $ref: '#/components/responses/CommandResult'
+    post:
+      summary: Change the machine
+      description: >
+        Needs the storage administration rights. The body is a flat JSON
+        object of strings, numbers and booleans.
+
+        settings: simple settings and documents (maintenance_stop_at,
+        smart_short, smart_long, dircache, dircache_minutes, idle_action
+        none|suspend|shutdown, idle_minutes, idle_check_network, wol,
+        doc.NAME); an empty value removes the setting. Answers with the
+        state, as GET /host.
+
+        share_save {name, path, smb, nfs, writable, guest, users, recycle,
+        recycle_days, nfs_hosts, comment, hidden}, share_delete {name}:
+        Samba and NFS are written and reloaded; "applied" tells if it
+        worked. share_user_set {user, password}, share_user_delete {user}.
+        permissions {path} (background job).
+
+        backup_save {name, source, dest_uuid or dest_path, dest_dir, when,
+        plug, mirror, enabled}, backup_delete {name}, backup_run {name}
+        (background job).
+
+        power_save {disk (serial or device name), apm, aam, wcache}: saved
+        and applied with hdparm; "applied" tells if the disk took them.
+
+        smart_test {device, kind short|long}. wipe {device, method
+        zero|random, confirm (the device again)}, copy {source, target,
+        mirror}: background jobs. file_rename {path, name}, file_delete
+        {path}. wol: apply Wake-on-LAN now. restore {path, text}: write one
+        configuration file given by settings_backup; a SnapRAID configuration
+        goes through the checks of PUT storage/engine_conf.
+
+        The background jobs are followed with GET /snapraid/v1/storage/job
+        and stopped with POST /snapraid/v1/storage/job_stop.
+      parameters:
+        - name: what
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '202':
+          description: Done or started.
+        '4XX':
+          description: Client error.
+          $ref: '#/components/responses/CommandResult'
+        '5XX':
+          description: Server error.
+          $ref: '#/components/responses/CommandResult'
+
   /snapraid/v1/arrays:
     get:
       summary: List the arrays

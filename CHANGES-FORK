@@ -6,9 +6,10 @@ by Andrea Mazzoleni (https://github.com/amadvance/snapraid-daemon).
 
 The original project is licensed under GPL-3.0-or-later, and so are the
 additions. Files that already existed keep the copyright of their author.
-The new files (daemon/storage.c, daemon/storage.h, daemon/arrays.c,
-daemon/arrays.h, js/storage.js and js/arrays.js of both UIs, test/ui/,
-installer.sh) are copyright of Robert Paleka.
+The new files (daemon/storage.c, daemon/storage.h, daemon/storage_int.h,
+daemon/arrays.c, daemon/arrays.h, daemon/host.c, daemon/host.h,
+js/storage.js, js/arrays.js, js/simple.js, js/plain.js and css/simple.css of
+both UIs, test/ui/, installer.sh) are copyright of Robert Paleka.
 
 The additions were written with the help of an AI coding assistant (Claude).
 The AGENTS.md file of the original project asks agents to never commit to
@@ -97,6 +98,61 @@ protected by 'net_auth_credential' or 'net_acl'. Linux only.
   Node.js is installed, the tests of the logic of the Storage and Arrays
   pages.
 
+* Pages for everyday use, in both UIs, for people who are not technical:
+  Home (one headline saying if the files are safe, with the one thing to do,
+  four tiles, what needs attention and what happened lately), My files,
+  Sharing, Backups, Disks, Protection, Alerts, System and Help. Plain words,
+  the words of the trade explained on hover, one main action per page, a
+  confirmation telling what happens and what does not change before every
+  change, and every saved setting read back from the daemon and said in words.
+  The detailed pages of the daemon are under "Advanced" in the menu; the
+  former Dashboard is "Status details" (#/dashboard).
+
+* Settings of the machine, beside the arrays, in snapraidd-host.conf next to
+  the main configuration, with a thread acting on them once a minute, and the
+  /snapraid/v1/host endpoints. Linux only, and like the storage endpoints
+  every change needs the storage administration rights:
+
+  - Time window of the maintenance: a sync or scrub of a scheduled
+    maintenance still running at the set time is stopped; the next one goes on.
+  - SMART self-tests of every disk of the arrays, short and long, on a
+    schedule ("Sun 03:00", "Sat#1 04:30" for the first Saturday of the
+    month) or on request, and their log.
+  - Power settings of the disks (APM, AAM, write cache) with hdparm,
+    applied again at every start.
+  - Folder listings kept in memory: the folders of the data disks that are
+    spinning are read again every few minutes, and vfs_cache_pressure is
+    lowered, so browsing does not spin the disks up.
+  - Suspend or power off when the machine is idle (no task, no storage job,
+    nobody on a share or on SSH, no disk activity, little network traffic, no
+    maintenance in the next 30 minutes), and Wake-on-LAN with ethtool.
+  - SMB shares (with Samba: one include line at the end of smb.conf and the
+    file /etc/samba/snapraidd-shares.conf), NFS exports
+    (/etc/exports.d/snapraidd.exports), users of the shares, recycle bin
+    with automatic cleaning, and a reset of the permissions of a share.
+  - Backups of a folder to a disk given by its UUID, or to a folder, with
+    rsync: on a schedule, when the disk is plugged in, or on request. A disk
+    not mounted is mounted for the run and released after.
+  - Wipe of a whole disk (zeros or random data), refused for the disks of the
+    arrays and for disks in use.
+  - Copy of a folder to another disk, rename and delete of files and folders
+    of the disks and of the pools.
+  - The programs keeping a mount busy.
+  - Read and write history of the disks of the arrays, for the last day.
+  - Diagnostics in one text file, without serial numbers, the name of the
+    machine, credentials, access lists and the commands of notifications
+    and hooks.
+  - Backup of the configuration files in one JSON file, and their restore,
+    one file at a time, keeping the old one as .before-restore.
+  - Small documents of the UI (the map of the disk bays).
+
+  SNAPRAIDD_HOST_DRYRUN=1 in the environment of the daemon makes the idle
+  action only logged: the lab uses it.
+
+* The background job of the storage page is shared by the long operations of
+  the machine (wipe, copy, backup, permissions): one at a time, with the same
+  progress and stop.
+
 
 Changes to existing files
 -------------------------
@@ -146,6 +202,19 @@ For more arrays:
     daemon/version.c           the update check reads the releases of the fork
     installer.sh                 installer for systems using apt (new file)
     .github/workflows/release.yml  build of the releases (new file)
+
+For the pages for everyday use and the settings of the machine:
+
+    daemon/rest.c              /snapraid/v1/host endpoints
+    daemon/daemon.c            start and stop of the thread of the machine
+    daemon/selftest.c          call of host_selftest()
+    daemon/storage.c           helpers shared with host.c (storage_int.h),
+                               job_is_running(), job_progress()
+    commander/, brutale/       index.html (grouped menu), js/app.js (routes of
+                               the new pages, old Dashboard at #/dashboard),
+                               js/utils.js (icons)
+    Makefile.am                new sources, UI files and tests
+    snapraidd.yaml             OpenAPI description of the new endpoints
 
 
 How it is tested

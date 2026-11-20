@@ -41,43 +41,59 @@ Features
    - Warn that files on the cache are not protected by parity until moved.
 
 3. Protection window
-   - Show how much data changed since the last sync, and for how long it has
-     been unprotected. SnapRAID parity is a snapshot, not real time.
+   - Done: the Protection and Home pages show the files changed since the
+     last sync, its age and the next one.
    - Optional sync when the changes pass a threshold, and after the mover.
+   - The added/deleted ratio that lets a sync go on past the delete
+     threshold (snapraid-aio-script): the threshold is checked by the
+     engine, the daemon would need a diff before the sync.
 
 4. Shares
-   - Top-level folders of the pool as shares, with their size and disks.
-   - Export over SMB and NFS from the UI (Samba and exports configuration).
+   - Done: SMB and NFS shares, users, recycle bin, permission reset.
+   - Size of every share and the disks holding it.
    - Keep a folder together on one disk (mergerfs "ep" policies), include and
-     exclude disks per share.
+     exclude disks per share. Friendly names of the placement policies on
+     the Pool tab.
 
 5. Disk burn-in
-   - SMART extended test and a full surface pass (badblocks) before a new
-     disk is trusted, as a background job with a report.
+   - Done: SMART short and long self-tests, on request and on a schedule.
+   - A full surface pass (badblocks) before a new disk is trusted, as a
+     background job with a report.
 
 6. Empty a disk, move between disks
    - "Evacuate this disk" to the others of the pool, before removing it.
    - Move a folder to a chosen disk from the file browser.
 
 7. Notification channels
-   - Ready-made email, ntfy, Telegram and Discord on top of the notify hook
-     of the daemon, with a test button.
+   - Done: ntfy, Discord, Telegram, email and any web address, with a test,
+     and pop-ups of the browser.
+   - More channels at once, and Web Push without the page open.
 
 8. History of sync and scrub
-   - Duration, speed, errors found and fixed for every run, as a chart.
+   - Done: duration and speed of every run on the Protection page, read and
+     write history of the disks.
+   - Errors found and fixed for every run.
 
 9. Encrypted disks
    - LUKS at format time, unlock at boot with a key file, state in the
      inventory.
 
 10. External disks and remote mounts
+    - Done for backups: a USB disk is mounted for the run and released.
     - Mount and eject USB disks with one click.
     - SMB and NFS mounts as sources to copy data into the array.
 
 11. UPS
     - Pause sync and scrub on battery (NUT, apcupsd).
 
-12. More arrays, what is left
+12. Pages for everyday use, what is left
+    - Copy of a single file (only folders are copied today).
+    - The time window of the maintenance tried end to end in the lab: the
+      emulated disks are too fast for a sync still running at a set time.
+    - The idle action tried on a real machine: the lab only logs it.
+    - A first-run tour of the pages.
+
+13. More arrays, what is left
     - Windows: built from the same sources, but not compiled nor tried.
     - Pools saved in fstab: an explicit order after their branches for
       systemd, on top of "nofail" and of the protected mount points.
