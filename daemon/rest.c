@@ -14,6 +14,7 @@
 #include "smart.h"
 #include "web.h"
 #include "storage.h"
+#include "host.h"
 #include "rest.h"
 #include "arrays.h"
 
@@ -2918,6 +2919,171 @@ static int handler_storage(struct mg_connection* conn, void* cbdata)
 	return 200;
 }
 
+/****************************************************************************/
+/* host */
+
+/**
+ * Parse a flat JSON object of strings, booleans and numbers into names and values.
+ * Booleans become "1" and "0". The strings are decoded in place in buf.
+ */
+static int json_flat(char* js, ssize_t jl, struct host_args* args, char* buf, size_t buf_size, char* msg, size_t msg_size)
+{
+	jsmntok_t jv[JSMN_TOKEN_MAX];
+	int jc;
+	int j = 0;
+	size_t used = 0;
+
+	args->count = 0;
+	if (json_parse(js, jl, jv, &jc, 1, msg, msg_size) != 0)
+		return -1;
+	if (jc == 0)
+		return 0;
+	if (jv[0].type != JSMN_OBJECT) {
+		snprintf(msg, msg_size, "Missing root JSON object");
+		return -1;
+	}
+
+	int c0 = jv[j++].size;
+	while (c0-- > 0) {
+		if (args->count == HOST_ARGS_MAX) {
+			snprintf(msg, msg_size, "Too many fields");
+			return -1;
+		}
+		if (jv[j].type != JSMN_STRING || jv[j].size != 1) {
+			snprintf(msg, msg_size, "Invalid JSON object");
+			return -1;
+		}
+		char* key = buf + used;
+		if (json_string(js, &jv[j], key, buf_size - used) != 0) {
+			snprintf(msg, msg_size, "Invalid field name");
+			return -1;
+		}
+		used += strlen(key) + 1;
+		for (unsigned k = 0; k < args->count; ++k) {
+			if (strcmp(args->key[k], key) == 0) {
+				snprintf(msg, msg_size, "Duplicate field '%s'", key);
+				return -1;
+			}
+		}
+		++j;
+		char* val = buf + used;
+		if (jv[j].type == JSMN_STRING) {
+			if (json_string(js, &jv[j], val, buf_size - used) != 0) {
+				snprintf(msg, msg_size, "Invalid value of '%s'", key);
+				return -1;
+			}
+		} else if (jv[j].type == JSMN_PRIMITIVE) {
+			int flag;
+			size_t len = jv[j].end - jv[j].start;
+			if (json_boolean(js, &jv[j], &flag) == 0) {
+				snprintf(val, buf_size - used, "%d", flag);
+			} else if (len < 32 && (isdigit((unsigned char)js[jv[j].start]) || js[jv[j].start] == '-')) {
+				memcpy(val, js + jv[j].start, len);
+				val[len] = 0;
+			} else {
+				snprintf(msg, msg_size, "Invalid value of '%s'", key);
+				return -1;
+			}
+		} else {
+			snprintf(msg, msg_size, "The value of '%s' must be a string, a number or a boolean", key);
+			return -1;
+		}
+		used += strlen(val) + 1;
+		args->key[args->count] = key;
+		args->val[args->count] = val;
+		++args->count;
+		++j;
+	}
+
+	return 0;
+}
+
+/**
+ * GET  /snapraid/v1/host[/what]
+ * POST /snapraid/v1/host/action
+ */
+static int handler_host(struct mg_connection* conn, void* cbdata)
+{
+	if (!rest_uri_is_lowercase(conn))
+		return send_lowercase(conn);
+
+	struct snapraid_state* state = cbdata;
+	const struct mg_request_info* ri = mg_get_request_info(conn);
+	char msg[MSG_MAX];
+	int level = 0;
+	ss_t s;
+
+	if (strcmp(ri->request_method, "OPTIONS") == 0)
+		return send_no_content(conn);
+
+	const char* what = ri->local_uri + strlen("/snapraid/v1/host");
+	if (*what == '/')
+		++what;
+
+	int is_get = strcmp(ri->request_method, "GET") == 0;
+	if (!is_get && strcmp(ri->request_method, "POST") != 0)
+		return send_json_error(conn, 405, "Only GET and POST are allowed for this endpoint");
+	if (!is_get && what[0] == 0)
+		return send_json_error(conn, 405, "Only GET is allowed for this endpoint");
+
+	/* changing the machine, or reading its secrets, is storage administration */
+	if ((!is_get || host_get_is_private(what)) && storage_admin_check(state, msg, sizeof(msg)) != 0)
+		return send_json_error(conn, 403, msg);
+
+	struct host_args args;
+	char* js = 0;
+	char* buf = 0;
+	ssize_t jl = 0;
+	int status;
+	args.count = 0;
+
+	if (is_get) {
+		static const char* QUERY[] = { "device", "path", 0 };
+		static char qbuf[2][PATH_MAX];
+		char local[2][PATH_MAX];
+		(void)qbuf;
+		for (unsigned i = 0; QUERY[i] && ri->query_string; ++i) {
+			if (mg_get_var(ri->query_string, strlen(ri->query_string), QUERY[i], local[i], sizeof(local[i])) > 0) {
+				args.key[args.count] = QUERY[i];
+				args.val[args.count] = local[i];
+				++args.count;
+			}
+		}
+		ss_init(&s, JSON_INITIAL_SIZE);
+		ss_json_open(&s, &level);
+		status = host_get(what, &args, &s, level, msg, sizeof(msg));
+	} else {
+		status = json_read(conn, &js, &jl, msg, sizeof(msg));
+		if (status != 200)
+			return send_json_error(conn, status, msg);
+		size_t size = (jl + 1) * 2 + 64;
+		buf = malloc_nofail(size);
+		if (json_flat(js, jl, &args, buf, size, msg, sizeof(msg)) != 0) {
+			free(js);
+			free(buf);
+			return send_json_error(conn, 400, msg);
+		}
+		ss_init(&s, JSON_INITIAL_SIZE);
+		ss_json_open(&s, &level);
+		ss_json_bool(&s, level, "success", 1);
+		status = host_post(what, &args, &s, level, msg, sizeof(msg));
+	}
+
+	free(js);
+	free(buf);
+
+	if (status != 0) {
+		ss_done(&s);
+		return send_json_error(conn, status, msg);
+	}
+
+	ss_json_close(&s, &level);
+	send_json_answer(conn, is_get ? 200 : 202, &s);
+	ss_done(&s);
+
+	return is_get ? 200 : 202;
+}
+
 /**
  * PUT  /snapraid/v1/storage/engine_conf
  * POST /snapraid/v1/storage/format
@@ -4306,6 +4472,8 @@ int rest_init(struct snapraid_state* state, int net_enabled, const char* net_por
 		|| mg_set_request_handler(state->host->rest_context, "/snapraid/v1/arrays$", handler_arrays, state) != 0
 		|| mg_set_request_handler(state->host->rest_context, REST_ARRAYS "*$", handler_arrays_one, state) != 0
 		|| mg_set_request_handler(state->host->rest_context, "/metrics$", handler_metrics, state) != 0
+		|| mg_set_request_handler(state->host->rest_context, "/snapraid/v1/host$", handler_host, state) != 0
+		|| mg_set_request_handler(state->host->rest_context, "/snapraid/v1/host/*$", handler_host, state) != 0
 
 	        /*
 	         * Keep REST unknown paths inside the REST namespace, but make the

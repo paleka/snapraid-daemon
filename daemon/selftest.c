@@ -9,6 +9,7 @@
 #include "selftest.h"
 #include "version.h"
 #include "storage.h"
+#include "host.h"
 
 struct filter_escape_test_case {
 	const char* input;
@@ -329,6 +330,8 @@ int selftest(void)
 	if (test_version_cmp() != 0)
 		return -1;
 
+	if (host_selftest() != 0)
+		return -1;
 	if (storage_selftest() != 0)
 		return -1;
 

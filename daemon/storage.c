@@ -10,6 +10,7 @@
 #include "storage.h"
 #include "arrays.h"
 #include "memory.h"
+#include "storage_int.h"
 
 /****************************************************************************/
 /* storage */
@@ -39,13 +40,13 @@ static pthread_mutex_t storage_mutex = PTHREAD_MUTEX_INITIALIZER;
  */
 static __thread unsigned priv_depth;
 
-static void priv_enter(void)
+void priv_enter(void)
 {
 	if (priv_depth++ == 0)
 		os_privileges_acquire();
 }
 
-static void priv_leave(void)
+void priv_leave(void)
 {
 	if (--priv_depth == 0)
 		os_privileges_release();
@@ -59,7 +60,7 @@ static void priv_leave(void)
  * or in /etc/fstab. Only a conservative character set is accepted, which also
  * avoids any need of quoting in fstab.
  */
-static int valid_chars(const char* str, const char* extra, size_t max)
+int valid_chars(const char* str, const char* extra, size_t max)
 {
 	size_t len = strlen(str);
 
@@ -77,7 +78,7 @@ static int valid_chars(const char* str, const char* extra, size_t max)
 	return 1;
 }
 
-static int valid_path(const char* path)
+int valid_path(const char* path)
 {
 	if (path[0] != '/' || path[1] == 0)
 		return 0;
@@ -109,7 +110,7 @@ static int valid_source(const char* source)
 }
 
 /** Directories that can never be used as mount point. */
-static int system_path(const char* path)
+int system_path(const char* path)
 {
 	static const char* exact[] = { "/", "/mnt", "/media", "/srv", "/home", "/opt", "/root", "/tmp", 0 };
 	static const char* tree[] = { "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc", "/run", "/sbin", "/sys", "/usr", "/var", 0 };
@@ -202,7 +203,7 @@ static int job_busy(char* msg, size_t msg_size)
 	return 0;
 }
 
-static int job_stopping(void)
+int job_stopping(void)
 {
 	pthread_mutex_lock(&job_mutex);
 	int stop = job.stop;
@@ -210,14 +211,55 @@ static int job_stopping(void)
 	return stop;
 }
 
-static void job_current(const char* what)
+void job_current(const char* what)
 {
 	pthread_mutex_lock(&job_mutex);
 	sncpy(job.current, sizeof(job.current), what);
 	pthread_mutex_unlock(&job_mutex);
 }
 
-static void job_finish(int status, const char* message)
+int job_is_running(void)
+{
+	pthread_mutex_lock(&job_mutex);
+	int running = job.running;
+	pthread_mutex_unlock(&job_mutex);
+	return running;
+}
+
+void job_progress(uint64_t files, uint64_t bytes)
+{
+	pthread_mutex_lock(&job_mutex);
+	job.files += files;
+	job.bytes += bytes;
+	pthread_mutex_unlock(&job_mutex);
+}
+
+void job_claim(const char* array)
+{
+	pthread_mutex_lock(&job_mutex);
+	if (job.claims_count < JOB_CLAIMS_MAX)
+		sncpy(job.claims[job.claims_count++], ARRAY_NAME_MAX, array);
+	pthread_mutex_unlock(&job_mutex);
+}
+
+/** Add an entry {"name", "value"} to the result of the job. */
+void job_result_line(const char* name, const char* value)
+{
+	int level = 1;
+
+	pthread_mutex_lock(&job_mutex);
+	++job.found;
+	if (job.found <= JOB_RESULT_MAX && job.result_valid) {
+		ss_t* s = &job.result;
+		ss_json_open(s, &level);
+		ss_json_str(s, level, "name", name);
+		ss_json_str(s, level, "value", value);
+		ss_json_close(s, &level);
+	}
+	pthread_mutex_unlock(&job_mutex);
+}
+
+void job_finish(int status, const char* message)
 {
 	pthread_mutex_lock(&job_mutex);
 	job.status = status;
@@ -250,7 +292,7 @@ int storage_job_claims_array(const char* name)
 }
 
 /** Reserve the job slot. The caller fills the arguments and starts the thread. */
-static int job_begin(const char* kind, const char* target, char* msg, size_t msg_size)
+int job_begin(const char* kind, const char* target, char* msg, size_t msg_size)
 {
 	pthread_mutex_lock(&job_mutex);
 	if (job.running) {
@@ -275,7 +317,7 @@ static int job_begin(const char* kind, const char* target, char* msg, size_t msg
 	return 0;
 }
 
-static int job_launch(void* (*func)(void*), char* msg, size_t msg_size)
+int job_launch(void* (*func)(void*), char* msg, size_t msg_size)
 {
 	pthread_t thread;
 	pthread_attr_t attr;
@@ -355,7 +397,7 @@ int storage_job_stop(char* msg, size_t msg_size)
 
 static const char* tool_dirs[] = { "/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/sbin", "/usr/local/bin", 0 };
 
-static int tool_find(const char* name, char* path, size_t path_size)
+int tool_find(const char* name, char* path, size_t path_size)
 {
 	for (unsigned i = 0; tool_dirs[i]; ++i) {
 		snprintf(path, path_size, "%s/%s", tool_dirs[i], name);
@@ -367,7 +409,7 @@ static int tool_find(const char* name, char* path, size_t path_size)
 	return -1;
 }
 
-static int tool_exists(const char* name)
+int tool_exists(const char* name)
 {
 	char path[PATH_MAX];
 
@@ -381,7 +423,7 @@ static int tool_exists(const char* name)
  * \param out Collects stdout and stderr, or 0 to discard them.
  * \return The exit code of the tool, -1 on failure, -2 if the tool is missing.
  */
-static int tool_run(const char* name, const char** args, const char* stdin_text, ss_t* out, unsigned timeout_sec)
+int tool_run(const char* name, const char** args, const char* stdin_text, ss_t* out, unsigned timeout_sec)
 {
 	char path[PATH_MAX];
 	const char* argv[32];
@@ -494,7 +536,7 @@ static int tool_run(const char* name, const char** args, const char* stdin_text,
 }
 
 /** Run a tool and report its failure, with the last line it printed. */
-static int tool_check(const char* name, const char** args, const char* stdin_text, unsigned timeout_sec, char* msg, size_t msg_size)
+int tool_check(const char* name, const char** args, const char* stdin_text, unsigned timeout_sec, char* msg, size_t msg_size)
 {
 	ss_t out;
 	int ret;
@@ -533,7 +575,7 @@ static int tool_check(const char* name, const char** args, const char* stdin_tex
 /* files */
 
 /** Read a whole text file. The result is always 0 terminated. */
-static int file_read(const char* path, ss_t* s)
+int file_read(const char* path, ss_t* s)
 {
 	priv_enter();
 	int f = open(path, O_RDONLY | O_CLOEXEC);
@@ -562,7 +604,7 @@ static int file_read(const char* path, ss_t* s)
  * Replace a text file in an atomic way, keeping the previous version with
  * the specified backup extension. Symbolic links are followed.
  */
-static int file_replace(const char* path, const char* text, const char* backup_ext, mode_t mode)
+int file_replace(const char* path, const char* text, const char* backup_ext, mode_t mode)
 {
 	char real[PATH_MAX];
 	char tmp[PATH_MAX + 32];
@@ -621,7 +663,7 @@ bail:
 	return ret;
 }
 
-static int make_dirs(const char* path)
+int make_dirs(const char* path)
 {
 	char buf[PATH_MAX];
 	int ret = 0;
@@ -671,7 +713,7 @@ static void dir_guard(const char* path, int on)
 }
 
 /** Check if a path is the other one, or inside it. */
-static int path_inside(const char* path, const char* dir)
+int path_inside(const char* path, const char* dir)
 {
 	size_t len = strlen(dir);
 
@@ -720,12 +762,6 @@ static int option_has(const char* options, const char* option)
 /****************************************************************************/
 /* mount table */
 
-struct mount_entry {
-	char source[PATH_MAX];
-	char target[PATH_MAX];
-	char fstype[64];
-	char options[1024];
-};
 
 /** Decode the \040 like sequences used in /proc/mounts and /etc/fstab. */
 static void mount_unescape(char* str)
@@ -747,7 +783,7 @@ static void mount_unescape(char* str)
  * Parse the next line of a mount table.
  * \return 1 if an entry was read, 0 for a line without entry, -1 at the end.
  */
-static int mount_next(const char** cursor, struct mount_entry* entry, const char** line_begin, const char** line_end)
+int mount_next(const char** cursor, struct mount_entry* entry, const char** line_begin, const char** line_end)
 {
 	const char* p = *cursor;
 	char line[PATH_MAX * 2 + 1200];
@@ -796,13 +832,13 @@ static int mount_next(const char** cursor, struct mount_entry* entry, const char
 	return 1;
 }
 
-static int is_mergerfs(const char* fstype)
+int is_mergerfs(const char* fstype)
 {
 	return strcmp(fstype, "fuse.mergerfs") == 0 || strcmp(fstype, "mergerfs") == 0;
 }
 
 /** Find the filesystem mounted at the specified directory. The last one wins. */
-static int mount_find(const char* target, struct mount_entry* found)
+int mount_find(const char* target, struct mount_entry* found)
 {
 	ss_t s;
 	struct mount_entry entry;
@@ -1673,7 +1709,7 @@ static int sys_read(const char* path, char* buf, size_t size)
 	return 0;
 }
 
-static int dir_is_empty(const char* path)
+int dir_is_empty(const char* path)
 {
 	DIR* d = opendir(path);
 	struct dirent* dd;
@@ -1723,7 +1759,7 @@ static unsigned disk_partitions(const char* name, char* first, size_t first_size
 }
 
 /** Check that neither the disk nor any of its partitions is in use. */
-static int disk_in_use(const char* name, char* msg, size_t msg_size)
+int disk_in_use(const char* name, char* msg, size_t msg_size)
 {
 	char path[PATH_MAX];
 	ss_t s;
@@ -2378,14 +2414,7 @@ int storage_format_start(const char* device, const char* fstype, const char* lab
 /****************************************************************************/
 /* pool branches */
 
-#define BRANCH_MAX 64
 
-struct pool_branch {
-	char path[PATH_MAX];
-	int writable;
-	uint64_t total;
-	uint64_t free;
-};
 
 /** Split the branch list of mergerfs: /path=MODE,MINFREE:/path... */
 static void pool_parse_branches(char* value, struct pool_branch* branches, unsigned* count)
@@ -2429,7 +2458,7 @@ static uint64_t balance_meet(uint64_t used_src, uint64_t total_src, uint64_t use
 }
 
 /** A directory inside a pool: absolute, and never climbing out of it. */
-static int valid_browse_path(const char* path)
+int valid_browse_path(const char* path)
 {
 	size_t len = strlen(path);
 
@@ -2444,7 +2473,7 @@ static int valid_browse_path(const char* path)
 }
 
 /** Read the branches of a mounted pool. */
-static int pool_branches(const char* mountpoint, struct pool_branch* branches, unsigned* count, char* msg, size_t msg_size)
+int pool_branches(const char* mountpoint, struct pool_branch* branches, unsigned* count, char* msg, size_t msg_size)
 {
 	struct mount_entry entry;
 	char value[BRANCH_MAX * 128];
@@ -2461,7 +2490,7 @@ static int pool_branches(const char* mountpoint, struct pool_branch* branches, u
 	return 0;
 }
 
-static void pool_branches_space(struct pool_branch* branches, unsigned count)
+void pool_branches_space(struct pool_branch* branches, unsigned count)
 {
 	for (unsigned i = 0; i < count; ++i) {
 		struct statvfs vfs;
@@ -2475,7 +2504,7 @@ static void pool_branches_space(struct pool_branch* branches, unsigned count)
 }
 
 /** Files that are never touched: SnapRAID's own, and what the filesystem owns. */
-static int walk_skip(const char* name, int top)
+int walk_skip(const char* name, int top)
 {
 	if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
 		return 1;
@@ -2485,13 +2514,12 @@ static int walk_skip(const char* name, int top)
 	return 0;
 }
 
-typedef int walk_func(const char* rel, const struct stat* st, void* arg);
 
 /**
  * Visit the regular files of a tree. The callback gets the path relative to the root,
  * starting with /, and stops the visit returning not zero.
  */
-static int walk_tree(const char* root, const char* rel, unsigned depth, walk_func* func, void* arg)
+int walk_tree(const char* root, const char* rel, unsigned depth, walk_func* func, void* arg)
 {
 	char path[PATH_MAX];
 	int ret = 0;

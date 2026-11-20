@@ -15,6 +15,7 @@
 #include "web.h"
 #include "selftest.h"
 #include "arrays.h"
+#include "host.h"
 
 /****************************************************************************/
 /* helpers */
@@ -400,6 +401,12 @@ int daemon_init(struct snapraid_state* state)
 	 */
 	arrays_start();
 
+	/*
+	 * Start the thread of the machine
+	 */
+	host_init();
+	host_start();
+
 	return 0;
 }
 
@@ -520,6 +527,7 @@ void daemon_done(struct snapraid_state* state)
 {
 	web_done(state);
 	rest_done(state, state->config.net_enabled);
+	host_done();
 	arrays_done();
 	scheduler_done(state);
 	runner_done(state);
