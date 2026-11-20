@@ -5,6 +5,7 @@ import { API, ARRAY_DEFAULT } from './api.js';
 import { loadStorage, initStorage } from './storage.js';
 import { loadArrays, refreshArrays, renderSwitcher, initArrays } from './arrays.js';
 import { Icons, showToast, showConfirm, showConfirmDown, showConfirmDownThreshold, showModal, formatElapsedTime, formatDiskSize, formatSeconds, formatAttr } from './utils.js';
+import { SIMPLE_PAGES, loadSimplePage, simplePulse, simpleHealthWatch, initSimple } from './simple.js';
 import { renderDashboard, renderDisks, renderTasks, renderDifferences, renderRecovery, renderSettings, renderTempSparkline, renderScrubHistory, renderHealthBanner, escHtml } from './ui.js';
 
 // Periodic refresh for pages that need to be updated even without a pulse.
@@ -36,6 +37,9 @@ const app = {
         document.documentElement.dataset.theme = savedTheme;
 
         // Render Icons
+        document.querySelectorAll('[data-icon]').forEach(el => {
+            if (Icons[el.dataset.icon]) el.innerHTML = Icons[el.dataset.icon];
+        });
         document.querySelectorAll('[id^="icon-"]').forEach(el => {
             const iconName = el.id.replace('icon-', '');
             if (iconName === 'theme') {
@@ -111,7 +115,9 @@ const app = {
         });
 
         initStorage();
+        initSimple();
         initArrays(app.selectArray);
+        app.initMenu();
 
         // Navigation
         window.addEventListener('hashchange', app.handleRoute);
@@ -180,9 +186,19 @@ const app = {
         });
     },
 
+    /** The advanced group of the menu stays as the person left it. */
+    initMenu: () => {
+        const adv = document.getElementById('nav-advanced');
+        if (!adv) return;
+        try { adv.open = localStorage.getItem('nav-advanced') === '1'; } catch (ignore) { /* no storage */ }
+        adv.addEventListener('toggle', () => {
+            try { localStorage.setItem('nav-advanced', adv.open ? '1' : '0'); } catch (ignore) { /* no storage */ }
+        });
+    },
+
     redrawGraphs: () => {
         const hash = app.state.currentRoute;
-        if (hash === '#/' && app.state.dashboardArray?.scrub_history) {
+        if (hash === '#/dashboard' && app.state.dashboardArray?.scrub_history) {
             renderScrubHistory('scrub-history-graph', app.state.dashboardArray.scrub_history);
         } else if (hash === '#/disks' && app.state.disks) {
             const data = app.state.disks;
@@ -286,7 +302,7 @@ const app = {
 
             const now = Date.now();
             const hash = app.state.currentRoute;            
-            if (hash === '#/' && (now - app.state.lastSystemRefresh) > REFRESH_INTERVAL_MS) {
+            if (hash === '#/dashboard' && (now - app.state.lastSystemRefresh) > REFRESH_INTERVAL_MS) {
                 needsSystemRefresh = true;
             }
             if (hash === '#/disks' && (now - app.state.lastDisksRefresh) > REFRESH_INTERVAL_MS) {
@@ -294,7 +310,7 @@ const app = {
             }
 
             switch (app.state.currentRoute) {
-                case '#/': // Dashboard - check array and activity
+                case '#/dashboard': // Dashboard - check array and activity
                     if (pulse.array !== oldPulse.array || pulse.activity !== oldPulse.activity) needsRefresh = true;
                     break;
                 case '#/disks': // Disks - check disks
@@ -314,11 +330,15 @@ const app = {
                     break;
             }
 
+            // the pages for everyday use refresh themselves
+            simpleHealthWatch(state);
+            if (SIMPLE_PAGES[hash]) await simplePulse(hash, pulse, oldPulse);
+
             // Also refresh if we reconnected and are currently showing an error
             const isShowingError = !!document.querySelector('#view-container .border-red-500');
 
             if (needsRefresh || needsSystemRefresh || needsDiskRefresh || (wasDisconnected && isShowingError)) {
-                if (hash === '#/') {
+                if (hash === '#/dashboard') {
                     await app.loadDashboard({
                         array: (pulse.array !== oldPulse.array) || wasDisconnected,
                         activity: (pulse.activity !== oldPulse.activity) || wasDisconnected,
@@ -417,7 +437,7 @@ const app = {
 
     getRouteTitle: (route) => {
         switch (route) {
-            case '#/': return 'Dashboard';
+            case '#/dashboard': return 'Status details';
             case '#/disks': return 'Disks';
             case '#/tasks': return 'Tasks';
             case '#/diff': return 'Differences';
@@ -425,7 +445,7 @@ const app = {
             case '#/storage': return 'Storage';
             case '#/arrays': return 'Arrays';
             case '#/settings': return 'Settings';
-            default: return 'Page Not Found';
+            default: return SIMPLE_PAGES[route]?.title || 'Page Not Found';
         }
     },
 
@@ -433,7 +453,7 @@ const app = {
         const route = app.state.currentRoute || '#/';
         const title = baseTitle || app.getRouteTitle(route);
         const titleEl = document.getElementById('page-title');
-        if (titleEl && app.state.arraysCount > 1 && route !== '#/arrays') {
+        if (titleEl && app.state.arraysCount > 1 && route !== '#/arrays' && !SIMPLE_PAGES[route]?.machine) {
             // with more arrays every page says which one it's about
             titleEl.innerText = `${API.array()} · ${title}`;
         } else if (titleEl) {
@@ -460,6 +480,9 @@ const app = {
         document.querySelectorAll('.nav-item').forEach(el => {
             el.classList.toggle('active', el.getAttribute('href') === hash);
         });
+        // a page of the advanced group opens the group
+        const adv = document.getElementById('nav-advanced');
+        if (adv && adv.querySelector(`.nav-item[href="${hash}"]`)) adv.open = true;
 
         const view = document.getElementById('view-container');
         const actions = document.getElementById('header-actions');
@@ -468,9 +491,15 @@ const app = {
         actions.innerHTML = '';
 
         try {
+            if (SIMPLE_PAGES[hash]) {
+                app.updatePageTitle(SIMPLE_PAGES[hash].title);
+                await loadSimplePage(hash, view, actions);
+                app.setConnection(true);
+                return;
+            }
             switch (hash) {
-                case '#/':
-                    app.updatePageTitle('Dashboard');
+                case '#/dashboard':
+                    app.updatePageTitle('Status details');
                     const health = app.state.dashboardArray?.health;
                     if (health === 'failing' || health === 'prefail' || health === 'degraded') {
                         actions.innerHTML = `
@@ -581,7 +610,7 @@ const app = {
             app.setConnection(true);
 
             // Only re-render if we are still on the dashboard
-            if (app.state.currentRoute === '#/') {
+            if (app.state.currentRoute === '#/dashboard') {
                 const active = activity && activity.status !== 'terminated' && activity.status !== 'signaled' && activity.status !== 'canceled';
                 const actions = document.getElementById('header-actions');
                 const health = array?.health;
@@ -943,7 +972,10 @@ const app = {
     },
 
     showSmartDetails: async (deviceNode) => {
-        if (!app.state.disks) return;
+        // the Disks page for everyday use has not loaded them
+        if (!app.state.disks || app.state.currentRoute !== '#/disks') {
+            try { app.state.disks = await API.getDisks(); } catch (e) { showToast(e.message, 'error'); return; }
+        }
 
         let device = null;
         let parentDisk = null;

@@ -59,6 +59,12 @@ tasks, viewing history, and configuring system settings.
 
 ## Page Breakdown
 
+> In the fork (branch `storage`), `#/` is the Home page for everyday use. The pages for
+> everyday use (Home, My files, Sharing, Backups, Disks `#/drives`, Protection, Alerts,
+> System, Help) are in `js/simple.js`, their logic without page in `js/plain.js` (tested by
+> `test/ui/plain.test.mjs`), their style in `css/simple.css`. The pages below are under
+> "Advanced" in the menu; the Dashboard is at `#/dashboard`.
+
 ### 1. Dashboard (`#/`)
 The central hub for monitoring current system status.
 *   **Hero Section**: Displays the active running task (if any) with:

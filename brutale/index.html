@@ -7,6 +7,7 @@
     <title>SnapRAID Brutale</title>
     <script src="js/init.js"></script>
     <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/simple.css">
     <link rel="apple-touch-icon" sizes="180x180" href="/image/apple-touch-icon.png">
     <link rel="icon" type="image/png" sizes="32x32" href="/image/favicon-32x32.png">
     <link rel="icon" type="image/png" sizes="16x16" href="/image/favicon-16x16.png">
@@ -29,29 +30,61 @@
 
             <nav class="nav-links">
                 <a href="#/" class="nav-item active" data-link>
-                    <span class="icon" id="icon-dashboard"></span> Dashboard
+                    <span class="icon" id="icon-home"></span> Home
                 </a>
-                <a href="#/disks" class="nav-item" data-link>
+                <div class="nav-group">Your data</div>
+                <a href="#/files" class="nav-item" data-link>
+                    <span class="icon" id="icon-folder"></span> My files
+                </a>
+                <a href="#/sharing" class="nav-item" data-link>
+                    <span class="icon" id="icon-share"></span> Sharing
+                </a>
+                <a href="#/backups" class="nav-item" data-link>
+                    <span class="icon" id="icon-backup"></span> Backups
+                </a>
+                <div class="nav-group">Your server</div>
+                <a href="#/drives" class="nav-item" data-link>
                     <span class="icon" id="icon-harddrive"></span> Disks
                 </a>
-                <a href="#/storage" class="nav-item" data-link>
-                    <span class="icon" id="icon-storage"></span> Storage
+                <a href="#/protection" class="nav-item" data-link>
+                    <span class="icon" id="icon-shield"></span> Protection
                 </a>
-                <a href="#/arrays" class="nav-item" data-link>
-                    <span class="icon" id="icon-arrays"></span> Arrays
+                <a href="#/alerts" class="nav-item" data-link>
+                    <span class="icon" id="icon-bell"></span> Alerts
                 </a>
-                <a href="#/tasks" class="nav-item" data-link>
-                    <span class="icon" id="icon-activity"></span> Tasks
+                <a href="#/system" class="nav-item" data-link>
+                    <span class="icon" id="icon-settings"></span> System
                 </a>
-                <a href="#/diff" class="nav-item" data-link>
-                    <span class="icon" id="icon-check"></span> Differences
+                <a href="#/help" class="nav-item" data-link>
+                    <span class="icon" id="icon-help"></span> Help
                 </a>
-                <a href="#/recovery" class="nav-item" data-link>
-                    <span class="icon" id="icon-shield"></span> Recovery
-                </a>
-                <a href="#/settings" class="nav-item" data-link>
-                    <span class="icon" id="icon-settings"></span> Settings
-                </a>
+                <details class="nav-advanced" id="nav-advanced">
+                    <summary class="nav-group nav-group-toggle"><span class="icon" id="icon-tools"></span> Advanced</summary>
+                    <a href="#/dashboard" class="nav-item" data-link>
+                        <span class="icon" id="icon-dashboard"></span> Status details
+                    </a>
+                    <a href="#/storage" class="nav-item" data-link>
+                        <span class="icon" id="icon-storage"></span> Storage
+                    </a>
+                    <a href="#/arrays" class="nav-item" data-link>
+                        <span class="icon" id="icon-arrays"></span> Arrays
+                    </a>
+                    <a href="#/disks" class="nav-item" data-link>
+                        <span class="icon" data-icon="harddrive"></span> Disk details
+                    </a>
+                    <a href="#/tasks" class="nav-item" data-link>
+                        <span class="icon" id="icon-activity"></span> Tasks
+                    </a>
+                    <a href="#/diff" class="nav-item" data-link>
+                        <span class="icon" id="icon-check"></span> Differences
+                    </a>
+                    <a href="#/recovery" class="nav-item" data-link>
+                        <span class="icon" data-icon="shield"></span> Recovery
+                    </a>
+                    <a href="#/settings" class="nav-item" data-link>
+                        <span class="icon" data-icon="settings"></span> Daemon settings
+                    </a>
+                </details>
             </nav>
 
             <div class="sidebar-footer">
@@ -73,7 +106,7 @@
                     <button id="mobile-menu-btn" class="icon-btn mobile-only">
                         <span class="icon" id="icon-menu"></span>
                     </button>
-                    <h1 id="page-title">Dashboard</h1>
+                    <h1 id="page-title">Home</h1>
                 </div>
                 <div class="flex items-center gap-2">
                     <div class="header-actions" id="header-actions">

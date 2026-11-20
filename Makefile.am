@@ -36,8 +36,11 @@ COMMANDER_DIST = \
 	image/favicon-32x32.png \
 	favicon.ico \
 	css/style.css \
+	css/simple.css \
 	js/api.js \
 	js/storage.js \
+	js/simple.js \
+	js/plain.js \
 	js/arrays.js \
 	js/app.js \
 	js/init.js \
@@ -180,6 +183,7 @@ EXTRA_DIST = \
 	test/ui/README \
 	test/ui/storage.test.mjs \
 	test/ui/arrays.test.mjs \
+	test/ui/plain.test.mjs \
 	autogen.sh autover.sh \
 	README HISTORY INSTALL AUTHORS BLUEBOX \
 	CHANGES-FORK ROADMAP-FORK installer.sh \
@@ -232,10 +236,13 @@ EXTRA_DIST = \
 	commander/image/favicon-32x32.png \
 	commander/favicon.ico \
 	commander/css/style.css \
+	commander/css/simple.css \
 	commander/js/init.js \
 	commander/js/ui.js \
 	commander/js/api.js \
 	commander/js/storage.js \
+	commander/js/simple.js \
+	commander/js/plain.js \
 	commander/js/arrays.js \
 	commander/js/app.js \
 	commander/js/utils.js \
@@ -248,10 +255,13 @@ EXTRA_DIST = \
 	brutale/image/favicon-32x32.png \
 	brutale/favicon.ico \
 	brutale/css/style.css \
+	brutale/css/simple.css \
 	brutale/js/init.js \
 	brutale/js/ui.js \
 	brutale/js/api.js \
 	brutale/js/storage.js \
+	brutale/js/simple.js \
+	brutale/js/plain.js \
 	brutale/js/arrays.js \
 	brutale/js/app.js \
 	brutale/js/utils.js \
@@ -484,7 +494,7 @@ endif
 check-local: snapraidd$(EXEEXT)
 	./snapraidd$(EXEEXT) test
 	@if command -v node >/dev/null 2>&1; then \
-		node --test $(srcdir)/test/ui/storage.test.mjs $(srcdir)/test/ui/arrays.test.mjs; \
+		node --test $(srcdir)/test/ui/storage.test.mjs $(srcdir)/test/ui/arrays.test.mjs $(srcdir)/test/ui/plain.test.mjs; \
 	else \
 		echo "node not found: skipping the tests of the Storage page"; \
 	fi

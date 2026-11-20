@@ -248,7 +248,7 @@ const call = async (endpoint, method, body) => {
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 /** Follow the background operation of the daemon until it ends. */
-const waitJob = async (onTick) => {
+export const waitJob = async (onTick) => {
     for (;;) {
         const { job } = await call('/job', 'GET');
         if (onTick) onTick(job);
@@ -257,7 +257,7 @@ const waitJob = async (onTick) => {
     }
 };
 
-const StorageAPI = {
+export const StorageAPI = {
     get: () => call('', 'GET'),
     saveConf: (text) => call('/engine_conf', 'PUT', { text }),
     // formatting runs in background: big disks take minutes
@@ -299,7 +299,7 @@ const usageBar = (total, free) => {
         </div>`;
 };
 
-const applyWidths = (root) => {
+export const applyWidths = (root) => {
     root.querySelectorAll('[data-width]').forEach(el => { el.style.width = `${el.dataset.width}%`; });
     root.querySelectorAll('[data-height]').forEach(el => { el.style.height = `${el.dataset.height}%`; });
 };
@@ -391,7 +391,7 @@ export const dialog = ({ title, body, large = true, buttons }) => {
  * Ask before doing something, saying in plain words what is going to happen.
  * \return A promise resolving to true only when confirmed.
  */
-const confirmDo = ({ title, intro, effects = [], safe = [], label = 'Confirm', danger = false }) => new Promise((resolve) => {
+export const confirmDo = ({ title, intro, effects = [], safe = [], label = 'Confirm', danger = false }) => new Promise((resolve) => {
     dialog({
         title, large: false,
         body: `
@@ -1066,8 +1066,8 @@ const render = () => {
     applyWidths(state.view);
 };
 
-export const loadStorage = async (view) => {
-    state.view = view || state.view;
+/** Read everything the Storage page and its advisor need, without showing it. */
+const loadStorageState = async () => {
     const [inv, disks, array, system, tasks, config] = await Promise.all([StorageAPI.get(), API.getDisks().catch(() => null), API.getState().catch(() => null), API.getSystem().catch(() => null), API.getTasks().catch(() => null), API.getConfig().catch(() => null)]);
     state.health = {};
     state.known = {};
@@ -1087,8 +1087,45 @@ export const loadStorage = async (view) => {
     state.legacyContent = legacyContentOf(tasks);
     state.config = config;
     state.model = buildModel(inv);
+    return state.model;
+};
+
+/** What the Storage page would open once shown: set from the other pages. */
+let pendingOpen = null;
+
+/** Open the Storage page on a tab, and optionally one of its dialogs: wizard, recover, replace, remove, pool-create. */
+export const storageOpen = (tab, action = null, data = {}) => {
+    state.tab = tab || 'overview';
+    pendingOpen = action ? { action, data } : null;
+    if (window.location.hash === '#/storage') loadStorage();
+    else window.location.hash = '#/storage';
+};
+
+export const loadStorage = async (view) => {
+    state.view = view || state.view;
+    const m = await loadStorageState();
     render();
-    if (inv.job?.running) watchJob();
+    if (m.inv.job?.running) watchJob();
+    const open = pendingOpen;
+    pendingOpen = null;
+    if (open) {
+        switch (open.action) {
+            case 'wizard': openWizard(); break;
+            case 'recover': recoverDialog(); break;
+            case 'replace': replaceDisk(open.data.kind, open.data.name); break;
+            case 'remove': removeDisk(open.data.name); break;
+            case 'pool-create': poolCreate(); break;
+        }
+    }
+};
+
+/**
+ * The model of the Storage page and the advice of its advisor, for the other pages.
+ * \return { model, findings, health, array }
+ */
+export const storageSnapshot = async () => {
+    const m = await loadStorageState();
+    return { model: m, findings: advise(m), health: state.health, array: state.array, lastSync: state.lastSync };
 };
 
 const reload = async () => {
