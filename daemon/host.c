@@ -63,6 +63,14 @@ static int hfail(char* msg, size_t msg_size, int status, const char* fmt, ...)
 	return status;
 }
 
+/** Remove an empty folder made for a mount. */
+static void dir_remove(const char* path)
+{
+	priv_enter();
+	rmdir(path);
+	priv_leave();
+}
+
 /****************************************************************************/
 /* settings */
 
@@ -391,6 +399,14 @@ static int valid_path_list(const char* list)
 	return 1;
 }
 
+/** An address safe inside single quotes of a shell, and that curl takes as it is. */
+static int valid_web_url(const char* v)
+{
+	if (strncmp(v, "https://", 8) != 0 && strncmp(v, "http://", 7) != 0)
+		return 0;
+	return strlen(v) > 10 && valid_chars(v, "._~:/?#@!&=+%,;-", 1024);
+}
+
 static int valid_options_line(const char* line, const char* const* allowed, char* msg, size_t msg_size)
 {
 	char buf[2048];
@@ -429,6 +445,9 @@ static int valid_options_line(const char* line, const char* const* allowed, char
 		case 'u' : ok = val[0] == 0 || valid_chars(val, "_-,", 512); break;
 		case 'h' : ok = val[0] == 0 || valid_chars(val, ".:/,*-", 512); break;
 		case 't' : ok = valid_line(val, 256) && strpbrk(val, "\"\\") == 0; break;
+		case 'w' : ok = valid_web_url(val); break;
+		case 'k' : ok = val[0] != '-' ? valid_chars(val, ":_-.@+", 256) : valid_chars(val + 1, "0123456789", 32); break;
+		case 'H' : ok = val[0] != '-' && valid_chars(val, ".-_:", 255); break;
 		default : return hfail(msg, msg_size, 400, "Unknown option '%s'", name);
 		}
 		if (!ok)
@@ -488,6 +507,17 @@ static const char* const CACHE_OPTIONS[] = {
 static const char* const KEEP_OPTIONS[] = {
 	"pool:p", "path:p", "disks:l", "when:s", "enabled:b", 0
 };
+
+static const char* const REMOTE_OPTIONS[] = {
+	"kind:n", "host:H", "share:t", "user:t", "domain:n", "vers:k", 0
+};
+
+static int valid_ups(const char* v)
+{
+	if (strcmp(v, "apc") == 0)
+		return 1;
+	return strncmp(v, "nut:", 4) == 0 && v[4] != 0 && v[4] != '-' && valid_chars(v + 4, "@.-_:", 128);
+}
 
 static const char* const POWER_OPTIONS[] = {
 	"apm:i", "aam:i", "wcache:b", 0
@@ -560,6 +590,41 @@ static int setting_check(const char* key, const char* val, char* msg, size_t msg
 		if (opt_get(val, "dest_uuid", uuid, sizeof(uuid)) != 0 && opt_get(val, "dest_path", dpath, sizeof(dpath)) != 0)
 			return hfail(msg, msg_size, 400, "A backup needs a destination: a disk or a folder");
 		return 0;
+	}
+	if (strcmp(key, "sync_changes") == 0) {
+		if (!valid_int(val, 0, 1000000))
+			return hfail(msg, msg_size, 400, "sync_changes is from 0 to 1000000");
+		return 0;
+	}
+	if (strcmp(key, "sync_changes_minutes") == 0) {
+		if (!valid_int(val, 1, 1440))
+			return hfail(msg, msg_size, 400, "sync_changes_minutes is from 1 to 1440");
+		return 0;
+	}
+	if (strcmp(key, "ups") == 0) {
+		if (!valid_ups(val))
+			return hfail(msg, msg_size, 400, "ups is apc, or nut: followed by the name of the UPS, like nut:myups or nut:myups@otherhost");
+		return 0;
+	}
+	if (strcmp(key, "ups_shutdown") == 0) {
+		if (!valid_bool(val))
+			return hfail(msg, msg_size, 400, "ups_shutdown is 0 or 1");
+		return 0;
+	}
+	if (strcmp(key, "ups_percent") == 0) {
+		if (!valid_int(val, 5, 95))
+			return hfail(msg, msg_size, 400, "ups_percent is from 5 to 95");
+		return 0;
+	}
+	if (strcmp(key, "ups_minutes") == 0) {
+		if (!valid_int(val, 1, 120))
+			return hfail(msg, msg_size, 400, "ups_minutes is from 1 to 120");
+		return 0;
+	}
+	if (strncmp(key, "remote.", 7) == 0) {
+		if (!valid_name(key + 7))
+			return hfail(msg, msg_size, 400, "A name has only letters, digits, - and _ (up to 32)");
+		return valid_options_line(val, REMOTE_OPTIONS, msg, msg_size);
 	}
 	if (strcmp(key, "sync_ratio") == 0) {
 		if (!valid_int(val, 0, 1000))
@@ -979,14 +1044,190 @@ static void* wipe_thread(void* arg)
 	return 0;
 }
 
+/****************************************************************************/
+/* write test of a disk before trusting it with files */
+
+#define BURNIN_BAD_MAX 20 /**< Areas listed one by one in the result */
+
+/** Fill a buffer with the pattern following the seed. Any two disks get different data. */
+static void burnin_pattern(unsigned char* buf, size_t size, uint64_t* seed)
+{
+	uint64_t x = *seed;
+	size_t i = 0;
+
+	for (; i + 8 <= size; i += 8) {
+		x ^= x << 13;
+		x ^= x >> 7;
+		x ^= x << 17;
+		memcpy(buf + i, &x, 8);
+	}
+	for (; i < size; ++i)
+		buf[i] = (unsigned char)(x >> (8 * (i & 7)));
+	*seed = x;
+}
+
+/**
+ * Write the pattern over the whole size, or read it back and compare.
+ * \param bad Areas that differ or cannot be read, counted when reading back.
+ * \return 0 if it ran to the end, 1 if stopped, -1 on a write error with errno set.
+ */
+static int burnin_pass(int f, uint64_t size, uint64_t seed, int verify, unsigned char* buf, unsigned char* want, uint64_t* done_out, unsigned* bad)
+{
+	uint64_t done = 0;
+	int ret = 0;
+
+	while (done < size) {
+		if (job_stopping()) {
+			ret = 1;
+			break;
+		}
+		size_t chunk = size - done < WIPE_CHUNK ? (size_t)(size - done) : WIPE_CHUNK;
+		if (!verify) {
+			burnin_pattern(buf, chunk, &seed);
+			size_t off = 0;
+			while (off < chunk) {
+				ssize_t n = pwrite(f, buf + off, chunk - off, (off_t)(done + off));
+				if (n < 0 && errno == EINTR)
+					continue;
+				if (n <= 0) {
+					if (n == 0)
+						errno = EIO;
+					*done_out = done + off;
+					return -1;
+				}
+				off += n;
+			}
+		} else {
+			burnin_pattern(want, chunk, &seed);
+			size_t off = 0;
+			int unreadable = 0;
+			while (off < chunk) {
+				ssize_t n = pread(f, buf + off, chunk - off, (off_t)(done + off));
+				if (n < 0 && errno == EINTR)
+					continue;
+				if (n <= 0) {
+					unreadable = 1;
+					break;
+				}
+				off += n;
+			}
+			if (unreadable || memcmp(buf, want, chunk) != 0) {
+				if (*bad < BURNIN_BAD_MAX) {
+					char where[64];
+					snprintf(where, sizeof(where), "%" PRIu64, done);
+					job_result_line(where, unreadable ? "cannot be read" : "reads back different from what was written");
+				}
+				++*bad;
+			}
+			posix_fadvise(f, (off_t)done, chunk, POSIX_FADV_DONTNEED);
+		}
+		done += chunk;
+		job_progress(0, chunk);
+	}
+
+	*done_out = done;
+	return ret;
+}
+
+static void* burnin_thread(void* arg)
+{
+	(void)arg;
+	char msg[MSG_MAX];
+	const char* device = hjob.a;
+	int direct = 1;
+
+	/* straight to the disk: what is read back comes from the disk and not from the memory */
+	priv_enter();
+	int f = open(device, O_RDWR | O_CLOEXEC | O_EXCL | O_DIRECT);
+	if (f < 0) {
+		direct = 0;
+		f = open(device, O_RDWR | O_CLOEXEC | O_EXCL);
+	}
+	priv_leave();
+	if (f < 0) {
+		snprintf(msg, sizeof(msg), "Cannot open %.100s: %.100s", device, strerror(errno));
+		job_finish(500, msg);
+		return 0;
+	}
+
+	uint64_t size = 0;
+	if (ioctl(f, BLKGETSIZE64, &size) != 0 || size == 0) {
+		close(f);
+		job_finish(500, "Cannot read the size of the disk");
+		return 0;
+	}
+
+	unsigned char* buf = 0;
+	unsigned char* want = 0;
+	if (posix_memalign((void**)&buf, 4096, WIPE_CHUNK) != 0 || posix_memalign((void**)&want, 4096, WIPE_CHUNK) != 0) {
+		close(f);
+		free(buf);
+		job_finish(500, "Not enough memory for the test");
+		return 0;
+	}
+
+	uint64_t seed = ((uint64_t)time(0) << 20) ^ ((uint64_t)getpid() << 40) ^ size ^ 0x9E3779B97F4A7C15ULL;
+	uint64_t done = 0;
+	unsigned bad = 0;
+
+	job_current("Writing to every block");
+	int ret = burnin_pass(f, size, seed, 0, buf, want, &done, &bad);
+	int failed = ret < 0 ? errno : 0;
+	int written_all = ret == 0;
+	uint64_t checked = 0;
+	if (ret == 0) {
+		fsync(f);
+		if (!direct)
+			posix_fadvise(f, 0, 0, POSIX_FADV_DONTNEED);
+		job_current("Reading every block back");
+		ret = burnin_pass(f, size, seed, 1, buf, want, &checked, &bad);
+	}
+
+	/* leave it blank where a filesystem would be looked for */
+	if (failed == 0) {
+		memset(buf, 0, WIPE_CHUNK);
+		uint64_t head = size < 4 * (uint64_t)WIPE_CHUNK ? size : 4 * (uint64_t)WIPE_CHUNK;
+		for (uint64_t o = 0; o < head; o += WIPE_CHUNK) {
+			size_t chunk = head - o < WIPE_CHUNK ? (size_t)(head - o) : WIPE_CHUNK;
+			if (pwrite(f, buf, chunk, (off_t)o) < 0)
+				break;
+		}
+		if (size > WIPE_CHUNK)
+			(void)!pwrite(f, buf, WIPE_CHUNK, (off_t)((size - WIPE_CHUNK) & ~(uint64_t)4095));
+		fsync(f);
+	}
+	close(f);
+	free(buf);
+	free(want);
+
+	if (failed) {
+		snprintf(msg, sizeof(msg), "Write error after %" PRIu64 " bytes: %s. This disk is failing: do not trust it with files.", done, strerror(failed));
+		job_finish(500, msg);
+	} else if (bad) {
+		snprintf(msg, sizeof(msg), "%u areas of %.100s did not give back what was written. This disk is failing: do not trust it with files.", bad, device);
+		job_finish(500, msg);
+	} else if (!written_all || ret != 0) {
+		snprintf(msg, sizeof(msg), "Stopped before the end: %" PRIu64 " of %" PRIu64 " bytes written, %" PRIu64 " read back, no error so far. The test tells nothing sure until it runs to the end.", done, size, checked);
+		job_finish(499, msg);
+	} else {
+		const char* rr[] = { "--rereadpt", device, 0 };
+		tool_run("blockdev", rr, 0, 0, 30);
+		snprintf(msg, sizeof(msg), "Every block of %.100s was written and read back without a single error (%" PRIu64 " bytes). The disk is blank and ready to use.", device, size);
+		job_finish(0, msg);
+	}
+
+	return 0;
+}
+
 static int wipe_start(const char* device, const char* method, char* msg, size_t msg_size)
 {
 	char name[64];
 
 	if (!valid_disk_device(device, name, sizeof(name)))
 		return hfail(msg, msg_size, 400, "%s is not a whole disk", device);
-	if (strcmp(method, "zero") != 0 && strcmp(method, "random") != 0)
-		return hfail(msg, msg_size, 400, "The method is zero or random");
+	int test = strcmp(method, "test") == 0;
+	if (!test && strcmp(method, "zero") != 0 && strcmp(method, "random") != 0)
+		return hfail(msg, msg_size, 400, "The method is zero, random or test");
 
 	/* never a disk of an array, even if it's not mounted now */
 	struct host_disk* disks = malloc_nofail(sizeof(struct host_disk) * HOST_DISKS_MAX);
@@ -1005,14 +1246,14 @@ static int wipe_start(const char* device, const char* method, char* msg, size_t 
 	if (ret != 0)
 		return ret;
 
-	ret = job_begin("wipe", device, msg, msg_size);
+	ret = job_begin(test ? "burnin" : "wipe", device, msg, msg_size);
 	if (ret != 0)
 		return ret;
 	sncpy(hjob.a, sizeof(hjob.a), device);
 	sncpy(hjob.c, sizeof(hjob.c), method);
 	log_msg(LVL_WARNING, "host: wipe of %s with %s started", device, method);
 
-	return job_launch(wipe_thread, msg, msg_size);
+	return job_launch(test ? burnin_thread : wipe_thread, msg, msg_size);
 }
 
 /** Progress of rsync with --info=progress2: "  1,234,567  12%  1.2MB/s  0:00:12 (xfr#3, to-chk=1/9)" */
@@ -1845,12 +2086,17 @@ static void recycle_clean(void)
 /****************************************************************************/
 /* backups */
 
+static int remote_of_path(const char* path, char* name, size_t name_size);
+static int remote_mount(const char* name, char* msg, size_t msg_size);
+static void remote_unmount(const char* name);
+
 struct backup_seen {
 	char name[64];
 	int known; /**< The destination was looked at once at least */
 	int present; /**< The destination disk was there at the latest look */
 	int pending; /**< A run is due but the job slot was busy */
 	char mounted_by_us[PATH_MAX]; /**< Mount made for the run, removed after it */
+	char remote_by_us[64]; /**< Folder of another computer mounted for the run */
 };
 
 #define BACKUPS_MAX 64
@@ -1928,9 +2174,14 @@ static void backup_record(const char* name, int status, const char* message)
 		const char* args[] = { b->mounted_by_us, 0 };
 		if (tool_run("umount", args, 0, 0, 120) == 0) {
 			log_msg(LVL_INFO, "host: backup %s done, %s unmounted: the disk can be unplugged", name, b->mounted_by_us);
-			rmdir(b->mounted_by_us);
+			dir_remove(b->mounted_by_us);
 		}
 		b->mounted_by_us[0] = 0;
+	}
+
+	if (b && b->remote_by_us[0]) {
+		remote_unmount(b->remote_by_us);
+		b->remote_by_us[0] = 0;
 	}
 
 	log_msg(status == 0 || status == 207 ? LVL_INFO : LVL_WARNING, "host: backup %s ended: %s", name, message);
@@ -1956,14 +2207,35 @@ static int backup_run(const char* name, char* msg, size_t msg_size)
 	opt_get(line, "dest_dir", dir, sizeof(dir));
 	struct backup_seen* b = backup_slot(name);
 
+	/* files of another computer: reach it for the time of the run */
+	char remote[64];
+	int remote_new = 0;
+	if (remote_of_path(src, remote, sizeof(remote)) == 0) {
+		if (job_is_running())
+			return hfail(msg, msg_size, 409, "Another storage operation is still running. Wait for it to finish, or stop it.");
+		int r = remote_mount(remote, msg, msg_size);
+		if (r != 0 && r != 1) {
+			if (r >= 500) {
+				char why[MSG_MAX];
+				sncpy(why, sizeof(why), msg);
+				backup_record(name, r, why);
+			}
+			return r;
+		}
+		remote_new = r == 0;
+	}
+
 	if (opt_get(line, "dest_path", path, sizeof(path)) == 0) {
 		sncpy(dest, sizeof(dest), path);
 	} else {
 		char target[PATH_MAX];
 		opt_get(line, "dest_uuid", uuid, sizeof(uuid));
 		int r = uuid_mount(uuid, target, sizeof(target));
-		if (r == -2)
+		if (r == -2) {
+			if (remote_new)
+				remote_unmount(remote);
 			return hfail(msg, msg_size, 409, "The backup disk of %s is not plugged in", name);
+		}
 		if (r != 0) {
 			/* plugged but not mounted: mount it for the run */
 			char source[128];
@@ -1971,8 +2243,11 @@ static int backup_run(const char* name, char* msg, size_t msg_size)
 			snprintf(source, sizeof(source), "UUID=%s", uuid);
 			make_dirs(target);
 			const char* args[] = { source, target, 0 };
-			if (tool_check("mount", args, 0, 120, msg, msg_size) != 0)
+			if (tool_check("mount", args, 0, 120, msg, msg_size) != 0) {
+				if (remote_new)
+					remote_unmount(remote);
 				return 500;
+			}
 			if (b)
 				sncpy(b->mounted_by_us, sizeof(b->mounted_by_us), target);
 		}
@@ -1984,6 +2259,12 @@ static int backup_run(const char* name, char* msg, size_t msg_size)
 		const char* args[] = { b->mounted_by_us, 0 };
 		tool_run("umount", args, 0, 0, 120);
 		b->mounted_by_us[0] = 0;
+	}
+	if (remote_new) {
+		if (ret != 0)
+			remote_unmount(remote);
+		else if (b)
+			sncpy(b->remote_by_us, sizeof(b->remote_by_us), remote);
 	}
 	if (b)
 		b->pending = ret == 409;
@@ -3575,6 +3856,1405 @@ static void options_json(ss_t* s, int level, const char* line, const char* const
 	}
 }
 
+static int setting_store(const char* key, const char* val, char* msg, size_t msg_size);
+
+static void host_wake(void);
+
+/****************************************************************************/
+/* files next to the settings */
+
+/** Path of a file kept in the folder of the settings. */
+static void host_side_path(const char* name, char* out, size_t out_size)
+{
+	char dir[PATH_MAX];
+
+	sncpy(dir, sizeof(dir), host_conf_path);
+	char* slash = strrchr(dir, '/');
+	if (slash)
+		*slash = 0;
+	else
+		sncpy(dir, sizeof(dir), ".");
+	snprintf(out, out_size, "%.*s/%s", (int)(out_size > 80 ? out_size - 80 : 0), dir, name);
+}
+
+/****************************************************************************/
+/* record of the runs: what every sync, scrub, check and fix found */
+
+#define RUNS_NAME "snapraidd-runs.log"
+#define RUNS_KEEP 2500 /**< Lines kept when the record is trimmed */
+#define RUNS_MAX 3000 /**< Lines over which the record is trimmed */
+#define RUNS_ARRAYS 64
+#define RUNS_BATCH 64
+
+struct run_last {
+	char array[ARRAY_NAME_MAX];
+	int64_t end; /**< End of the newest run recorded */
+	unsigned cmds; /**< Bits of the commands recorded with that end, as more can end in the same second */
+};
+
+static struct run_last runs_last[RUNS_ARRAYS];
+static unsigned runs_last_count;
+static unsigned runs_lines;
+static int runs_loaded;
+static pthread_mutex_t runs_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static struct run_last* runs_slot(const char* array)
+{
+	for (unsigned i = 0; i < runs_last_count; ++i) {
+		if (strcmp(runs_last[i].array, array) == 0)
+			return &runs_last[i];
+	}
+	if (runs_last_count == RUNS_ARRAYS)
+		return 0;
+	struct run_last* r = &runs_last[runs_last_count++];
+	memset(r, 0, sizeof(*r));
+	sncpy(r->array, sizeof(r->array), array);
+	return r;
+}
+
+static int run_cmd_code(const char* name)
+{
+	if (strcmp(name, "sync") == 0)
+		return CMD_SYNC;
+	if (strcmp(name, "scrub") == 0)
+		return CMD_SCRUB;
+	if (strcmp(name, "fix") == 0)
+		return CMD_FIX;
+	if (strcmp(name, "check") == 0)
+		return CMD_CHECK;
+	return 0;
+}
+
+static const char* run_cmd_name(int cmd)
+{
+	switch (cmd) {
+	case CMD_SYNC : return "sync";
+	case CMD_SCRUB : return "scrub";
+	case CMD_FIX : return "fix";
+	case CMD_CHECK : return "check";
+	}
+	return 0;
+}
+
+/** One line of the record: 13 fields separated by tabs. */
+struct run_line {
+	int64_t end;
+	char array[ARRAY_NAME_MAX];
+	char command[16];
+	char status[16]; /**< ok, error, stopped */
+	int exit_code;
+	int64_t seconds;
+	uint64_t soft, io, data, recovered, unrecoverable;
+	int64_t added, removed, updated;
+};
+
+static int run_parse(char* line, struct run_line* r)
+{
+	char* f[14];
+	unsigned n = 0;
+	char* save = 0;
+
+	for (char* tok = strtok_r(line, "\t", &save); tok && n < 14; tok = strtok_r(0, "\t", &save))
+		f[n++] = tok;
+	if (n != 14)
+		return -1;
+	r->end = strtoll(f[0], 0, 10);
+	sncpy(r->array, sizeof(r->array), f[1]);
+	sncpy(r->command, sizeof(r->command), f[2]);
+	sncpy(r->status, sizeof(r->status), f[3]);
+	r->exit_code = atoi(f[4]);
+	r->seconds = strtoll(f[5], 0, 10);
+	r->soft = strtoull(f[6], 0, 10);
+	r->io = strtoull(f[7], 0, 10);
+	r->data = strtoull(f[8], 0, 10);
+	r->recovered = strtoull(f[9], 0, 10);
+	r->unrecoverable = strtoull(f[10], 0, 10);
+	r->added = strtoll(f[11], 0, 10);
+	r->removed = strtoll(f[12], 0, 10);
+	r->updated = strtoll(f[13], 0, 10);
+	if (r->end <= 0 || r->array[0] == 0 || run_cmd_code(r->command) == 0)
+		return -1;
+	return 0;
+}
+
+static void run_format(ss_t* s, const struct run_line* r)
+{
+	ss_printf(s, "%" PRIi64 "\t%s\t%s\t%s\t%d\t%" PRIi64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIi64 "\t%" PRIi64 "\t%" PRIi64 "\n",
+		r->end, r->array, r->command, r->status, r->exit_code, r->seconds, r->soft, r->io, r->data, r->recovered, r->unrecoverable, r->added, r->removed, r->updated);
+}
+
+/** Read the record, the oldest first. The caller frees the lines. */
+static unsigned runs_read(struct run_line** out)
+{
+	char path[PATH_MAX];
+	ss_t s;
+	unsigned n = 0;
+	unsigned cap = 256;
+	struct run_line* list = malloc_nofail(sizeof(struct run_line) * cap);
+
+	host_side_path(RUNS_NAME, path, sizeof(path));
+	ss_init(&s, 65536);
+	if (file_read(path, &s) == 0) {
+		ss_write(&s, "", 1);
+		char* save = 0;
+		for (char* line = strtok_r(ss_ptr(&s), "\n", &save); line; line = strtok_r(0, "\n", &save)) {
+			struct run_line r;
+			if (line[0] == '#' || run_parse(line, &r) != 0)
+				continue;
+			if (n == cap) {
+				cap *= 2;
+				list = realloc(list, sizeof(struct run_line) * cap);
+				if (!list)
+					abort();
+			}
+			list[n++] = r;
+		}
+	}
+	ss_done(&s);
+
+	*out = list;
+	return n;
+}
+
+static void runs_write(const struct run_line* list, unsigned n)
+{
+	char path[PATH_MAX];
+	ss_t s;
+
+	host_side_path(RUNS_NAME, path, sizeof(path));
+	ss_init(&s, 65536);
+	ss_prints(&s, "# Runs of the SnapRAID Daemon: end, array, command, result, exit code, seconds, errors (soft, input/output, data), recovered, unrecoverable, files added, removed, updated.\n");
+	for (unsigned i = 0; i < n; ++i)
+		run_format(&s, &list[i]);
+	ss_write(&s, "", 1);
+	if (file_replace(path, ss_ptr(&s), 0, 0644) != 0)
+		log_msg(LVL_ERROR, "host: cannot write %s, errno=%s(%d)", path, strerror(errno), errno);
+	ss_done(&s);
+}
+
+/** Once a minute: the runs ended since the latest look are added to the record. */
+static void runs_tick(void)
+{
+	struct run_line fresh[RUNS_BATCH];
+	unsigned n = 0;
+
+	pthread_mutex_lock(&runs_mutex);
+
+	if (!runs_loaded) {
+		struct run_line* list;
+		unsigned count = runs_read(&list);
+		for (unsigned i = 0; i < count; ++i) {
+			struct run_last* r = runs_slot(list[i].array);
+			unsigned bit = 1U << run_cmd_code(list[i].command);
+			if (r && list[i].end > r->end) {
+				r->end = list[i].end;
+				r->cmds = bit;
+			} else if (r && list[i].end == r->end) {
+				r->cmds |= bit;
+			}
+		}
+		runs_lines = count;
+		runs_loaded = 1;
+		free(list);
+	}
+
+	state_lock();
+	for (tommy_node* i = tommy_list_head(&host_ptr()->state_list); i; i = i->next) {
+		struct snapraid_state* state = i->data;
+		struct run_last* last = runs_slot(state->name);
+		if (!last)
+			continue;
+		int64_t newest = last->end;
+		unsigned newest_cmds = last->cmds;
+		for (tommy_node* j = tommy_list_head(&state->runner.history_list); j && n < RUNS_BATCH; j = j->next) {
+			struct snapraid_task* t = j->data;
+			const char* name = run_cmd_name(t->cmd);
+			if (!name || t->running || t->unix_end_time <= 0)
+				continue;
+			if (t->state != PROCESS_STATE_TERM && t->state != PROCESS_STATE_SIGNAL)
+				continue;
+			unsigned bit = 1U << t->cmd;
+			if (t->unix_end_time < last->end || (t->unix_end_time == last->end && (last->cmds & bit) != 0))
+				continue;
+			struct run_line* r = &fresh[n++];
+			memset(r, 0, sizeof(*r));
+			r->end = t->unix_end_time;
+			sncpy(r->array, sizeof(r->array), state->name);
+			sncpy(r->command, sizeof(r->command), name);
+			int stopped = t->state == PROCESS_STATE_SIGNAL;
+			for (tommy_node* k = tommy_list_head(&t->message_list); k && !stopped; k = k->next) {
+				struct snapraid_message* m = k->data;
+				if (strstr(m->msg, "Stop requested") != 0)
+					stopped = 1;
+			}
+			r->exit_code = t->state == PROCESS_STATE_TERM ? t->exit_code : -1;
+			sncpy(r->status, sizeof(r->status), stopped ? "stopped" : r->exit_code == 0 ? "ok" : "error");
+			r->seconds = t->unix_start_time > 0 && t->unix_end_time >= t->unix_start_time ? t->unix_end_time - t->unix_start_time : 0;
+			r->soft = t->error_soft;
+			r->io = t->error_io;
+			r->data = t->error_data;
+			r->recovered = t->error_recovered;
+			r->unrecoverable = t->error_unrecoverable;
+			r->added = t->diff_added;
+			r->removed = t->diff_removed;
+			r->updated = t->diff_updated;
+			if (t->unix_end_time > newest) {
+				newest = t->unix_end_time;
+				newest_cmds = bit;
+			} else if (t->unix_end_time == newest) {
+				newest_cmds |= bit;
+			}
+		}
+		last->end = newest;
+		last->cmds = newest_cmds;
+	}
+	state_unlock();
+
+	if (n > 0) {
+		struct run_line* list;
+		unsigned count = runs_read(&list);
+		list = realloc(list, sizeof(struct run_line) * (count + n));
+		if (!list)
+			abort();
+		/* the tasks of one look are added by time */
+		for (unsigned a = 0; a < n; ++a) {
+			unsigned pos = count;
+			while (pos > 0 && list[pos - 1].end > fresh[a].end) {
+				list[pos] = list[pos - 1];
+				--pos;
+			}
+			list[pos] = fresh[a];
+			++count;
+		}
+		unsigned from = count > RUNS_MAX ? count - RUNS_KEEP : 0;
+		runs_write(list + from, count - from);
+		runs_lines = count - from;
+		free(list);
+	}
+
+	pthread_mutex_unlock(&runs_mutex);
+}
+
+/** The record for the pages, the newest first. */
+static void runs_json(ss_t* s, int level, const char* array, int limit)
+{
+	struct run_line* list;
+
+	pthread_mutex_lock(&runs_mutex);
+	unsigned count = runs_read(&list);
+	pthread_mutex_unlock(&runs_mutex);
+
+	uint64_t found = 0;
+	uint64_t fixed = 0;
+	uint64_t lost = 0;
+	unsigned total = 0;
+	int64_t first = 0;
+
+	ss_json_array_open(s, &level, "runs");
+	for (unsigned i = count; i > 0; --i) {
+		const struct run_line* r = &list[i - 1];
+		if (array && array[0] && strcmp(array, r->array) != 0)
+			continue;
+		++total;
+		if (strcmp(r->command, "fix") != 0)
+			found += r->io + r->data; /* a repair finds again what it repairs */
+		fixed += r->recovered;
+		lost += r->unrecoverable;
+		first = r->end;
+		if (limit-- <= 0)
+			continue;
+		ss_json_open(s, &level);
+		ss_json_pair_iso8601(s, level, "finished_at", (time_t)r->end);
+		ss_json_str(s, level, "array", r->array);
+		ss_json_str(s, level, "command", r->command);
+		ss_json_str(s, level, "result", r->status);
+		ss_json_int(s, level, "exit_code", r->exit_code);
+		ss_json_i64(s, level, "seconds", r->seconds);
+		ss_json_u64(s, level, "errors_soft", r->soft);
+		ss_json_u64(s, level, "errors_io", r->io);
+		ss_json_u64(s, level, "errors_data", r->data);
+		ss_json_u64(s, level, "recovered", r->recovered);
+		ss_json_u64(s, level, "unrecoverable", r->unrecoverable);
+		ss_json_i64(s, level, "added", r->added);
+		ss_json_i64(s, level, "removed", r->removed);
+		ss_json_i64(s, level, "updated", r->updated);
+		ss_json_close(s, &level);
+	}
+	ss_json_array_close(s, &level);
+	ss_json_uint(s, level, "total", total);
+	ss_json_u64(s, level, "errors_found", found);
+	ss_json_u64(s, level, "errors_fixed", fixed);
+	ss_json_u64(s, level, "errors_lost", lost);
+	if (first)
+		ss_json_pair_iso8601(s, level, "since", (time_t)first);
+	free(list);
+}
+
+/****************************************************************************/
+/* an update of the protection as soon as enough files changed */
+
+#define CHANGES_ARRAYS 64
+
+/**
+ * With the setting 'sync_changes', every 'sync_changes_minutes' the arrays
+ * are looked at with a diff, and the maintenance is run when at least that
+ * many files were added, changed or deleted. The safety limits apply as in
+ * any automatic run.
+ */
+static void changes_tick(void)
+{
+	static struct {
+		struct snapraid_state* state;
+		time_t next;
+		time_t asked; /**< When the diff was queued, 0 if none is awaited */
+	} seen[CHANGES_ARRAYS];
+	static unsigned seen_count;
+	struct snapraid_state* look[CHANGES_ARRAYS];
+	struct snapraid_state* go[CHANGES_ARRAYS];
+	int64_t go_count[CHANGES_ARRAYS];
+	unsigned look_n = 0;
+	unsigned go_n = 0;
+
+	int limit = kv_int("sync_changes", 0);
+	if (limit <= 0) {
+		seen_count = 0;
+		return;
+	}
+	int minutes = kv_int("sync_changes_minutes", 60);
+	if (minutes < 1)
+		minutes = 1;
+	time_t now = time(0);
+
+	state_lock();
+	for (tommy_node* i = tommy_list_head(&host_ptr()->state_list); i; i = i->next) {
+		struct snapraid_state* state = i->data;
+		unsigned k;
+		for (k = 0; k < seen_count; ++k) {
+			if (seen[k].state == state)
+				break;
+		}
+		if (k == seen_count) {
+			if (seen_count == CHANGES_ARRAYS)
+				continue;
+			seen[k].state = state;
+			seen[k].next = now + minutes * 60;
+			seen[k].asked = 0;
+			++seen_count;
+			continue;
+		}
+
+		int busy = (state->runner.latest && state->runner.latest->running) || !tommy_list_empty(&state->runner.waiting_list);
+
+		if (seen[k].asked) {
+			if (busy)
+				continue;
+			struct snapraid_task* diff = 0;
+			for (tommy_node* j = tommy_list_head(&state->runner.history_list); j; j = j->next) {
+				struct snapraid_task* t = j->data;
+				if (t->cmd == CMD_DIFF && t->unix_end_time >= seen[k].asked && (diff == 0 || t->number > diff->number))
+					diff = t;
+			}
+			if (!diff && now - seen[k].asked < 30 * 60)
+				continue;
+			seen[k].asked = 0;
+			seen[k].next = now + minutes * 60;
+			if (diff && diff->state == PROCESS_STATE_TERM) {
+				int64_t changed = diff->diff_added + diff->diff_removed + diff->diff_updated;
+				if (changed >= limit && go_n < CHANGES_ARRAYS) {
+					go[go_n] = state;
+					go_count[go_n] = changed;
+					++go_n;
+				}
+			}
+			continue;
+		}
+
+		if (now < seen[k].next)
+			continue;
+		if (busy || tommy_list_empty(&state->array.disk_list)) {
+			seen[k].next = now + 60;
+			continue;
+		}
+		seen[k].asked = now;
+		if (look_n < CHANGES_ARRAYS)
+			look[look_n++] = state;
+	}
+	state_unlock();
+
+	for (unsigned k = 0; k < look_n; ++k) {
+		char msg[MSG_MAX];
+		int status = 0;
+		if (storage_job_claims_array(look[k]->name))
+			continue;
+		runner(look[k], 0, CMD_DIFF, 0, 0, 0, msg, sizeof(msg), &status);
+	}
+	for (unsigned k = 0; k < go_n; ++k) {
+		char msg[MSG_MAX];
+		int status = 0;
+		log_msg(LVL_INFO, "host: %" PRIi64 " files changed in the array %s, at least %d: updating the protection now", go_count[k], go[k]->name, limit);
+		schedule_maintenance(go[k], -1, 1, msg, sizeof(msg), &status);
+	}
+}
+
+/****************************************************************************/
+/* battery backup (UPS): pause on battery, shut down before it's empty */
+
+static struct {
+	int configured;
+	int known; /**< The latest read worked */
+	int on_battery;
+	int low; /**< The UPS itself says the battery is low */
+	int charge; /**< Percent, -1 unknown */
+	int runtime; /**< Seconds left, -1 unknown */
+	time_t since; /**< Start of the time on battery */
+	int low_reads; /**< Reads in a row asking for the shutdown */
+	int shutdown_done;
+	unsigned stopped; /**< Runs stopped in this time on battery */
+	char text[128]; /**< Status as the UPS tells it */
+	char error[160];
+} ups;
+
+static pthread_mutex_t ups_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/** Value of "name: value" (NUT) or "NAME   : value" (apcupsd) in the output of the tool. */
+static int ups_field(const char* text, const char* name, char* out, size_t out_size)
+{
+	size_t len = strlen(name);
+	const char* p = text;
+
+	out[0] = 0;
+	while (p && *p) {
+		if (strncmp(p, name, len) == 0) {
+			const char* q = p + len;
+			while (*q == ' ')
+				++q;
+			if (*q == ':') {
+				++q;
+				while (*q == ' ')
+					++q;
+				size_t l = strcspn(q, "\r\n");
+				while (l > 0 && q[l - 1] == ' ')
+					--l;
+				if (l >= out_size)
+					l = out_size - 1;
+				memcpy(out, q, l);
+				out[l] = 0;
+				return 0;
+			}
+		}
+		p = strchr(p, '\n');
+		if (p)
+			++p;
+	}
+
+	return -1;
+}
+
+/**
+ * Read the state from the output of upsc or of apcaccess.
+ * \return 0 if the output tells if it's on battery
+ */
+static int ups_parse(const char* text, int apc, int* on_battery, int* low, int* charge, int* runtime, char* status, size_t status_size)
+{
+	char v[128];
+
+	*on_battery = 0;
+	*low = 0;
+	*charge = -1;
+	*runtime = -1;
+
+	if (apc) {
+		if (ups_field(text, "STATUS", status, status_size) != 0)
+			return -1;
+		if (strstr(status, "COMMLOST") != 0)
+			return -1;
+		*on_battery = strstr(status, "ONBATT") != 0;
+		*low = strstr(status, "LOWBATT") != 0;
+		if (ups_field(text, "BCHARGE", v, sizeof(v)) == 0)
+			*charge = atoi(v);
+		if (ups_field(text, "TIMELEFT", v, sizeof(v)) == 0)
+			*runtime = (int)(atof(v) * 60);
+	} else {
+		if (ups_field(text, "ups.status", status, status_size) != 0)
+			return -1;
+		/* flags separated by spaces: OL online, OB on battery, LB low battery */
+		char buf[128];
+		char* save = 0;
+		int seen = 0;
+		sncpy(buf, sizeof(buf), status);
+		for (char* tok = strtok_r(buf, " ", &save); tok; tok = strtok_r(0, " ", &save)) {
+			if (strcmp(tok, "OB") == 0) {
+				*on_battery = 1;
+				seen = 1;
+			} else if (strcmp(tok, "OL") == 0) {
+				seen = 1;
+			} else if (strcmp(tok, "LB") == 0) {
+				*low = 1;
+			}
+		}
+		if (!seen)
+			return -1;
+		if (ups_field(text, "battery.charge", v, sizeof(v)) == 0)
+			*charge = atoi(v);
+		if (ups_field(text, "battery.runtime", v, sizeof(v)) == 0)
+			*runtime = atoi(v);
+	}
+
+	return 0;
+}
+
+static int ups_read(const char* source, ss_t* out)
+{
+	if (strcmp(source, "apc") == 0) {
+		const char* args[] = { "status", 0 };
+		return tool_run("apcaccess", args, 0, out, 10);
+	}
+	const char* args[] = { source + 4, 0 };
+	return tool_run("upsc", args, 0, out, 10);
+}
+
+/** Every look of the host thread, a few times a minute. */
+static void ups_tick(void)
+{
+	char source[160];
+	char status[128];
+	ss_t out;
+	int on_battery, low, charge, runtime;
+
+	kv_get("ups", "", source, sizeof(source));
+	if (source[0] == 0 || !valid_ups(source)) {
+		pthread_mutex_lock(&ups_mutex);
+		memset(&ups, 0, sizeof(ups));
+		pthread_mutex_unlock(&ups_mutex);
+		return;
+	}
+
+	ss_init(&out, 4096);
+	int r = ups_read(source, &out);
+	ss_write(&out, "", 1);
+	int parsed = r == 0 ? ups_parse(ss_ptr(&out), strcmp(source, "apc") == 0, &on_battery, &low, &charge, &runtime, status, sizeof(status)) : -1;
+	ss_done(&out);
+
+	pthread_mutex_lock(&ups_mutex);
+	ups.configured = 1;
+	if (parsed != 0) {
+		/* without news it's taken as it was: a lost cable is not a power cut */
+		if (ups.known || ups.error[0] == 0)
+			log_msg(LVL_WARNING, "host: the UPS %s does not answer", source);
+		ups.known = 0;
+		if (r == -2)
+			snprintf(ups.error, sizeof(ups.error), "The tool %s is not installed", strcmp(source, "apc") == 0 ? "apcaccess" : "upsc");
+		else
+			snprintf(ups.error, sizeof(ups.error), "The UPS does not answer");
+		pthread_mutex_unlock(&ups_mutex);
+		return;
+	}
+	ups.known = 1;
+	ups.error[0] = 0;
+	ups.low = low;
+	ups.charge = charge;
+	ups.runtime = runtime;
+	sncpy(ups.text, sizeof(ups.text), status);
+	int was = ups.on_battery;
+	ups.on_battery = on_battery;
+	if (on_battery && !was) {
+		ups.since = time(0);
+		ups.stopped = 0;
+		ups.low_reads = 0;
+		ups.shutdown_done = 0;
+		log_msg(LVL_WARNING, "host: power cut, the machine runs on the battery of the UPS (%d%%). The update of the protection and the check for damage wait for the power.", charge);
+	}
+	if (!on_battery && was)
+		log_msg(LVL_WARNING, "host: the power is back after %d minutes on battery", (int)((time(0) - ups.since) / 60));
+	pthread_mutex_unlock(&ups_mutex);
+
+	if (!on_battery)
+		return;
+
+	/* on battery nothing heavy runs: a sync or a scrub goes on from where it stopped */
+	struct snapraid_state* stop_list[64];
+	unsigned n = 0;
+	state_lock();
+	for (tommy_node* i = tommy_list_head(&host_ptr()->state_list); i && n < 64; i = i->next) {
+		struct snapraid_state* state = i->data;
+		struct snapraid_task* task = state->runner.latest;
+		if (task && task->running && (task->cmd == CMD_SCRUB || task->cmd == CMD_SYNC) && task->state != PROCESS_STATE_SIGNAL)
+			stop_list[n++] = state;
+	}
+	state_unlock();
+	for (unsigned k = 0; k < n; ++k) {
+		char msg[MSG_MAX];
+		int st;
+		uint64_t pid;
+		int number;
+		log_msg(LVL_WARNING, "host: on battery, stopping the work on the array %s: the next run continues it", stop_list[k]->name);
+		runner_stop(stop_list[k], msg, sizeof(msg), &st, &pid, &number);
+	}
+	if (n) {
+		pthread_mutex_lock(&ups_mutex);
+		ups.stopped += n;
+		pthread_mutex_unlock(&ups_mutex);
+	}
+
+	if (!kv_int("ups_shutdown", 1))
+		return;
+	int percent = kv_int("ups_percent", 20);
+	int minutes = kv_int("ups_minutes", 5);
+	int due = low || (charge >= 0 && charge <= percent) || (runtime >= 0 && runtime <= minutes * 60);
+
+	pthread_mutex_lock(&ups_mutex);
+	ups.low_reads = due ? ups.low_reads + 1 : 0;
+	/* two reads in a row: one odd value does not turn the machine off */
+	int act = ups.low_reads >= 2 && !ups.shutdown_done;
+	if (act)
+		ups.shutdown_done = 1;
+	pthread_mutex_unlock(&ups_mutex);
+	if (!act)
+		return;
+
+	if (host_dryrun) {
+		log_msg(LVL_WARNING, "host: the battery of the UPS is running out (%d%%, %d seconds left), would shut down (dry run)", charge, runtime);
+		return;
+	}
+	log_msg(LVL_CRITICAL, "host: the battery of the UPS is running out (%d%%, %d seconds left): shutting down", charge, runtime);
+	sync();
+	const char* args[] = { "poweroff", 0 };
+	if (tool_run("systemctl", args, 0, 0, 60) != 0) {
+		const char* sh[] = { "-h", "now", 0 };
+		tool_run("shutdown", sh, 0, 0, 60);
+	}
+}
+
+static void ups_json(ss_t* s, int level)
+{
+	pthread_mutex_lock(&ups_mutex);
+	ss_json_object_open(s, &level, "ups");
+	ss_json_bool(s, level, "configured", ups.configured);
+	ss_json_str(s, level, "state", !ups.configured ? "off" : !ups.known ? "unknown" : !ups.on_battery ? "online" : ups.low ? "low" : "battery");
+	if (ups.known) {
+		ss_json_int(s, level, "charge", ups.charge);
+		ss_json_int(s, level, "runtime_seconds", ups.runtime);
+		ss_json_str(s, level, "status", ups.text);
+		if (ups.on_battery) {
+			ss_json_pair_iso8601(s, level, "since", ups.since);
+			ss_json_uint(s, level, "stopped", ups.stopped);
+			ss_json_bool(s, level, "shutdown", ups.shutdown_done);
+		}
+	}
+	if (ups.error[0])
+		ss_json_str(s, level, "error", ups.error);
+	ss_json_close(s, &level);
+	pthread_mutex_unlock(&ups_mutex);
+}
+
+/** The UPS units the tools on this machine know of. */
+static void ups_detect_json(ss_t* s, int level)
+{
+	ss_t out;
+
+	ss_json_bool(s, level, "upsc", tool_exists("upsc"));
+	ss_json_bool(s, level, "apcaccess", tool_exists("apcaccess"));
+	ss_json_array_open(s, &level, "found");
+	ss_init(&out, 1024);
+	const char* list[] = { "-l", 0 };
+	if (tool_run("upsc", list, 0, &out, 10) == 0) {
+		ss_write(&out, "", 1);
+		char* save = 0;
+		for (char* line = strtok_r(ss_ptr(&out), "\n", &save); line; line = strtok_r(0, "\n", &save)) {
+			char id[160];
+			strtrim(line);
+			snprintf(id, sizeof(id), "nut:%.120s", line);
+			if (line[0] && valid_ups(id))
+				ss_json_elem(s, level, id);
+		}
+	}
+	ss_done(&out);
+	ss_init(&out, 1024);
+	const char* st[] = { "status", 0 };
+	if (tool_run("apcaccess", st, 0, &out, 10) == 0) {
+		char v[64];
+		ss_write(&out, "", 1);
+		if (ups_field(ss_ptr(&out), "STATUS", v, sizeof(v)) == 0)
+			ss_json_elem(s, level, "apc");
+	}
+	ss_done(&out);
+	ss_json_array_close(s, &level);
+}
+
+/****************************************************************************/
+/* alerts on more channels at once */
+
+#define ALERTS_NAME "snapraidd-alerts.sh"
+#define ALERTS_MAX 8
+
+static const char* const ALERT_OPTIONS[] = {
+	"kind:n", "url:w", "token:k", "chat:k", "to:k", 0
+};
+
+/**
+ * Write the script that sends one report to every channel.
+ * \param channels One channel for each line, as options "kind=ntfy<TAB>url=https://..."
+ */
+static int alerts_save(const char* channels, ss_t* s, int level, char* msg, size_t msg_size)
+{
+	char path[PATH_MAX];
+	char buf[8192];
+	ss_t sh;
+	unsigned n = 0;
+	char run_as[CONFIG_MAX];
+
+	if (strlen(channels) >= sizeof(buf))
+		return hfail(msg, msg_size, 400, "Too many channels");
+	sncpy(buf, sizeof(buf), channels);
+	host_side_path(ALERTS_NAME, path, sizeof(path));
+
+	ss_init(&sh, 4096);
+	ss_prints(&sh, "#!/bin/sh\n");
+	ss_prints(&sh, "# Sends a report of the SnapRAID Daemon to every channel chosen in the Alerts page.\n");
+	ss_prints(&sh, "# Written by the daemon: a change made by hand is lost at the next save.\n");
+	ss_prints(&sh, "# Arguments: subject, priority, tag. The text of the report comes from the standard input.\n");
+
+	ss_t body;
+	ss_init(&body, 4096);
+	char* save = 0;
+	for (char* line = strtok_r(buf, "\n", &save); line; line = strtok_r(0, "\n", &save)) {
+		char kind[32], url[1100], token[128], chat[64], to[256];
+		if (line[0] == 0)
+			continue;
+		if (++n > ALERTS_MAX) {
+			ss_done(&sh);
+			ss_done(&body);
+			return hfail(msg, msg_size, 400, "Up to %d channels", ALERTS_MAX);
+		}
+		int ret = valid_options_line(line, ALERT_OPTIONS, msg, msg_size);
+		if (ret != 0) {
+			ss_done(&sh);
+			ss_done(&body);
+			return ret;
+		}
+		opt_get(line, "kind", kind, sizeof(kind));
+		opt_get(line, "url", url, sizeof(url));
+		opt_get(line, "token", token, sizeof(token));
+		opt_get(line, "chat", chat, sizeof(chat));
+		opt_get(line, "to", to, sizeof(to));
+
+		int ok = 1;
+		if (strcmp(kind, "ntfy") == 0 && url[0]) {
+			ss_printf(&body, "curl -fsS --max-time 30 --retry 3 -H \"Title: $1\" -H \"Priority: $2\" -H \"Tags: $3\" --data-binary @\"$t\" '%s' > /dev/null || r=1\n", url);
+		} else if (strcmp(kind, "webhook") == 0 && url[0]) {
+			ss_printf(&body, "curl -fsS --max-time 30 --retry 3 -H \"Title: $1\" --data-binary @\"$t\" '%s' > /dev/null || r=1\n", url);
+		} else if (strcmp(kind, "discord") == 0 && url[0]) {
+			ss_printf(&body, "curl -fsS --max-time 30 --retry 3 -H \"Content-Type: application/json\" -d \"{\\\"content\\\": \\\"$1\\\"}\" '%s' > /dev/null || r=1\n", url);
+		} else if (strcmp(kind, "telegram") == 0 && token[0] && chat[0]) {
+			ss_printf(&body, "curl -fsS --max-time 30 --retry 3 --data-urlencode 'chat_id=%s' --data-urlencode \"text=$1\" 'https://api.telegram.org/bot%s/sendMessage' > /dev/null || r=1\n", chat, token);
+		} else if (strcmp(kind, "email") == 0 && to[0] && to[0] != '-') {
+			ss_printf(&body, "mail -s \"$1\" '%s' < \"$t\" || r=1\n", to);
+		} else {
+			ok = 0;
+		}
+		if (!ok) {
+			ss_done(&sh);
+			ss_done(&body);
+			return hfail(msg, msg_size, 400, "A channel is not complete");
+		}
+		ss_printf(&sh, "# channel\t%s\n", line);
+	}
+
+	if (n == 0) {
+		ss_done(&sh);
+		ss_done(&body);
+		priv_enter();
+		unlink(path);
+		priv_leave();
+		ss_json_str(s, level, "command", "");
+		return 0;
+	}
+
+	ss_prints(&sh, "t=$(mktemp) || exit 1\ncat > \"$t\"\nr=0\n");
+	ss_write(&body, "", 1);
+	ss_prints(&sh, ss_ptr(&body));
+	ss_prints(&sh, "rm -f \"$t\"\nexit $r\n");
+	ss_write(&sh, "", 1);
+	ss_done(&body);
+
+	/* the addresses are secrets: only who sends the reports reads the script */
+	int ret = file_replace(path, ss_ptr(&sh), 0, 0700);
+	ss_done(&sh);
+	if (ret != 0)
+		return hfail(msg, msg_size, 500, "Cannot write %s: %s", path, strerror(errno));
+
+	state_lock();
+	sncpy(run_as, sizeof(run_as), state_ptr()->config.notify_run_as_user);
+	state_unlock();
+	if (run_as[0]) {
+		struct passwd* pw = getpwnam(run_as);
+		if (pw) {
+			priv_enter();
+			if (chown(path, pw->pw_uid, pw->pw_gid) != 0)
+				log_msg(LVL_WARNING, "host: cannot give %s to %s", path, run_as);
+			priv_leave();
+		}
+	}
+
+	char cmd[PATH_MAX + 32];
+	snprintf(cmd, sizeof(cmd), "%s \"%%s\" \"%%n\" \"%%t\"", path);
+	ss_json_str(s, level, "command", cmd);
+	ss_json_uint(s, level, "channels", n);
+	log_msg(LVL_INFO, "host: alerts go to %u channels with %s", n, path);
+
+	return 0;
+}
+
+/** The channels of the script, to show them again. */
+static void alerts_json(ss_t* s, int level)
+{
+	char path[PATH_MAX];
+	ss_t text;
+
+	host_side_path(ALERTS_NAME, path, sizeof(path));
+	ss_json_str(s, level, "script", path);
+	ss_json_array_open(s, &level, "channels");
+	ss_init(&text, 4096);
+	priv_enter();
+	int r = file_read(path, &text);
+	priv_leave();
+	if (r == 0) {
+		ss_write(&text, "", 1);
+		char* save = 0;
+		for (char* line = strtok_r(ss_ptr(&text), "\n", &save); line; line = strtok_r(0, "\n", &save)) {
+			if (strncmp(line, "# channel\t", 10) != 0)
+				continue;
+			ss_json_open(s, &level);
+			options_json(s, level, line + 10, ALERT_OPTIONS);
+			ss_json_close(s, &level);
+		}
+	}
+	ss_done(&text);
+	ss_json_array_close(s, &level);
+}
+
+/****************************************************************************/
+/* disks plugged in for a while: mount without a trace, and safe removal */
+
+/** Mount points of the filesystems of a whole disk, as lines. */
+static unsigned disk_mounts(const char* disk, char out[][PATH_MAX], unsigned max)
+{
+	ss_t s;
+	struct mount_entry entry;
+	unsigned n = 0;
+	int r;
+
+	ss_init(&s, 4096);
+	if (file_read("/proc/self/mounts", &s) == 0) {
+		const char* cursor = ss_ptr(&s);
+		while ((r = mount_next(&cursor, &entry, 0, 0)) >= 0 && n < max) {
+			char base[64];
+			char sys[PATH_MAX];
+			if (r != 1 || strncmp(entry.source, "/dev/", 5) != 0)
+				continue;
+			if (device_base(entry.source, base, sizeof(base)) != 0)
+				continue;
+			snprintf(sys, sizeof(sys), "/sys/block/%s/%s", disk, base);
+			if (strcmp(base, disk) == 0 || access(sys, F_OK) == 0)
+				sncpy(out[n++], PATH_MAX, entry.target);
+		}
+	}
+	ss_done(&s);
+
+	return n;
+}
+
+/** The whole disk of a device, itself when it's not a partition. */
+static int device_disk(const char* device, char* disk, size_t disk_size)
+{
+	char name[64];
+	char path[PATH_MAX];
+	char real[PATH_MAX];
+
+	if (strncmp(device, "/dev/", 5) != 0 || !valid_path(device) || device_base(device, name, sizeof(name)) != 0)
+		return -1;
+	snprintf(path, sizeof(path), "/sys/class/block/%s", name);
+	if (realpath(path, real) == 0)
+		return -1;
+	snprintf(path, sizeof(path), "/sys/class/block/%s/partition", name);
+	if (access(path, F_OK) != 0) {
+		sncpy(disk, disk_size, name);
+		return 0;
+	}
+	/* /sys/devices/.../sdb/sdb1: the folder above is the disk */
+	char* slash = strrchr(real, '/');
+	if (!slash)
+		return -1;
+	*slash = 0;
+	slash = strrchr(real, '/');
+	if (!slash)
+		return -1;
+	sncpy(disk, disk_size, slash + 1);
+	return 0;
+}
+
+/** Tell if the disk is one of an array, to never take it away by mistake. */
+static int disk_of_array(const char* disk, char* msg, size_t msg_size)
+{
+	struct host_disk* disks = malloc_nofail(sizeof(struct host_disk) * HOST_DISKS_MAX);
+	unsigned count = host_disks(disks, HOST_DISKS_MAX);
+	int ret = 0;
+
+	for (unsigned i = 0; i < count && ret == 0; ++i) {
+		char other[64];
+		if (disks[i].device[0] && device_disk(disks[i].device, other, sizeof(other)) == 0 && strcmp(other, disk) == 0)
+			ret = hfail(msg, msg_size, 409, "/dev/%s is the disk %s of the array %s. Remove it from the array first.", disk, disks[i].name, disks[i].array);
+	}
+	free(disks);
+
+	return ret;
+}
+
+/** Mount a filesystem under /media until it's ejected or the machine restarts. Nothing is written in fstab. */
+static int usb_mount(const char* device, ss_t* s, int level, char* msg, size_t msg_size)
+{
+	char disk[64];
+	char name[64];
+	char target[PATH_MAX];
+	char label[128];
+	ss_t out;
+
+	if (device_disk(device, disk, sizeof(disk)) != 0 || device_base(device, name, sizeof(name)) != 0)
+		return hfail(msg, msg_size, 400, "%s is not a disk or a part of one", device);
+	int ret = disk_of_array(disk, msg, msg_size);
+	if (ret != 0)
+		return ret;
+
+	ss_t all;
+	struct mount_entry entry;
+	int r;
+	ss_init(&all, 4096);
+	if (file_read("/proc/self/mounts", &all) == 0) {
+		const char* cursor = ss_ptr(&all);
+		while ((r = mount_next(&cursor, &entry, 0, 0)) >= 0) {
+			char base[64];
+			if (r == 1 && strncmp(entry.source, "/dev/", 5) == 0 && device_base(entry.source, base, sizeof(base)) == 0 && strcmp(base, name) == 0) {
+				ss_done(&all);
+				ss_json_str(s, level, "target", entry.target);
+				return 0; /* already there */
+			}
+		}
+	}
+	ss_done(&all);
+
+	/* the folder takes the label of the filesystem, when it has a plain one */
+	label[0] = 0;
+	ss_init(&out, 256);
+	const char* blk[] = { "-s", "LABEL", "-o", "value", device, 0 };
+	if (tool_run("blkid", blk, 0, &out, 30) == 0) {
+		ss_write(&out, "", 1);
+		sncpy(label, sizeof(label), ss_ptr(&out));
+		strtrim(label);
+		for (char* c = label; *c; ++c) {
+			if (!isalnum((unsigned char)*c) && *c != '-' && *c != '_')
+				*c = '_';
+		}
+		if (strlen(label) > 32)
+			label[32] = 0;
+	}
+	ss_done(&out);
+	snprintf(target, sizeof(target), "/media/%s", label[0] ? label : name);
+	struct stat st;
+	struct mount_entry busy;
+	if (mount_find(target, &busy) == 0 || (lstat(target, &st) == 0 && !S_ISDIR(st.st_mode)))
+		snprintf(target, sizeof(target), "/media/%s-%s", label[0] ? label : "disk", name);
+
+	if (make_dirs(target) != 0)
+		return hfail(msg, msg_size, 500, "Cannot create %s: %s", target, strerror(errno));
+	const char* args[] = { "-o", "nosuid,nodev", device, target, 0 };
+	if (tool_check("mount", args, 0, 120, msg, msg_size) != 0) {
+		dir_remove(target);
+		return 500;
+	}
+
+	ss_json_str(s, level, "target", target);
+	log_msg(LVL_INFO, "host: %s mounted in %s until it's ejected", device, target);
+	return 0;
+}
+
+/** Unmount every filesystem of a disk and turn it off, so it can be unplugged. */
+static int usb_eject(const char* device, ss_t* s, int level, char* msg, size_t msg_size)
+{
+	char disk[64];
+	char path[PATH_MAX];
+	char mounts[16][PATH_MAX];
+
+	if (device_disk(device, disk, sizeof(disk)) != 0)
+		return hfail(msg, msg_size, 400, "%s is not a disk", device);
+	int ret = disk_of_array(disk, msg, msg_size);
+	if (ret != 0)
+		return ret;
+	if (job_is_running())
+		return hfail(msg, msg_size, 409, "A storage operation is running. Wait for it to finish, then eject the disk.");
+
+	unsigned n = disk_mounts(disk, mounts, 16);
+	for (unsigned i = 0; i < n; ++i) {
+		if (strcmp(mounts[i], "/") == 0 || strcmp(mounts[i], "/boot") == 0 || strncmp(mounts[i], "/boot/", 6) == 0 || system_path(mounts[i]))
+			return hfail(msg, msg_size, 409, "/dev/%s holds the system of this machine: it cannot be ejected", disk);
+	}
+	/* a pool would lose a disk under its feet */
+	{
+		ss_t all;
+		struct mount_entry entry;
+		struct pool_branch* branches = malloc_nofail(sizeof(struct pool_branch) * 64);
+		char pool[PATH_MAX];
+		int r;
+		pool[0] = 0;
+		ss_init(&all, 4096);
+		if (file_read("/proc/self/mounts", &all) == 0) {
+			const char* cursor = ss_ptr(&all);
+			while (pool[0] == 0 && (r = mount_next(&cursor, &entry, 0, 0)) >= 0) {
+				unsigned count = 64;
+				char why[MSG_MAX];
+				if (r != 1 || !is_mergerfs(entry.fstype) || pool_branches(entry.target, branches, &count, why, sizeof(why)) != 0)
+					continue;
+				for (unsigned b = 0; b < count && pool[0] == 0; ++b) {
+					for (unsigned i = 0; i < n; ++i) {
+						if (strcmp(branches[b].path, mounts[i]) == 0 || path_inside(branches[b].path, mounts[i]))
+							sncpy(pool, sizeof(pool), entry.target);
+					}
+				}
+			}
+		}
+		ss_done(&all);
+		free(branches);
+		if (pool[0])
+			return hfail(msg, msg_size, 409, "/dev/%s is part of the pool %.200s. Take it out of the pool first.", disk, pool);
+	}
+
+	sync();
+	for (unsigned i = 0; i < n; ++i) {
+		const char* args[] = { mounts[i], 0 };
+		char why[MSG_MAX];
+		if (tool_check("umount", args, 0, 120, why, sizeof(why)) != 0)
+			return hfail(msg, msg_size, 409, "%s is in use: close the files and the programs using it, then try again. (%.200s)", mounts[i], why);
+		if (strncmp(mounts[i], "/media/", 7) == 0 || strncmp(mounts[i], "/mnt/backup-", 12) == 0)
+			dir_remove(mounts[i]);
+	}
+
+	/* stop the disk and take it off the bus: the light goes off, the heads are parked */
+	snprintf(path, sizeof(path), "/sys/block/%s/device/delete", disk);
+	priv_enter();
+	int f = open(path, O_WRONLY | O_CLOEXEC);
+	int off = 0;
+	if (f >= 0) {
+		off = write(f, "1\n", 2) == 2;
+		close(f);
+	}
+	priv_leave();
+
+	ss_json_bool(s, level, "powered_off", off);
+	ss_json_uint(s, level, "unmounted", n);
+	ss_json_str(s, level, "note", off ? "The disk is off: it can be unplugged now" : "Nothing of the disk is in use any more: it can be unplugged now");
+	log_msg(LVL_INFO, "host: /dev/%s ejected, %u filesystems unmounted%s", disk, n, off ? ", powered off" : "");
+
+	return 0;
+}
+
+/****************************************************************************/
+/* folders shared by other computers, as sources of the backups */
+
+#define REMOTE_DIR "/mnt/remote"
+#define REMOTES_MAX 32
+
+static void remote_target(const char* name, char* out, size_t out_size)
+{
+	snprintf(out, out_size, "%s/%s", REMOTE_DIR, name);
+}
+
+static void remote_cred_path(const char* name, char* out, size_t out_size)
+{
+	char file[128];
+
+	snprintf(file, sizeof(file), "snapraidd-remote-%s.cred", name);
+	host_side_path(file, out, out_size);
+}
+
+/** Name of the remote a path is in, if it's inside /mnt/remote/NAME. */
+static int remote_of_path(const char* path, char* name, size_t name_size)
+{
+	size_t len = strlen(REMOTE_DIR);
+
+	if (strncmp(path, REMOTE_DIR, len) != 0 || path[len] != '/')
+		return -1;
+	const char* p = path + len + 1;
+	size_t l = strcspn(p, "/");
+	if (l == 0 || l >= name_size)
+		return -1;
+	memcpy(name, p, l);
+	name[l] = 0;
+	return valid_name(name) ? 0 : -1;
+}
+
+/**
+ * Mount the folder of another computer, read-only.
+ * \return 0 if mounted now, 1 if it was already, otherwise the HTTP status
+ */
+static int remote_mount(const char* name, char* msg, size_t msg_size)
+{
+	char key[128];
+	char line[2048];
+	char kind[16], host[256], share[512], user[256], domain[64], vers[16];
+	char target[PATH_MAX];
+	char source[1024];
+	char options[PATH_MAX + 512];
+	struct mount_entry entry;
+
+	snprintf(key, sizeof(key), "remote.%s", name);
+	kv_get(key, "", line, sizeof(line));
+	if (line[0] == 0)
+		return hfail(msg, msg_size, 404, "There is no folder of another computer named %s", name);
+	opt_get(line, "kind", kind, sizeof(kind));
+	opt_get(line, "host", host, sizeof(host));
+	opt_get(line, "share", share, sizeof(share));
+	opt_get(line, "user", user, sizeof(user));
+	opt_get(line, "domain", domain, sizeof(domain));
+	opt_get(line, "vers", vers, sizeof(vers));
+
+	remote_target(name, target, sizeof(target));
+	if (mount_find(target, &entry) == 0)
+		return 1;
+	if (make_dirs(target) != 0)
+		return hfail(msg, msg_size, 500, "Cannot create %s: %s", target, strerror(errno));
+
+	const char* type;
+	if (strcmp(kind, "nfs") == 0) {
+		type = "nfs";
+		if (!tool_exists("mount.nfs"))
+			return hfail(msg, msg_size, 501, "To read NFS folders this machine needs the package nfs-common (nfs-utils on Fedora)");
+		snprintf(source, sizeof(source), "%s:%s%s", host, share[0] == '/' ? "" : "/", share);
+		snprintf(options, sizeof(options), "ro,nosuid,nodev,noexec,soft,timeo=100,retrans=2");
+	} else {
+		type = "cifs";
+		if (!tool_exists("mount.cifs"))
+			return hfail(msg, msg_size, 501, "To read Windows (SMB) folders this machine needs the package cifs-utils");
+		const char* sh = share;
+		while (*sh == '/' || *sh == '\\')
+			++sh;
+		snprintf(source, sizeof(source), "//%s/%s", host, sh);
+		if (user[0]) {
+			char cred[PATH_MAX];
+			remote_cred_path(name, cred, sizeof(cred));
+			snprintf(options, sizeof(options), "ro,nosuid,nodev,noexec,iocharset=utf8,credentials=%s", cred);
+		} else {
+			snprintf(options, sizeof(options), "ro,nosuid,nodev,noexec,iocharset=utf8,guest");
+		}
+		if (vers[0]) {
+			sncat(options, sizeof(options), ",vers=");
+			sncat(options, sizeof(options), vers);
+		}
+	}
+
+	const char* args[] = { "-t", type, "-o", options, source, target, 0 };
+	char why[MSG_MAX];
+	if (tool_check("mount", args, 0, 60, why, sizeof(why)) != 0) {
+		dir_remove(target);
+		const char* hint = "";
+		if (strstr(why, "ermission denied") != 0 || strstr(why, "error(13)") != 0)
+			hint = "The other computer refused the name or the password. ";
+		else if (strstr(why, "o route") != 0 || strstr(why, "error(113)") != 0 || strstr(why, "error(112)") != 0 || strstr(why, "timed out") != 0 || strstr(why, "could not resolve") != 0 || strstr(why, "esolv") != 0)
+			hint = "The other computer does not answer: check its name or address, and that it's on. ";
+		else if (strstr(why, "error(2)") != 0 || strstr(why, "o such file") != 0 || strstr(why, "access denied by server") != 0)
+			hint = "The other computer has no shared folder with this name, or does not let this machine read it. ";
+		return hfail(msg, msg_size, 502, "%s(%.300s)", hint, why);
+	}
+
+	log_msg(LVL_INFO, "host: %s mounted read-only in %s", source, target);
+	return 0;
+}
+
+static void remote_unmount(const char* name)
+{
+	char target[PATH_MAX];
+	struct mount_entry entry;
+
+	remote_target(name, target, sizeof(target));
+	if (mount_find(target, &entry) != 0)
+		return;
+	const char* args[] = { target, 0 };
+	if (tool_run("umount", args, 0, 0, 120) != 0) {
+		const char* lazy[] = { "-l", target, 0 };
+		tool_run("umount", lazy, 0, 0, 120);
+	}
+	dir_remove(target);
+}
+
+static int remote_save(const struct host_args* args, char* msg, size_t msg_size)
+{
+	char key[128];
+	char line[2048];
+	char v[512];
+	const char* name = host_arg(args, "name");
+	const char* password = host_arg(args, "password");
+
+	if (!name || !valid_name(name))
+		return hfail(msg, msg_size, 400, "A name has only letters, digits, - and _ (up to 32)");
+	snprintf(key, sizeof(key), "remote.%s", name);
+	line[0] = 0;
+	for (unsigned i = 0; REMOTE_OPTIONS[i]; ++i) {
+		char opt[32];
+		sncpy(opt, sizeof(opt), REMOTE_OPTIONS[i]);
+		*strchr(opt, ':') = 0;
+		const char* val = host_arg(args, opt);
+		if (!val || val[0] == 0)
+			continue;
+		if (line[0])
+			sncat(line, sizeof(line), "\t");
+		sncat(line, sizeof(line), opt);
+		sncat(line, sizeof(line), "=");
+		sncat(line, sizeof(line), val);
+	}
+
+	int ret = valid_options_line(line, REMOTE_OPTIONS, msg, msg_size);
+	if (ret != 0)
+		return ret;
+	if (opt_get(line, "kind", v, sizeof(v)) != 0 || (strcmp(v, "smb") != 0 && strcmp(v, "nfs") != 0))
+		return hfail(msg, msg_size, 400, "The kind is smb (Windows, Mac, NAS) or nfs (Linux)");
+	int nfs = strcmp(v, "nfs") == 0;
+	if (opt_get(line, "host", v, sizeof(v)) != 0)
+		return hfail(msg, msg_size, 400, "Missing name or address of the other computer");
+	if (opt_get(line, "share", v, sizeof(v)) != 0 || strchr(v, ',') != 0 || strstr(v, "..") != 0 || (!nfs && strpbrk(v, " ") == v))
+		return hfail(msg, msg_size, 400, "Missing or invalid name of the shared folder");
+	if (opt_get(line, "user", v, sizeof(v)) == 0 && strpbrk(v, ",\n") != 0)
+		return hfail(msg, msg_size, 400, "Invalid user name");
+	if (password && strpbrk(password, "\r\n") != 0)
+		return hfail(msg, msg_size, 400, "Invalid password");
+
+	/* the password is kept apart from the settings, readable by root only */
+	if (!nfs && opt_get(line, "user", v, sizeof(v)) == 0) {
+		char cred[PATH_MAX];
+		char domain[64];
+		remote_cred_path(name, cred, sizeof(cred));
+		if (password && password[0]) {
+			ss_t c;
+			ss_init(&c, 512);
+			ss_printf(&c, "username=%s\npassword=%s\n", v, password);
+			if (opt_get(line, "domain", domain, sizeof(domain)) == 0 && domain[0])
+				ss_printf(&c, "domain=%s\n", domain);
+			ss_write(&c, "", 1);
+			int w = file_replace(cred, ss_ptr(&c), 0, 0600);
+			memset(ss_ptr(&c), 0, ss_len(&c));
+			ss_done(&c);
+			if (w != 0)
+				return hfail(msg, msg_size, 500, "Cannot write %s: %s", cred, strerror(errno));
+		} else {
+			priv_enter();
+			int have = access(cred, F_OK) == 0;
+			priv_leave();
+			if (!have)
+				return hfail(msg, msg_size, 400, "Missing password");
+		}
+	}
+
+	/* the next use mounts it again with what was saved */
+	remote_unmount(name);
+
+	return setting_store(key, line, msg, msg_size);
+}
+
+static int remote_delete(const char* name, char* msg, size_t msg_size)
+{
+	char key[128];
+	char cred[PATH_MAX];
+	char target[PATH_MAX + 2];
+
+	if (!valid_name(name))
+		return hfail(msg, msg_size, 400, "Invalid name");
+
+	/* not while a backup reads from it */
+	remote_target(name, target, sizeof(target));
+	size_t len = strlen(target);
+	pthread_mutex_lock(&host_mutex);
+	const char* user = 0;
+	for (unsigned i = 0; i < kv_count && !user; ++i) {
+		char src[PATH_MAX];
+		if (strncmp(kv_list[i].key, "backup.", 7) != 0 || opt_get(kv_list[i].val, "source", src, sizeof(src)) != 0)
+			continue;
+		if (strncmp(src, target, len) == 0 && (src[len] == 0 || src[len] == '/'))
+			user = kv_list[i].key + 7;
+	}
+	char by[64];
+	sncpy(by, sizeof(by), user ? user : "");
+	pthread_mutex_unlock(&host_mutex);
+	if (by[0])
+		return hfail(msg, msg_size, 409, "The backup %s copies from this folder. Delete or change the backup first.", by);
+
+	remote_unmount(name);
+	remote_cred_path(name, cred, sizeof(cred));
+	priv_enter();
+	unlink(cred);
+	priv_leave();
+	snprintf(key, sizeof(key), "remote.%s", name);
+
+	return setting_store(key, "", msg, msg_size);
+}
+
+/** Try the folder: mount it, tell what is inside, and leave it as it was. */
+static int remote_test(const char* name, ss_t* s, int level, char* msg, size_t msg_size)
+{
+	char target[PATH_MAX];
+
+	if (!valid_name(name))
+		return hfail(msg, msg_size, 400, "Invalid name");
+	int r = remote_mount(name, msg, msg_size);
+	if (r != 0 && r != 1)
+		return r;
+
+	remote_target(name, target, sizeof(target));
+	unsigned entries = 0;
+	ss_json_array_open(s, &level, "folders");
+	priv_enter();
+	DIR* d = opendir(target);
+	priv_leave();
+	if (d) {
+		struct dirent* dd;
+		while ((dd = readdir(d)) != 0) {
+			if (dd->d_name[0] == '.')
+				continue;
+			++entries;
+			struct stat st;
+			if (entries <= 200 && fstatat(dirfd(d), dd->d_name, &st, 0) == 0 && S_ISDIR(st.st_mode))
+				ss_json_elem(s, level, dd->d_name);
+		}
+		closedir(d);
+	}
+	ss_json_array_close(s, &level);
+	ss_json_uint(s, level, "entries", entries);
+	ss_json_str(s, level, "target", target);
+
+	if (r == 0 && !job_is_running())
+		remote_unmount(name);
+
+	return 0;
+}
+
+static void remotes_json(ss_t* s, int level)
+{
+	ss_json_array_open(s, &level, "remotes");
+	for (unsigned i = 0; i < kv_count; ++i) {
+		char target[PATH_MAX];
+		char user[256];
+		struct mount_entry entry;
+		if (strncmp(kv_list[i].key, "remote.", 7) != 0)
+			continue;
+		const char* name = kv_list[i].key + 7;
+		remote_target(name, target, sizeof(target));
+		ss_json_open(s, &level);
+		ss_json_str(s, level, "name", name);
+		options_json(s, level, kv_list[i].val, REMOTE_OPTIONS);
+		ss_json_str(s, level, "target", target);
+		ss_json_bool(s, level, "password", opt_get(kv_list[i].val, "user", user, sizeof(user)) == 0 && user[0] != 0);
+		ss_json_bool(s, level, "mounted", mount_find(target, &entry) == 0);
+		ss_json_close(s, &level);
+	}
+	ss_json_array_close(s, &level);
+}
+
 static void status_json(ss_t* s, int level)
 {
 	struct statvfs vfs;
@@ -3583,7 +5263,7 @@ static void status_json(ss_t* s, int level)
 	ss_json_bool(s, level, "dry_run", host_dryrun);
 
 	ss_json_object_open(s, &level, "tools");
-	static const char* TOOLS[] = { "smartctl", "hdparm", "rsync", "smbd", "exportfs", "ethtool", "systemctl", "mergerfs", 0 };
+	static const char* TOOLS[] = { "smartctl", "hdparm", "rsync", "smbd", "exportfs", "ethtool", "systemctl", "mergerfs", "upsc", "apcaccess", "mount.cifs", "mount.nfs", 0 };
 	for (unsigned i = 0; TOOLS[i]; ++i)
 		ss_json_bool(s, level, TOOLS[i], tool_exists(TOOLS[i]));
 	ss_json_close(s, &level);
@@ -3731,6 +5411,8 @@ static void status_json(ss_t* s, int level)
 	}
 	ss_json_array_close(s, &level);
 
+	remotes_json(s, level);
+
 	ss_json_object_open(s, &level, "idle");
 	ss_json_str(s, level, "action", kv_get_locked("idle_action", "none"));
 	ss_json_int(s, level, "minutes", atoi(kv_get_locked("idle_minutes", "60")));
@@ -3752,6 +5434,8 @@ static void status_json(ss_t* s, int level)
 	ss_json_close(s, &level);
 
 	pthread_mutex_unlock(&host_mutex);
+
+	ups_json(s, level);
 
 	/* facts for the health checks of the UI */
 	ss_json_object_open(s, &level, "facts");
@@ -3781,7 +5465,7 @@ static void status_json(ss_t* s, int level)
 
 int host_get_is_private(const char* what)
 {
-	return strcmp(what, "diagnostics") == 0 || strcmp(what, "settings_backup") == 0 || strcmp(what, "openfiles") == 0;
+	return strcmp(what, "diagnostics") == 0 || strcmp(what, "settings_backup") == 0 || strcmp(what, "openfiles") == 0 || strcmp(what, "alerts") == 0;
 }
 
 int host_get(const char* what, const struct host_args* query, ss_t* s, int level, char* msg, size_t msg_size)
@@ -3796,6 +5480,20 @@ int host_get(const char* what, const struct host_args* query, ss_t* s, int level
 	}
 	if (strcmp(what, "network") == 0) {
 		wol_json(s, level);
+		return 0;
+	}
+	if (strcmp(what, "runs") == 0) {
+		const char* limit = host_arg(query, "limit");
+		runs_tick();
+		runs_json(s, level, host_arg(query, "array"), limit && valid_int(limit, 1, 5000) ? atoi(limit) : 200);
+		return 0;
+	}
+	if (strcmp(what, "ups_detect") == 0) {
+		ups_detect_json(s, level);
+		return 0;
+	}
+	if (strcmp(what, "alerts") == 0) {
+		alerts_json(s, level);
 		return 0;
 	}
 	if (strcmp(what, "share_users") == 0) {
@@ -3895,7 +5593,7 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 		/* simple settings and documents of the UI; shares, backups and power have their own requests */
 		for (unsigned i = 0; i < args->count; ++i) {
 			const char* k = args->key[i];
-			if (strncmp(k, "share.", 6) == 0 || strncmp(k, "backup.", 7) == 0 || strncmp(k, "power.", 6) == 0 || strncmp(k, "cache.", 6) == 0 || strncmp(k, "keep.", 5) == 0 || strncmp(k, "last.", 5) == 0)
+			if (strncmp(k, "share.", 6) == 0 || strncmp(k, "backup.", 7) == 0 || strncmp(k, "power.", 6) == 0 || strncmp(k, "cache.", 6) == 0 || strncmp(k, "keep.", 5) == 0 || strncmp(k, "remote.", 7) == 0 || strncmp(k, "last.", 5) == 0)
 				return hfail(msg, msg_size, 400, "Use the request of its own for %s", k);
 			ret = setting_check(k, args->val[i], msg, msg_size);
 			if (ret != 0)
@@ -3906,6 +5604,8 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 			if (ret != 0)
 				return ret;
 		}
+		/* what follows a setting, like the look at the UPS, does not wait for the next round */
+		host_wake();
 		if (host_arg(args, "wol") && strcmp(host_arg(args, "wol"), "1") == 0) {
 			ret = wol_apply(msg, msg_size);
 			if (ret != 0)
@@ -4060,6 +5760,19 @@ int host_post(const char* action, const struct host_args* args, ss_t* s, int lev
 		return wipe_start(device, need(args, "method"), msg, msg_size);
 	}
 
+	if (strcmp(action, "usb_mount") == 0)
+		return usb_mount(need(args, "device"), s, level, msg, msg_size);
+	if (strcmp(action, "usb_eject") == 0)
+		return usb_eject(need(args, "device"), s, level, msg, msg_size);
+	if (strcmp(action, "remote_save") == 0)
+		return remote_save(args, msg, msg_size);
+	if (strcmp(action, "remote_delete") == 0)
+		return remote_delete(need(args, "name"), msg, msg_size);
+	if (strcmp(action, "remote_test") == 0)
+		return remote_test(need(args, "name"), s, level, msg, msg_size);
+	if (strcmp(action, "alerts_save") == 0)
+		return alerts_save(need(args, "channels"), s, level, msg, msg_size);
+
 	if (strcmp(action, "copy") == 0) {
 		const char* mirror = host_arg(args, "mirror");
 		return copy_start("copy", need(args, "source"), need(args, "target"), mirror && strcmp(mirror, "1") == 0, 0, msg, msg_size);
@@ -4088,6 +5801,13 @@ static pthread_cond_t host_cond = PTHREAD_COND_INITIALIZER;
 static int host_stop;
 static int host_started;
 
+static void host_wake(void)
+{
+	pthread_mutex_lock(&host_wait_mutex);
+	pthread_cond_signal(&host_cond);
+	pthread_mutex_unlock(&host_wait_mutex);
+}
+
 static void* host_thread(void* arg)
 {
 	(void)arg;
@@ -4111,9 +5831,12 @@ static void* host_thread(void* arg)
 			caches_tick(&tm);
 			keeps_tick(&tm);
 			ratio_tick();
+			changes_tick();
+			runs_tick();
 			idle_tick(&tm);
 			first = 0;
 		}
+		ups_tick();
 		history_tick();
 		dircache_tick();
 		if (now - last_recycle >= 6 * 3600) {
@@ -4231,6 +5954,84 @@ int host_selftest(void)
 	HCHECK(sched_match("Mon 01:00, 04:00", &tm));
 	HCHECK(!sched_match("Sun 04:01", &tm));
 
+	/* write test: a clean pass finds nothing, one changed byte is found */
+	{
+		char tmp[] = "/tmp/snapraidd-selftest-XXXXXX";
+		int f = mkstemp(tmp);
+		HCHECK(f >= 0);
+		unsigned char* b1 = malloc_nofail(WIPE_CHUNK);
+		unsigned char* b2 = malloc_nofail(WIPE_CHUNK);
+		uint64_t size = WIPE_CHUNK + 4096 + 3;
+		uint64_t done = 0;
+		unsigned bad = 0;
+		HCHECK(burnin_pass(f, size, 42, 0, b1, b2, &done, &bad) == 0 && done == size);
+		HCHECK(burnin_pass(f, size, 42, 1, b1, b2, &done, &bad) == 0 && bad == 0);
+		HCHECK(burnin_pass(f, size, 43, 1, b1, b2, &done, &bad) == 0 && bad == 2);
+		unsigned char flip;
+		HCHECK(pread(f, &flip, 1, WIPE_CHUNK + 100) == 1);
+		flip ^= 0x10;
+		HCHECK(pwrite(f, &flip, 1, WIPE_CHUNK + 100) == 1);
+		bad = 0;
+		HCHECK(burnin_pass(f, size, 42, 1, b1, b2, &done, &bad) == 0 && bad == 1);
+		close(f);
+		unlink(tmp);
+		free(b1);
+		free(b2);
+	}
+
+	/* state of a UPS, as NUT and apcupsd tell it */
+	{
+		int ob, lb, ch, rt;
+		char st[64];
+		HCHECK(ups_parse("battery.charge: 100\nbattery.runtime: 1800\nups.status: OL CHRG\n", 0, &ob, &lb, &ch, &rt, st, sizeof(st)) == 0 && !ob && !lb && ch == 100 && rt == 1800);
+		HCHECK(ups_parse("battery.charge: 37\nups.status: OB DISCHRG\n", 0, &ob, &lb, &ch, &rt, st, sizeof(st)) == 0 && ob && !lb && ch == 37 && rt == -1);
+		HCHECK(ups_parse("ups.status: OB LB\n", 0, &ob, &lb, &ch, &rt, st, sizeof(st)) == 0 && ob && lb);
+		HCHECK(ups_parse("ups.status: OFF\n", 0, &ob, &lb, &ch, &rt, st, sizeof(st)) != 0);
+		HCHECK(ups_parse("Error: Data stale\n", 0, &ob, &lb, &ch, &rt, st, sizeof(st)) != 0);
+		HCHECK(ups_parse("APC      : 001,036,0879\nSTATUS   : ONLINE \nBCHARGE  : 100.0 Percent\nTIMELEFT : 45.5 Minutes\n", 1, &ob, &lb, &ch, &rt, st, sizeof(st)) == 0 && !ob && ch == 100 && rt == 2730);
+		HCHECK(ups_parse("STATUS   : ONBATT LOWBATT\nBCHARGE  : 9.0 Percent\n", 1, &ob, &lb, &ch, &rt, st, sizeof(st)) == 0 && ob && lb && ch == 9);
+		HCHECK(ups_parse("STATUS   : COMMLOST\n", 1, &ob, &lb, &ch, &rt, st, sizeof(st)) != 0);
+		HCHECK(valid_ups("apc") && valid_ups("nut:myups") && valid_ups("nut:ups@192.168.1.5:3493") && !valid_ups("nut:") && !valid_ups("nut:-l") && !valid_ups("nut:a b") && !valid_ups("other"));
+	}
+
+	/* record of the runs */
+	{
+		struct run_line r, back;
+		ss_t out;
+		memset(&r, 0, sizeof(r));
+		r.end = 1700000000;
+		sncpy(r.array, sizeof(r.array), "default");
+		sncpy(r.command, sizeof(r.command), "scrub");
+		sncpy(r.status, sizeof(r.status), "error");
+		r.exit_code = 1;
+		r.seconds = 61;
+		r.data = 3;
+		r.removed = 7;
+		ss_init(&out, 256);
+		run_format(&out, &r);
+		ss_write(&out, "", 1);
+		char* nl = strchr(ss_ptr(&out), '\n');
+		HCHECK(nl != 0);
+		*nl = 0;
+		HCHECK(run_parse(ss_ptr(&out), &back) == 0 && back.end == r.end && back.data == 3 && back.removed == 7 && back.seconds == 61 && strcmp(back.command, "scrub") == 0);
+		ss_done(&out);
+		char bad[] = "1700000000\tdefault\tdiff\tok\t0\t1\t0\t0\t0\t0\t0\t0\t0\t0";
+		HCHECK(run_parse(bad, &back) != 0);
+		char cut[] = "1700000000\tdefault\tsync\tok";
+		HCHECK(run_parse(cut, &back) != 0);
+	}
+
+	/* addresses of the alerts and folders of other computers */
+	HCHECK(valid_web_url("https://ntfy.sh/my-topic") && valid_web_url("http://192.168.1.2:8080/hook?a=1&b=2"));
+	HCHECK(!valid_web_url("ftp://x.example/a") && !valid_web_url("https://x.example/'; reboot; '") && !valid_web_url("https://x.example/$(id)") && !valid_web_url("https://x.example/a b"));
+	HCHECK(remote_of_path("/mnt/remote/nas/photos", buf, sizeof(buf)) == 0 && strcmp(buf, "nas") == 0);
+	HCHECK(remote_of_path("/mnt/remote/nas", buf, sizeof(buf)) == 0 && remote_of_path("/mnt/remote", buf, sizeof(buf)) != 0 && remote_of_path("/mnt/remotes/nas", buf, sizeof(buf)) != 0);
+	HCHECK(setting_check("remote.nas", "kind=smb\thost=nas.local\tshare=My Photos\tuser=anna", msg, sizeof(msg)) == 0);
+	HCHECK(setting_check("remote.nas", "kind=smb\thost=nas local\tshare=x", msg, sizeof(msg)) != 0);
+	HCHECK(setting_check("remote.nas", "kind=smb\thost=-oproxy\tshare=x", msg, sizeof(msg)) != 0);
+	HCHECK(setting_check("ups", "nut:myups", msg, sizeof(msg)) == 0 && setting_check("ups", "usb", msg, sizeof(msg)) != 0);
+	HCHECK(setting_check("sync_changes_minutes", "0", msg, sizeof(msg)) != 0 && setting_check("sync_changes", "200", msg, sizeof(msg)) == 0);
+
 	/* options lines */
 	const char* line = "path=/mnt/storage/My Movies\tsmb=1\tusers=anna,bob";
 	HCHECK(opt_get(line, "path", buf, sizeof(buf)) == 0 && strcmp(buf, "/mnt/storage/My Movies") == 0);
@@ -4285,7 +6086,7 @@ int host_selftest(void)
 			HCHECK(real_inside(link) == 0);
 			snprintf(link, sizeof(link), "%s/out", dir);
 			unlink(link);
-			rmdir(dir);
+			dir_remove(dir);
 		}
 	}
 

@@ -3038,9 +3038,9 @@ static int handler_host(struct mg_connection* conn, void* cbdata)
 	args.count = 0;
 
 	if (is_get) {
-		static const char* QUERY[] = { "device", "path", 0 };
+		static const char* QUERY[] = { "device", "path", "array", "limit", 0 };
 		static char qbuf[2][PATH_MAX];
-		char local[2][PATH_MAX];
+		char local[4][PATH_MAX];
 		(void)qbuf;
 		for (unsigned i = 0; QUERY[i] && ri->query_string; ++i) {
 			if (mg_get_var(ri->query_string, strlen(ri->query_string), QUERY[i], local[i], sizeof(local[i])) > 0) {
